@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/events/Aligned/v1.json",
+  "title": "Aligned",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "left_ref",
+    "right_ref",
+    "alignment_type"
+  ],
+  "properties": {
+    "alignment_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "left_ref": {
+      "type": "string"
+    },
+    "right_ref": {
+      "type": "string"
+    },
+    "alignment_type": {
+      "type": "string"
+    },
+    "method": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "assumptions": {
+      "type": "object"
+    },
+    "source_events": {
+      "type": "object"
+    },
+    "confidence": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

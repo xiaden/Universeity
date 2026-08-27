@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/events/OverrideApplied/v1.json",
+  "title": "OverrideApplied",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "subject_ref",
+    "predicate",
+    "object_ref"
+  ],
+  "properties": {
+    "subject_ref": {
+      "type": "string"
+    },
+    "predicate": {
+      "type": "string"
+    },
+    "object_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "authority": {
+      "const": "USER_OVERRIDE"
+    },
+    "confidence": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "actor": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

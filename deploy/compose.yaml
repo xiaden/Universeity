@@ -1,0 +1,174 @@
+# UMD Compose topology (Plan E, P2-S1).
+#
+# FINAL COMPOSE — targets the DD production baseline:
+#   * PostgreSQL **18.6** with **pgvector >= 0.8.2 (target 0.8.6)** for HNSW.
+#   * OCFL immutable-byte authority on a named volume (or optional MinIO-
+#     compatible S3 bridge profile).
+#   * Hatchet durable DAG runner (release pinned as a build gate).
+#   * Optional Ollama (GPU/embedding profile; disabled by default).
+#   * A dedicated sandbox-runner role behind a documented VALIDATED host
+#     profile — see deploy/security/SANDBOX_HOST_PROFILE.md. It runs with an
+#     explicitly non-privileged security config (read-only root FS, no-new-
+#     privileges, seccomp/AppArmor profile) and NEVER uses a privileged key.
+#
+# HONESTY NOTE: local dev/CI in this sandbox runs PostgreSQL 17 with pgvector
+# 0.8.0 (HNSW stays gated there). The 18.6 + 0.8.6 target is what THIS file
+# deploys and what CI/registry build verifies; this environment cannot run
+# Docker, so container-level behavior is validated statically here and by the
+# conditional Docker integration tests (skipped, not silently passed, when no
+# Docker daemon is present).
+name: umd
+
+x-umd-api-env: &umd-api-env
+  UMD_POSTGRES__DSN: postgresql+psycopg://umd:${UMD_POSTGRES_PASSWORD:-umd}@db:5432/umd
+  UMD_OCFL__ROOT: /data/ocfl
+  UMD_RUN_MIGRATIONS_ON_START: "1"
+  # Gate posture: all authority/security/provider extensions stay GATED and are
+  # enabled only through the .env surface (never compiled in, never a hard
+  # dependency of the base image).
+  UMD_PROJECTION__VECTOR_HNSW_MIN_VERSION: "0.8.2"
+  UMD_VLLM_ENABLED: "${UMD_VLLM_ENABLED:-0}"
+  UMD_DIARIZATION_ENABLED: "${UMD_DIARIZATION_ENABLED:-0}"
+  UMD_ASR_ENGINE: "${UMD_ASR_ENGINE:-}"
+
+services:
+  db:
+    image: pgvector/pgvector:pg18
+    # Target Postgres 18.6 + pgvector >=0.8.2 (target 0.8.6). Registry tag
+    # `pg18` currently ships a pgvector >= 0.8.2; release pinning of the
+    # concrete image digest is a deployment gate (see deploy/pins/runtime.txt
+    # and deploy/security/CVE_WATCH.md).
+    environment:
+      POSTGRES_USER: umd
+      POSTGRES_PASSWORD: ${UMD_POSTGRES_PASSWORD:-umd}
+      POSTGRES_DB: umd
+    volumes:
+      - ocfl-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U umd -d umd"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      UMD_ROLE: api
+      <<: *umd-api-env
+    env_file:
+      - path: ../.env.example
+        required: false
+    volumes:
+      - ocfl-data:/data/ocfl
+      - umd-api-secrets:/run/secrets:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${UMD_API_PORT:-8080}:8080"
+    healthcheck:
+      # Readiness gate: /v1/health must return 200 while dependencies degrade.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/v1/health').status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["worker"]
+    environment:
+      UMD_ROLE: worker
+      <<: *umd-api-env
+    env_file:
+      - path: ../.env.example
+        required: false
+    volumes:
+      - ocfl-data:/data/ocfl
+    depends_on:
+      db:
+        condition: service_healthy
+      hatchet:
+        condition: service_started
+    restart: unless-stopped
+
+  hatchet:
+    # Durable DAG runner (release exact pin is a build gate; see
+    # deploy/security/CVE_WATCH.md and the Plan E rollout section).
+    image: ghcr.io/hatchet-dev/hatchet:${HATCHET_VERSION:-v0.50.0}
+    environment:
+      SERVER_AUTH_COOKIE_SECRET: ${HATCHET_COOKIE_SECRET:?}
+      SERVER_ENCRYPTION_MASTER_KEY: ${HATCHET_MASTER_KEY:?}
+    depends_on:
+      db:
+        condition: service_started
+    restart: unless-stopped
+
+  # ---- OPTIONAL / profile-gated ---------------------------------------------
+  sandbox-runner:
+    # Dedicated, OPT-IN sandbox executor profile (no media stages in base). Uses
+    # the same API/worker image but runs with a DOCUMENTED VALIDATED non-
+    # privileged posture (deploy/security/SANDBOX_HOST_PROFILE.md): read-only
+    # root, no-new-privileges, cap_drop ALL, tmpfs scratch, seccomp. Never
+    # `privileged: true`.
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["worker"]
+    profiles: ["sandbox"]
+    environment:
+      UMD_ROLE: worker
+      UMD_SANDBOX_PROFILE: documented-validated-nonprivileged
+      <<: *umd-api-env
+    volumes:
+      - ocfl-data:/data/ocfl:ro
+      - sandbox-tmp:/tmp
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=deploy/security/sandbox-seccomp.json
+    tmpfs:
+      - /scratch
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+  ollama:
+    # Optional local embedding/LLM host (kept out of default up).
+    image: ollama/ollama:latest
+    profiles: ["gpu"]
+    volumes:
+      - ollama-cache:/root/.ollama
+    restart: unless-stopped
+
+  minio:
+    # Optional MinIO(-compatible) bridge for OCFL object bytes. Mount the S3
+    # path as the OCFL root in the API/worker env when enabled (profile).
+    image: minio/minio:latest
+    profiles: ["s3bridge"]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-umd}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-umdminio}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  ocfl-db:
+  ocfl-data:
+  umd-api-secrets:
+  sandbox-tmp:
+  ollama-cache:
+  minio-data:

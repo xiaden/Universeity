@@ -1,0 +1,124 @@
+"""Reversible entity resolution + persisted mentions (Phase 1).
+
+Phase 1 delivers the reversible entity-resolution core:
+
+  * persisted source mentions with provenance + confidence states (:mod:`mentions`),
+  * bounded candidate generation (:mod:`candidates`),
+  * splink-compatible linkage scoring with an active deterministic reference
+    provider and an honestly GATED splink/DuckDB adapter (:mod:`linkage`),
+  * append-only MERGE/ALIAS/SPLIT resolution events with split-time enumeration,
+    ReferenceRebound emission and ambiguity quarantine (:mod:`resolution`).
+
+Every mutation is append-only and reversible; nothing here is projection or
+query authority (that arrives in Phase 2/3).
+"""
+
+from __future__ import annotations
+
+from umd.resolution.candidates import (
+    CandidateHits,
+    CandidatePolicy,
+    MentionBlockIndex,
+    cluster_key,
+    jaccard_similarity,
+    lsh_bands,
+    minhash_signature,
+    normalize_name,
+    soundex,
+    transliteration_key,
+)
+from umd.resolution.linkage import (
+    DEFAULT_LINKAGE_SEED,
+    DUCKDB_REGRESSION_FACTOR,
+    REFERENCE_PROVIDER,
+    BenchmarkResult,
+    LinkageChunker,
+    LinkageDecision,
+    LinkageModelSettings,
+    LinkageProvider,
+    LinkageProviderUnavailable,
+    LinkageRun,
+    LinkRecord,
+    LinkScore,
+    OcflLinkageStore,
+    SplinkLinkageProvider,
+    TrainedLinkageModel,
+    benchmark_linkage,
+    linkage_capability_report,
+    predict_reference,
+    resolve_provider,
+    run_linkage,
+    train_reference_model,
+)
+from umd.resolution.mentions import (
+    MENTION_KINDS,
+    MentionCandidate,
+    MentionRepository,
+    MentionService,
+    PostgresMentionRepository,
+    RecordedMention,
+    SourceMention,
+)
+from umd.resolution.resolution import (
+    PostgresSplitEnumerator,
+    ReboundRecord,
+    ResolutionKind,
+    ResolutionRejected,
+    Resolver,
+    SplitEnumerator,
+    SplitOutcome,
+    SplitPlan,
+    rebound_event,
+    resolved_event,
+)
+
+__all__ = [
+    "BenchmarkResult",
+    "CandidateHits",
+    "CandidatePolicy",
+    "DUCKDB_REGRESSION_FACTOR",
+    "DEFAULT_LINKAGE_SEED",
+    "LinkRecord",
+    "LinkScore",
+    "LinkageChunker",
+    "LinkageDecision",
+    "LinkageModelSettings",
+    "LinkageProvider",
+    "LinkageProviderUnavailable",
+    "LinkageRun",
+    "MENTION_KINDS",
+    "MentionBlockIndex",
+    "MentionCandidate",
+    "MentionRepository",
+    "MentionService",
+    "OcflLinkageStore",
+    "PostgresMentionRepository",
+    "PostgresSplitEnumerator",
+    "REFERENCE_PROVIDER",
+    "ReboundRecord",
+    "RecordedMention",
+    "ResolutionKind",
+    "ResolutionRejected",
+    "Resolver",
+    "SplinkLinkageProvider",
+    "SplitEnumerator",
+    "SplitOutcome",
+    "SplitPlan",
+    "SourceMention",
+    "TrainedLinkageModel",
+    "benchmark_linkage",
+    "cluster_key",
+    "jaccard_similarity",
+    "linkage_capability_report",
+    "lsh_bands",
+    "minhash_signature",
+    "normalize_name",
+    "predict_reference",
+    "rebound_event",
+    "resolve_provider",
+    "resolved_event",
+    "run_linkage",
+    "soundex",
+    "train_reference_model",
+    "transliteration_key",
+]

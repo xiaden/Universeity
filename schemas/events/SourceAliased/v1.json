@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/events/SourceAliased/v1.json",
+  "title": "SourceAliased",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "source_id",
+    "work_id",
+    "role"
+  ],
+  "properties": {
+    "source_id": {
+      "type": "string"
+    },
+    "work_id": {
+      "type": "string"
+    },
+    "role": {
+      "type": "string"
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "canonical_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

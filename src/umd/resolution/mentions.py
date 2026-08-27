@@ -1,0 +1,296 @@
+"""Persisted source mentions with provenance and confidence states (P1-S1).
+
+Implements the DD §Reversible entity resolution requirement to *persist every
+source mention* — names, scripts, transliterations, titles, nicknames, OCR
+forms, speaker labels, face clusters, unknown placeholders and candidate sets —
+carrying exact provenance back to source evidence and an explicit confidence
+state.
+
+Representation
+--------------
+A mention maps onto the canonical ``entity_mention`` table row plus an
+``EntityMentioned`` semantic event appended to the ledger. The typed columns
+(``mention_text``, ``normalized_forms``, ``speaker_label``, ``face_cluster``)
+hold the surface form; provenance, candidate set, confidence state and mention
+kind live in the JSONB ``metadata_`` extension field (the DD's typed-core-plus-
+JSONB rule). The ``mention_id`` in the event payload is the row id, so the event
+and the row are traceable.
+
+Invariants
+----------
+  * provenance always names source/segment/evidence refs, never an untrusted
+    filename or path — a surface form is never a storage key;
+  * recording a mention appends the ``EntityMentioned`` event AND writes the
+    ``entity_mention`` row atomically through the ledger's side-effects path
+    (both commit or neither commits);
+  * candidate sets and confidence states are *represented* as a typed model and
+    persisted — they are evidence about identity, never a fabricated canonical
+    decision.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import uuid
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+import sqlalchemy as sa
+from pydantic import BaseModel, Field
+
+from umd.domain.events import SemanticEvent
+from umd.domain.models import ConfidenceState
+from umd.storage.postgres.ledger import CommitResult, SemanticLedger
+from umd.storage.postgres.tables import metadata as db_meta
+
+_mention_t = db_meta.tables["entity_mention"]
+
+pg_insert = sa.dialects.postgresql.insert
+
+
+def _uuid_hex() -> str:
+    return uuid.uuid4().hex
+
+
+#: Stable mention-kind vocabulary (DD §Reversible entity resolution).
+MENTION_KINDS: tuple[str, ...] = (
+    "name",
+    "script",
+    "transliteration",
+    "title",
+    "nickname",
+    "ocr_form",
+    "speaker_label",
+    "face_cluster",
+    "unknown_placeholder",
+    "candidate_set",
+)
+
+#: Metadata keys consumed as typed mention fields (not free extension data).
+_RESERVED_METADATA = frozenset(
+    {
+        "mention_kind",
+        "confidence_state",
+        "confidence",
+        "language",
+        "script",
+        "provenance",
+        "candidates",
+    }
+)
+
+
+class MentionCandidate(BaseModel):
+    """One candidate entity for a mention, with its supporting confidence."""
+
+    entity_ref: str
+    confidence: float
+    role: str = "candidate"  # candidate|canonical|unknown
+
+
+class SourceMention(BaseModel):
+    """A source mention pinned to evidence, with provenance + confidence state."""
+
+    id: uuid.UUID | None = None
+    source_id: str
+    segment_id: str | None = None
+    entity_id: str | None = None
+    mention_text: str
+    mention_kind: str = "name"
+    normalized_forms: list[str] = Field(default_factory=list)
+    speaker_label: str | None = None
+    face_cluster: str | None = None
+    confidence_state: str = ConfidenceState.UNKNOWN.value
+    confidence: float | None = None
+    language: str | None = None
+    script: str | None = None
+    candidates: list[MentionCandidate] = Field(default_factory=list)
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    metadata_: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def mention_id(self) -> str:
+        return str(self.id) if self.id is not None else self._computed_id
+
+    @property
+    def _computed_id(self) -> str:
+        # Deterministic pre-insert mention id so split-time rebound references
+        # and replay stay stable even before the row id is assigned.
+        raw = f"{self.source_id}\x1f{self.mention_text}\x1f{self.segment_id or ''}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+    def to_event(self) -> SemanticEvent:
+        """The ``EntityMentioned`` semantic event for this mention."""
+        authority = (
+            "USER_OVERRIDE"
+            if self.confidence_state == ConfidenceState.USER_CONFIRMED.value
+            else "machine"
+        )
+        return SemanticEvent(
+            event_type="EntityMentioned",
+            authority=authority,
+            confidence=self.confidence,
+            generated_by=self.provenance.get("generated_by") or {},
+            payload={
+                "mention_id": self.mention_id,
+                "source_id": self.source_id,
+                "entity_id": self.entity_id,
+                "segment_id": self.segment_id,
+                "mention_text": self.mention_text,
+                "normalized_forms": self.normalized_forms,
+                "speaker_label": self.speaker_label,
+            },
+        )
+
+    def _metadata_blob(self) -> dict[str, Any]:
+        blob: dict[str, Any] = {
+            "mention_kind": self.mention_kind,
+            "confidence_state": self.confidence_state,
+            "confidence": self.confidence,
+            "language": self.language,
+            "script": self.script,
+            "provenance": self.provenance,
+            **self.metadata_,
+        }
+        if self.candidates:
+            blob["candidates"] = [
+                {"entity_ref": c.entity_ref, "confidence": c.confidence, "role": c.role}
+                for c in self.candidates
+            ]
+        return blob
+
+
+class MentionRepository(Protocol):
+    """Persists source mentions (the ``entity_mention`` table)."""
+
+    def record(self, mention: SourceMention) -> str: ...
+    def get(self, mention_id: str) -> SourceMention | None: ...
+    def mentions_for_source(self, source_id: str) -> list[SourceMention]: ...
+    def mentions_for_entity(self, entity_id: str) -> list[SourceMention]: ...
+    def rebind(self, mention_id: str, entity_id: str | None) -> None: ...
+
+
+@dataclass
+class RecordedMention:
+    """Result of recording one mention."""
+
+    mention_id: str
+    is_new: bool
+
+
+class PostgresMentionRepository:
+    """``MentionRepository`` backed by the ``entity_mention`` table."""
+
+    def __init__(self, engine: sa.Engine) -> None:
+        self._engine = engine
+
+    def record(self, mention: SourceMention) -> str:
+        mid = str(self._row_values(mention)["id"])
+        with self._engine.begin() as conn:
+            conn.execute(
+                pg_insert(_mention_t)
+                .values(**self._row_values(mention))
+                .on_conflict_do_nothing(index_elements=["id"])
+            )
+        return mid
+
+    def get(self, mention_id: str) -> SourceMention | None:
+        with self._engine.connect() as conn:
+            r = conn.execute(sa.select(_mention_t).where(_mention_t.c.id == mention_id)).first()
+        return self._to_mention(r) if r is not None else None
+
+    def mentions_for_source(self, source_id: str) -> list[SourceMention]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(_mention_t).where(_mention_t.c.source_id == source_id)
+            ).fetchall()
+        return [self._to_mention(r) for r in rows]
+
+    def mentions_for_entity(self, entity_id: str) -> list[SourceMention]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(_mention_t).where(_mention_t.c.entity_id == entity_id)
+            ).fetchall()
+        return [self._to_mention(r) for r in rows]
+
+    def rebind(self, mention_id: str, entity_id: str | None) -> None:
+        """Re-point a mention at an entity (split/merge rebound)."""
+        if not mention_id:
+            return
+        with self._engine.begin() as conn:
+            conn.execute(
+                _mention_t.update().where(_mention_t.c.id == mention_id).values(entity_id=entity_id)
+            )
+
+    @staticmethod
+    def _row_values(mention: SourceMention) -> dict[str, Any]:
+        return {
+            "id": str(mention.id) if mention.id is not None else _uuid_hex(),
+            "entity_id": mention.entity_id,
+            "source_id": mention.source_id,
+            "segment_id": mention.segment_id,
+            "mention_text": mention.mention_text,
+            "normalized_forms": mention.normalized_forms or [],
+            "speaker_label": mention.speaker_label,
+            "face_cluster": mention.face_cluster,
+            "metadata_": mention._metadata_blob(),
+        }
+
+    @staticmethod
+    def _to_mention(r: Any) -> SourceMention:
+        meta = dict(r.metadata_ or {})
+        return SourceMention(
+            id=r.id,
+            source_id=PostgresMentionRepository._sid(r.source_id),
+            segment_id=PostgresMentionRepository._sid(r.segment_id) if r.segment_id else None,
+            entity_id=PostgresMentionRepository._sid(r.entity_id) if r.entity_id else None,
+            mention_text=r.mention_text,
+            mention_kind=meta.get("mention_kind", "name"),
+            normalized_forms=[str(f) for f in (r.normalized_forms or [])],
+            speaker_label=r.speaker_label,
+            face_cluster=r.face_cluster,
+            confidence_state=meta.get("confidence_state", ConfidenceState.UNKNOWN.value),
+            confidence=meta.get("confidence"),
+            language=meta.get("language"),
+            script=meta.get("script"),
+            candidates=[
+                MentionCandidate(**c) for c in meta.get("candidates") or [] if isinstance(c, dict)
+            ],
+            provenance=dict(meta.get("provenance") or {}),
+            metadata_={k: v for k, v in meta.items() if k not in _RESERVED_METADATA},
+        )
+
+    @staticmethod
+    def _sid(value: Any) -> str:
+        return value.hex if hasattr(value, "hex") else str(value)
+
+
+@dataclass
+class MentionService:
+    """Appends an ``EntityMentioned`` event and persists its row atomically."""
+
+    ledger: SemanticLedger
+    repository: MentionRepository
+
+    def record(self, mention: SourceMention) -> tuple[CommitResult, str]:
+        """Persist the mention row and append its event in ONE transaction.
+
+        Returns ``(commit, mention_id)``. The row is written via
+        ``complete_and_append`` side-effects so the event and the row commit
+        atomically — a crash cannot leave an event without its mention row.
+        """
+        mid = str(mention.id) if mention.id is not None else _uuid_hex()
+        mention = mention.model_copy(update={"id": uuid.UUID(mid)})
+        event = mention.to_event()
+
+        def _side(conn: sa.Connection) -> None:
+            conn.execute(
+                pg_insert(_mention_t)
+                .values(**PostgresMentionRepository._row_values(mention))
+                .on_conflict_do_nothing(index_elements=["id"])
+            )
+
+        result = self.ledger.complete_and_append(
+            events=[event], idempotency_key=None, side_effects=_side
+        )
+        return result, mid

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/events/EntityResolved/v1.json",
+  "title": "EntityResolved",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "entity_id"
+  ],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": [
+        "MERGE",
+        "SPLIT",
+        "ALIAS"
+      ]
+    },
+    "entity_id": {
+      "type": "string"
+    },
+    "target_entity_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "assignments": {
+      "type": "object"
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "quarantined_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

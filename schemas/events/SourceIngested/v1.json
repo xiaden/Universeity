@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/events/SourceIngested/v1.json",
+  "title": "SourceIngested",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "source_id",
+    "sha512",
+    "ocfl_ref",
+    "size_bytes",
+    "media_kind"
+  ],
+  "properties": {
+    "source_id": {
+      "type": "string"
+    },
+    "work_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sha512": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{128}$"
+    },
+    "ocfl_ref": {
+      "type": "string"
+    },
+    "size_bytes": {
+      "type": "integer"
+    },
+    "media_kind": {
+      "type": "string"
+    },
+    "format": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "language": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "original_name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "descriptor": {
+      "type": "object"
+    }
+  }
+}

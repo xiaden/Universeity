@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/events/HallucinationFiltered/v1.json",
+  "title": "HallucinationFiltered",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "reference",
+    "outcome"
+  ],
+  "properties": {
+    "source_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "reference": {
+      "type": "string"
+    },
+    "outcome": {
+      "type": "string"
+    },
+    "filter_signal": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "signals": {
+      "type": "object"
+    },
+    "replaced_with": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

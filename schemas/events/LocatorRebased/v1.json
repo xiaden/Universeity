@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/events/LocatorRebased/v1.json",
+  "title": "LocatorRebased",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "old_locator",
+    "new_locator"
+  ],
+  "properties": {
+    "old_locator": {
+      "type": "string"
+    },
+    "new_locator": {
+      "type": "string"
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "affected_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "source_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

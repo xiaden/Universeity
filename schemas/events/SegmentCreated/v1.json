@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/events/SegmentCreated/v1.json",
+  "title": "SegmentCreated",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "source_id",
+    "segment_id",
+    "deterministic_key",
+    "modality",
+    "segment_type",
+    "locator"
+  ],
+  "properties": {
+    "source_id": {
+      "type": "string"
+    },
+    "segment_id": {
+      "type": "string"
+    },
+    "deterministic_key": {
+      "type": "string"
+    },
+    "segment_type": {
+      "type": "string"
+    },
+    "modality": {
+      "type": "string"
+    },
+    "locator": {
+      "type": "string"
+    },
+    "ordinal": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

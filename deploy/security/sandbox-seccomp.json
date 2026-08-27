@@ -1,0 +1,32 @@
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "architectures": ["SCMP_ARCH_X86_64", "SCMP_ARCH_AARCH64"],
+  "syscalls": [
+    {
+      "names": [
+        "read", "write", "close", "lseek", "fstat", "stat", "lstat",
+        "readlink", "readlinkat", "openat", "fcntl", "ioctl", "mmap",
+        "munmap", "mprotect", "brk", "munlockall", "arch_prctl",
+        "set_tid_address", "set_robust_list", "prctl", "prlimit64",
+        "getpid", "gettid", "getrandom", "gettimeofday", "clock_gettime",
+        "clock_getres", "nanosleep", "futex", "clone", "clone3", "execve",
+        "execveat", "exit", "exit_group", "rt_sigreturn", "rt_sigaction",
+        "rt_sigprocmask", "rt_sigpending", "sigaltstack", "sched_yield",
+        "getrlimit", "setrlimit", "umask", "getuid", "getgid", "geteuid",
+        "getegid", "capget", "capset", "statfs", "fstatfs", "sysinfo",
+        "uname", "dup", "dup2", "dup3", "pipe", "pipe2", "socket",
+        "socketpair", "setsockopt", "getsockopt", "connect", "bind",
+        "listen", "accept", "accept4", "sendto", "recvfrom", "sendmsg",
+        "recvmsg", "poll", "select", "epoll_create1", "epoll_wait",
+        "eventfd2", "readv", "writev", "pread64", "pwrite64", "getdents64",
+        "flock", "fsync", "fdatasync", "truncate", "ftruncate", "mkdirat",
+        "mknodat", "unlinkat", "renameat", "renameat2", "linkat",
+        "symlinkat", "chmod", "fchmod", "fchmodat", "chown", "fchown",
+        "fchownat", "access", "faccessat", "newfstatat", "setgroups",
+        "setresuid", "setresgid", "setuid", "setgid", "unshare"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}
