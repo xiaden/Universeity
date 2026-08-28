@@ -1,9 +1,19 @@
-"""Source / locator / evidence / report routes (P3-S1).
+"""Source / locator / evidence / report routes (P3-S1..P3-S4).
 
 Ingest stores immutable bytes to the OCFL source store (content-addressed by
 sha512), records the ``SOURCE_INGESTED`` ledger event, and returns the resulting
-read-your-writes token. Media pipelines are delegated (a job is submitted); no
-shell interpolation, no projection writes from this boundary.
+read-your-writes token. Two ingestion forms are supported (P3-S2):
+
+* the retained **small inline-text JSON** form (``SourceIngestRequest`` with
+  ``content``) for compatibility;
+* a bounded **multipart streamed upload** (``file`` + descriptor form fields)
+  covering text/image/audio/video/subtitle source kinds.
+
+Bytes are stored immutably via :meth:`SourceStore.put_immutable` BEFORE dispatch.
+Decomposition is delegated through :class:`JobService` with the *production*
+stage registry (``ctx.work_registry``, never ``{}``). Dispatch/submission failures
+are surfaced as structured RFC 7807 errors or durable failed jobs — never
+swallowed (P3-S3). No projection writes and no shell interpolation happen here.
 """
 
 from __future__ import annotations
@@ -15,7 +25,8 @@ from contextlib import suppress
 from typing import Any
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
+from pydantic import ValidationError
 
 from umd.api.deps import (
     AppContext,
@@ -23,8 +34,9 @@ from umd.api.deps import (
     get_context,
     get_principal,
     get_write_principal,
+    serialize_audits,
 )
-from umd.api.errors import NotFoundError
+from umd.api.errors import ApiError, NotFoundError
 from umd.api.pagination import offset_from, page_cursors
 from umd.api.schemas import (
     EvidenceListResponse,
@@ -37,31 +49,144 @@ from umd.api.schemas import (
     SourceIngestRequest,
 )
 from umd.storage.ocfl.store import SourceDescriptor
+from umd.storage.postgres.tables import segment as _segment_table
 
 router = APIRouter(prefix="/v1", tags=["sources"], dependencies=[Depends(enforce_rate_limit)])
 
 
-@router.post("/sources", response_model=SourceDescriptorResponse, status_code=201)
-@router.post("/sources/{media_kind}", response_model=SourceDescriptorResponse, status_code=201)
-def ingest_source(
-    media_kind: str | None = None,
-    body: SourceIngestRequest | None = None,
-    _p: Any = Depends(get_write_principal),
-    ctx: AppContext = Depends(get_context),
-) -> SourceDescriptorResponse:
-    media = body.media_kind if body is not None else (media_kind or "txt")
-    original = body.original_name if body is not None else None
-    work_id = body.work_id if body is not None else None
-    content = (body.content if body is not None else None) or ""
-    content_type = (body.content_type if body is not None else None) or "text/plain"
-    source_id = (body.source_id if body is not None else None) or uuid.uuid4().hex
+def _segment_ids_by_key(engine: sa.Engine, source_id: str) -> dict[str, str]:
+    """Map ``deterministic_key -> DB segment row id`` for a committed source.
 
-    stream = io.BytesIO(content.encode("utf-8"))
+    The public segment list must expose the DB row id so the id round-trips
+    through :meth:`PostgresSegmentStore.resolve_segment` and the DB-id-keyed
+    evidence store (P3-S4), rather than the derived deterministic id.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.select(_segment_table.c.deterministic_key, _segment_table.c.id).where(
+                _segment_table.c.source_id == source_id
+            )
+        ).fetchall()
+    return {str(r.deterministic_key): str(r.id) for r in rows}
+
+
+def _form_str(value: Any) -> str | None:
+    """Coerce a multipart form value to ``str`` (or ``None``)."""
+    return str(value) if value is not None else None
+
+
+def _max_upload_bytes(ctx: AppContext) -> int:
+    """The configured max_upload_bytes (0/absent disables the bound)."""
+    return int(getattr(ctx.settings.limits, "max_upload_bytes", 0))
+
+
+def _upload_too_large_error(max_upload: int) -> ApiError:
+    """The RFC 7807 413 error shape used for every oversize-upload rejection."""
+    return ApiError(
+        f"upload exceeds max_upload_bytes={max_upload}",
+        status=413,
+        code="upload_too_large",
+        retryable=False,
+    )
+
+
+async def _read_bounded(file: Any, max_upload: int, chunk_size: int = 1 << 16) -> bytes:
+    """Stream ``file`` into memory, aborting as soon as the accumulated size
+    exceeds ``max_upload`` (so an oversize upload never buffers the whole body).
+
+    When ``max_upload`` is 0/None the bound is disabled and the whole body is read
+    (legacy behaviour). Otherwise we read in chunks and raise the RFC 7807 413
+    error the moment the count passes the bound, discarding the stream.
+    """
+    if not max_upload:
+        return bytes(await file.read())
+    total = 0
+    chunks: list[bytes] = []
+    while True:
+        chunk = await file.read(chunk_size)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_upload:
+            raise _upload_too_large_error(max_upload)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _coerce_body(raw: Any) -> SourceIngestRequest | None:
+    """Validate the inline-JSON body (RFC 7807 422 on a malformed payload)."""
+    if raw is None:
+        return None
+    try:
+        return SourceIngestRequest.model_validate(raw)
+    except ValidationError as exc:  # noqa: PERF203
+        raise ApiError(
+            "request validation failed",
+            status=422,
+            code="validation_error",
+            extra={"errors": exc.errors()},
+        ) from exc
+
+
+def _dispatch(ctx: AppContext, *, job_id: str, source_id: str, media_kind: str) -> None:
+    """Submit the real production DAG; surface dispatch failures (P3-S3).
+
+    Submission always carries the production stage registry (never ``{}``). A
+    deterministic quarantine is surfaced as a structured 422; any other dispatch
+    backend failure is a structured, retryable 500 — never swallowed.
+    """
+    from umd.jobs.stage_execution import StageQuarantinedError
+
+    try:
+        ctx.jobs.submit(
+            job_id=job_id,
+            source_id=source_id,
+            dag_universe="base",
+            work_registry=ctx.work_registry,
+            request={"source_id": source_id, "media_kind": media_kind},
+        )
+    except StageQuarantinedError as exc:
+        raise ApiError(
+            str(exc),
+            status=422,
+            code="stage_quarantined",
+            retryable=False,
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - never swallow dispatch failures
+        raise ApiError(
+            f"job dispatch failed: {exc}",
+            status=500,
+            code="dispatch_failed",
+            retryable=True,
+        ) from exc
+
+
+def _submit_source(
+    ctx: AppContext,
+    *,
+    media_kind: str,
+    original_name: str | None,
+    work_id: str | None,
+    content: bytes,
+    content_type: str,
+    source_id: str,
+    key: str,
+) -> SourceDescriptorResponse:
+    """Store bytes immutably, record the source, and dispatch the production DAG."""
+    # Bounded upload enforcement (P3-S2): reject oversize payloads up-front with a
+    # structured RFC 7807 error before any storage side effect. For the inline-JSON
+    # / any already-buffered path this is a final backstop — the multipart path
+    # already pre-checks Content-Length and aborts the streaming read early.
+    max_upload = _max_upload_bytes(ctx)
+    if content and max_upload and len(content) > max_upload:
+        raise _upload_too_large_error(max_upload)
+
+    stream = io.BytesIO(content or b"")
     manifest = ctx.source_store.put_immutable(
         stream,
         SourceDescriptor(
-            logical_name=original or f"{source_id}.txt",
-            media_kind=media,
+            logical_name=original_name or f"{source_id}.txt",
+            media_kind=media_kind,
             kind="source",
             content_type=content_type,
         ),
@@ -69,50 +194,104 @@ def ingest_source(
 
     ctx.memberships.ensure_source(
         source_id=source_id,
-        ocfl_ref=manifest.store_path,
+        ocfl_ref=manifest.object_id,
         sha512=manifest.sha512,
         size_bytes=manifest.size_bytes,
-        media_kind=media,
-        original_name=original,
+        media_kind=media_kind,
+        original_name=original_name,
         work_id=work_id,
     )
     commit = ctx.commands.record_source_ingested(
         source_id=source_id,
         sha512=manifest.sha512,
-        ocfl_ref=manifest.store_path,
+        ocfl_ref=manifest.object_id,
         size_bytes=manifest.size_bytes,
-        media_kind=media,
+        media_kind=media_kind,
         work_id=work_id,
-        original_name=original,
+        original_name=original_name,
         # The ledger requires idempotency keys to be valid UUIDs; derive a stable
         # one from the source id so a retried ingest of the same source is idempotent.
         idempotency_key=uuid.uuid5(uuid.NAMESPACE_URL, f"ingest:{source_id}"),
-        created_by=_p.key,
+        created_by=key,
     )
 
-    # Delegate the decomposition pipeline: submit a job (runs synchronously in-process).
+    # Delegate the decomposition pipeline: submit the real ordered DAG.
     job_id = f"job-{source_id[:12]}"
-    try:
-        ctx.jobs.submit(
-            job_id=job_id,
-            source_id=source_id,
-            dag_universe="base",
-            work_registry={},
-            request={"source_id": source_id, "media_kind": media},
-        )
-    except Exception:  # noqa: BLE001 - pipeline submission must not fail the ingest
-        ctx.log and ctx.log.warning("job submission failed after ingest", source_id=source_id)
+    _dispatch(ctx, job_id=job_id, source_id=source_id, media_kind=media_kind)
 
     return SourceDescriptorResponse(
         source_id=source_id,
         work_id=work_id,
-        ocfl_ref=manifest.store_path,
+        ocfl_ref=manifest.object_id,
         sha512=manifest.sha512,
         size_bytes=manifest.size_bytes,
-        media_kind=media,
-        original_name=original,
+        media_kind=media_kind,
+        original_name=original_name,
         seq=commit.seq,
         consistency_token=commit.seq,
+    )
+
+
+@router.post("/sources", response_model=SourceDescriptorResponse, status_code=201)
+@router.post("/sources/{media_kind}", response_model=SourceDescriptorResponse, status_code=201)
+async def ingest_source(
+    request: Request,
+    media_kind: str | None = None,
+    _p: Any = Depends(get_write_principal),
+    ctx: AppContext = Depends(get_context),
+) -> SourceDescriptorResponse:
+    """Ingest a source via inline JSON (compat) or a bounded multipart upload."""
+    ctype = (request.headers.get("content-type") or "").lower()
+    if ctype.startswith("multipart/form-data"):
+        # Reject oversize uploads up-front from the declared Content-Length, BEFORE
+        # parsing the multipart body. The header covers the whole request (incl.
+        # multipart framing overhead), so it is a conservative early rejection; the
+        # exact file-size bound is enforced again by the bounded streamed read below.
+        max_upload = _max_upload_bytes(ctx)
+        declared = request.headers.get("content-length")
+        if max_upload and declared:
+            try:
+                declared_size = int(declared)
+            except ValueError:  # non-numeric length -> no reliable early signal
+                declared_size = -1
+            if declared_size > max_upload:
+                raise _upload_too_large_error(max_upload)
+        form = await request.form()
+        file: Any = form.get("file")
+        if file is None or not hasattr(file, "read"):
+            raise ApiError(
+                "multipart upload requires a 'file' part", status=422, code="missing_file"
+            )
+        data = await _read_bounded(file, max_upload)
+        return _submit_source(
+            ctx,
+            media_kind=_form_str(form.get("media_kind")) or media_kind or "txt",
+            original_name=_form_str(form.get("original_name")),
+            work_id=_form_str(form.get("work_id")),
+            content=data,
+            content_type=_form_str(form.get("content_type"))
+            or getattr(file, "content_type", None)
+            or "application/octet-stream",
+            source_id=_form_str(form.get("source_id")) or uuid.uuid4().hex,
+            key=_p.key,
+        )
+
+    body = _coerce_body(await request.json())
+    media = body.media_kind if body is not None else (media_kind or "txt")
+    original = body.original_name if body is not None else None
+    work_id = body.work_id if body is not None else None
+    content = (body.content if body is not None else None) or ""
+    content_type = (body.content_type if body is not None else None) or "text/plain"
+    source_id = (body.source_id if body is not None else None) or uuid.uuid4().hex
+    return _submit_source(
+        ctx,
+        media_kind=media,
+        original_name=original,
+        work_id=work_id,
+        content=content.encode("utf-8"),
+        content_type=content_type,
+        source_id=source_id,
+        key=_p.key,
     )
 
 
@@ -151,9 +330,10 @@ def list_segments(
     offset = offset_from(cursor)
     segs = ctx.segments.segments_for_source(source_id)
     total = len(segs)
+    ids_by_key = _segment_ids_by_key(ctx.engine, source_id)
     items = [
         SegmentResponse(
-            segment_id=s.segment_id,
+            segment_id=ids_by_key.get(s.deterministic_key, s.segment_id),
             source_id=s.source_id,
             kind=s.segment_type,
             start=getattr(s, "ordinal", None),
@@ -234,16 +414,19 @@ def rerun_source(
     _p: Any = Depends(get_write_principal),
 ) -> dict[str, Any]:
     job_id = f"job-{source_id[:12]}"
-    events = ctx.jobs.events(job_id)
     ctx.jobs.rerun_source(
         source_id=source_id,
         scope="SOURCE",
         causation="api:rerun",
         dag_universe="base",
-        work_registry={},
+        work_registry=ctx.work_registry,
         job_id=job_id,
     )
-    return {"job_id": job_id, "action": "rerun", "targets": list(events)}
+    return {
+        "job_id": job_id,
+        "action": "rerun",
+        "targets": serialize_audits(ctx.jobs.events(job_id)),
+    }
 
 
 @router.get("/sources/{source_id}/report")
@@ -266,10 +449,28 @@ def source_analysis(
     ctx: AppContext = Depends(get_context),
     _p: Any = Depends(get_principal),
 ) -> dict[str, Any]:
+    """Expose REAL durable stage state (P3-S4): status, operational events, and
+    per-stage attempts/states from the durable job store — never fake completion."""
     job_id = f"job-{source_id[:12]}"
     status = "unknown"
     events: list[Any] = []
+    stages: list[dict[str, Any]] = []
     with suppress(Exception):
         status = ctx.jobs.status(job_id)
         events = ctx.jobs.events(job_id)
-    return {"source_id": source_id, "job_id": job_id, "status": status, "events": events}
+        store = ctx.extra["job_store"]
+        stages = [
+            {
+                "stage": s.stage_name,
+                "status": s.status,
+                "attempts": s.attempts,
+            }
+            for s in store.stage_states(job_id)
+        ]
+    return {
+        "source_id": source_id,
+        "job_id": job_id,
+        "status": status,
+        "events": serialize_audits(events),
+        "stages": stages,
+    }

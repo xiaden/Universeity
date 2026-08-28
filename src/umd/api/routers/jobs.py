@@ -12,6 +12,7 @@ from umd.api.deps import (
     get_context,
     get_principal,
     get_write_principal,
+    serialize_audits,
 )
 from umd.api.errors import ApiError, NotFoundError
 from umd.api.schemas import JobActionResponse, JobResponse
@@ -50,7 +51,7 @@ def job_events(
     _p: object = Depends(get_principal),
 ) -> list[Any]:
     try:
-        return cast(list[Any], ctx.jobs.events(job_id))
+        return cast(list[Any], serialize_audits(ctx.jobs.events(job_id)))
     except Exception as exc:  # noqa: BLE001
         raise NotFoundError(f"unknown job {job_id}") from exc
 
@@ -75,7 +76,7 @@ def retry_job(
     _p: object = Depends(get_write_principal),
 ) -> JobActionResponse:
     try:
-        ctx.jobs.retry(job_id=job_id, work_registry={}, dag_universe="base")
+        ctx.jobs.retry(job_id=job_id, work_registry=ctx.work_registry, dag_universe="base")
     except KeyError as exc:
         raise NotFoundError(f"unknown job {job_id}") from exc
     except Exception as exc:  # noqa: BLE001

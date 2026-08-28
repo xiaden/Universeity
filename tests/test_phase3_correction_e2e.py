@@ -253,7 +253,7 @@ def _scenario(
 
     # audio -> ASR with distinct utterance-level speaker candidates (no promotion)
     cfg = AudioConfig(declared_language="en")
-    config_digest_of(cfg)
+    cfg.config_digest = config_digest_of(cfg)  # persist digest for evidence idempotency
     aout = run_audio_baseline(_wav_decoded(multi_speaker_audio_wav_bytes()), cfg)
     assert aout.asr is not None and aout.asr.utterances
     uttr = " ".join(wd.word for u in aout.asr.utterances for wd in u.words)

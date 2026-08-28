@@ -56,6 +56,26 @@ ocr = [
     # "paddleocr==2.9.*",
 ]
 
+# ASR provider extras. faster-whisper is the validated self-hostable ASR path
+# (P2-S1..S3) but is HEAVY (ctranslate2/onnxruntime/huggingface-hub/av/numpy) and is
+# deliberately NOT in the base image — the adapter loads the model only inside the
+# sandboxed audio worker (umd.audio.dispatch), never the API process. Model weights
+# are separate (Systran/faster-whisper-tiny.en, MIT) and pulled into the env-driven
+# UMD_ASR_MODEL_CACHE dir. See deploy/pins/asr-runtime.md for the validated pins.
+asr = [
+    # MIT-licensed; CTranslate2 CPU Whisper. Pinned to the resolved 1.2.1 line
+    # (ctranslate2 4.8.1, onnxruntime 1.29.0) recorded in deploy/pins/asr-runtime.md.
+    "faster-whisper==1.2.1",
+]
+
+# Hatchet worker extras (GATED, opt-in). Hatchet is the SOLE v1 scheduler/runner;
+# the SDK is NOT in the base image — the worker role installs it. Pinned to the
+# candidate SDK release recorded in deploy/pins/runtime.txt (1.38.1 <-> server
+# v0.105.2), PENDING live shape-test validation in Plan J (not release evidence).
+worker = [
+    "hatchet-sdk==1.38.1",
+]
+
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
@@ -139,6 +159,22 @@ module = ["splink", "splink.*", "duckdb"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+# Optional ASR runtime (faster-whisper + its transitive CTranslate2/decoder deps) is
+# imported lazily behind the gate (see umd.audio.asr). None ships PEP 561 typing and
+# none is a base dependency; the active path is validated at runtime.
+module = [
+    "faster_whisper",
+    "faster_whisper.*",
+    "ctranslate2",
+    "ctranslate2.*",
+    "tokenizers",
+    "onnxruntime",
+    "huggingface_hub",
+    "huggingface_hub.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 # Vecalign is a GATED PARALLEL_MONOTONE-only adapter; imports are defensive probes
 # behind the gate and it ships no PEP 561 typing.
 module = ["vecalign"]
@@ -150,6 +186,8 @@ addopts = "-ra"
 testpaths = ["tests"]
 markers = [
     "postgres: requires a live PostgreSQL server (env UMD_TEST_POSTGRES=true)",
+    "docker: requires the Docker Compose stack (skipped honestly when no Docker daemon)",
+    "cluster: requires a live Hatchet cluster (skipped honestly when UMD_HATCHET_*/SDK absent)",
 ]
 
 [tool.coverage.run]

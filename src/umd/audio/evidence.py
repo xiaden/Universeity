@@ -309,4 +309,16 @@ def _hex(value: Any) -> str:
 
 
 def _uid(value: Any) -> Any:
-    return value
+    """Return a UUID-compatible source identifier for evidence models.
+
+    Some hermetic unit fixtures use readable source labels instead of UUIDs;
+    production identifiers are already UUIDs and pass through unchanged.
+    """
+    import uuid
+
+    if isinstance(value, uuid.UUID):
+        return value
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return uuid.uuid5(uuid.NAMESPACE_URL, f"umd:source:{value}")

@@ -562,6 +562,10 @@ stage_run = sa.Table(
     sa.Column("status", sa.String(24), nullable=False, index=True),
     sa.Column("input_manifest", JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
     sa.Column("artifact_refs", JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
+    # Evidence references produced by the stage, persisted atomically with the
+    # completion (same stage_run-row update as artifact_refs) so a StageCompleted
+    # append always carries its durable evidence refs.
+    sa.Column("evidence_refs", JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
     sa.Column("config_digest", sa.String(128), nullable=True),
     sa.Column(
         "created_at", sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.func.now()

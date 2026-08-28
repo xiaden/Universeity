@@ -9,6 +9,10 @@ enhancement as active.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
+from umd.audio.asr import _faster_whisper_installed, faster_whisper_runtime_ready
 from umd.audio.hallucination import S_ENERGY, S_LOGPROB, S_PROMOTION, S_VAD
 from umd.audio.types import AudioConfig
 
@@ -17,16 +21,45 @@ REFERENCE_ASR = "umd-reference-asr"
 FASTER_WHISPER = "faster-whisper"
 
 
+def _fw_gate_reason(cfg: AudioConfig) -> str:
+    """Honest, specific reason why the configured faster-whisper path is unavailable."""
+    cache = cfg.asr_model_dir or os.environ.get("UMD_ASR_MODEL_CACHE")
+    if not _faster_whisper_installed():
+        return (
+            "configured-but-unavailable: faster-whisper runtime not installed (install 'asr' extra)"
+        )
+    if not cache:
+        return "configured-but-unavailable: no model cache dir (set UMD_ASR_MODEL_CACHE)"
+    if not Path(cache).is_dir():
+        return "configured-but-unavailable: model cache dir missing"
+    return "configured-but-unavailable: model cache not validated"
+
+
 def audio_capability_report(config: AudioConfig | None = None) -> dict[str, object]:
     """The audio capability snapshot for ``/capabilities`` (honest gates)."""
     cfg = config or AudioConfig()
-    asr_active = REFERENCE_ASR if cfg.asr_engine != FASTER_WHISPER else None
-    fw_gated = cfg.asr_engine == FASTER_WHISPER
+    if cfg.asr_engine == FASTER_WHISPER:
+        ready = faster_whisper_runtime_ready(cfg.asr_model_dir)
+        asr_active = FASTER_WHISPER if ready else None
+        fw = {
+            "gated": not ready,
+            "enabled": True,
+            "active": ready,
+            "gate_reason": None if ready else _fw_gate_reason(cfg),
+        }
+    else:
+        asr_active = REFERENCE_ASR
+        fw = {
+            "gated": True,
+            "enabled": False,
+            "active": False,
+            "gate_reason": "faster-whisper not selected (reference ASR active)",
+        }
     return {
         "asr_engine": {
             "active": asr_active or "none",
             "reference_provider": REFERENCE_ASR,
-            "faster_whisper": {"gated": True, "enabled": fw_gated, "active": False},
+            "faster_whisper": fw,
         },
         "vad": {"active": "umd-reference-vad", "precedes_asr": True},
         "language": {"active": "umd-reference-lang", "honest_declared_or_unknown": True},

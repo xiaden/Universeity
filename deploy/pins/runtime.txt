@@ -48,10 +48,14 @@ mypy==2.3.1
 # license/CVE review (see LICENSE_REVIEW.md). Pins here reflect the *required
 # minimums* that the release gate enforces; the exact resolved version at build
 # time must be recorded in the container SBOM:
-#   faster-whisper>=1.0      (MIT)
+#   faster-whisper==1.2.1   (MIT; exact resolved pin + model in deploy/pins/asr-runtime.md)
 #   pyannote.audio>=3.0      (MIT, U1 legal gate)
 #   PySceneDetect>=0.6       (BSD-3)
 #   vllm>=0.6                (Apache-2.0; license interrogator for served weights)
+#   hatchet-sdk==1.38.1     (SDK pin; CANDIDATE — PENDING live shape-test validation in Plan J)
+#   hatchet-server==0.105.2  (server image pin; CANDIDATE — PENDING live shape-test validation
+#                             in Plan J; no Docker locally so NOT release evidence).
+#   (upgrade = bump both surfaces in lockstep, new DAG universe, drain in-flight before activation)
 #   hatchet-sdk (pinned exact — a build gate; see CVE_WATCH.md)
 #   splink>=4, duckdb        (MIT)
 #   vecalign>=1.0.1          (MIT)

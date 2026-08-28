@@ -91,7 +91,7 @@ def _ensure_audio_source(memberships, store, wav: bytes):
 
 def _baseline_output():
     cfg = AudioConfig(declared_language="en")
-    config_digest_of(cfg)
+    cfg.config_digest = config_digest_of(cfg)  # persist digest for evidence idempotency
     out = run_audio_baseline(_decoded(tone.render_phrase(["hi", "there"])), cfg)
     return out, cfg.config_digest
 
@@ -225,3 +225,115 @@ def test_audio_evidence_re_record_is_idempotent(umd_db, source_store) -> None:
             {"s": sid},
         ).scalar()
     assert n == len(r1.created)
+
+
+def test_filtered_raw_asr_recoverable_in_ocfl(umd_db, source_store) -> None:
+    # P2-S4: even when the four-signal filter drops an utterance from semantic
+    # consumption, the raw (pre-filter) ASR stays recoverable as audio_interval
+    # evidence AND the source bytes remain in OCFL. Nothing is lost by filtering.
+    from umd.audio import diarization, hallucination
+    from umd.audio.types import (
+        AsrResult,
+        AsrUtterance,
+        AsrWord,
+        AudioOutput,
+        SpeechSegment,
+        VadResult,
+    )
+
+    memberships = SourceMembershipService(umd_db)
+    sid, man = _ensure_audio_source(
+        memberships, source_store, _wav_bytes(tone.render_phrase(["hi", "there"]))
+    )
+    reg, ev = _pipeline(umd_db)
+
+    # A music-corrupted transcript with a strong VAD bed: low transcription-scoped
+    # confidence -> filtered, but the acoustic energy is genuinely present.
+    alty = AsrResult(
+        provider="umd-reference-asr",
+        provider_version="umd-reference-asr v1.0",
+        language="en",
+        confidence=0.03,
+        energy_correlation=0.95,
+        unmapped_count=4,
+        utterances=[
+            AsrUtterance(
+                index=1,
+                text="????",
+                start_s=0.2,
+                end_s=0.6,
+                music_suspected=True,
+                confidence=0.03,
+                words=[
+                    AsrWord(word="?", start_s=0.2, end_s=0.3, confidence=0.0),
+                    AsrWord(word="?", start_s=0.3, end_s=0.4, confidence=0.0),
+                    AsrWord(word="?", start_s=0.4, end_s=0.5, confidence=0.0),
+                    AsrWord(word="?", start_s=0.5, end_s=0.6, confidence=0.0),
+                ],
+            )
+        ],
+    )
+    vad_result = VadResult(
+        speech_segments=[SpeechSegment(0.0, 1.0)], total_speech_s=1.0, no_speech_ratio=0.0
+    )
+    outcome = hallucination.filter_hallucinations(
+        alty, AudioConfig(), source_id=sid, vad_result=vad_result
+    )
+    assert outcome.decisions and outcome.decisions[0].outcome == "filtered"
+
+    cfg = AudioConfig(declared_language="en")
+    cfg.config_digest = config_digest_of(cfg)  # persist digest for evidence idempotency
+    out = AudioOutput(
+        meta={
+            "format_name": "pcm_s16le",
+            "codec_name": "pcm_s16le",
+            "sample_rate": SR,
+            "channels": 1,
+            "duration_s": 1.0,
+            "bit_rate": None,
+            "decoder": "ffmpeg",
+            "renderer": "reference",
+        },
+        timing={"duration_s": 1.0, "n_samples": SR, "sample_rate": SR, "decoded_mono": True},
+        vad={
+            "has_speech": True,
+            "total_speech_s": 1.0,
+            "no_speech_ratio": 0.0,
+            "speech_segments": [{"start_s": 0.0, "end_s": 1.0}],
+        },
+        language=None,
+        asr=alty,
+        diarization=diarization.run_diarization(alty, config=cfg),
+        hallucination={
+            "energy_correlation": round(outcome.energy_correlation, 4),
+            "decisions": [
+                {
+                    "utterance_index": d.utterance_index,
+                    "reference": d.reference,
+                    "outcome": d.outcome,
+                    "trigger_signal": d.trigger_signal,
+                    "signals": d.signals,
+                    "replaced_with": d.replaced_with,
+                    "filtered_word_indices": d.filtered_word_indices,
+                }
+                for d in outcome.decisions
+            ],
+            "fpr_fnr_note": "measured in fixture tests; not detector-grade",
+        },
+    )
+    plan = build_audio_evidence_plan(
+        out, source_id=sid, source_sha512=man.sha512, config_digest=cfg.config_digest
+    )
+    reg.register(plan.segment_inputs)
+    ev.record(EvidenceBatch(records=plan.evidence))
+
+    # Raw (pre-filter) ASR is persisted as audio_interval evidence (recoverable).
+    persisted = _evidence_rows(ev, sid, EvidenceKind.AUDIO_INTERVAL.value)
+    assert persisted and all(_q(e, "text") == "????" for e in persisted)
+    # Versioned HallucinationFiltered events record the filtered decision, schema-valid.
+    assert plan.events and all(
+        e.event_type == EventType.HALLUCINATION_FILTERED.value for e in plan.events
+    )
+    assert all(e.prepare().payload["outcome"] == "filtered" for e in plan.events)
+    # Raw bytes retained in OCFL independent of filtering.
+    assert source_store.verify_fixity(man.object_id) is True

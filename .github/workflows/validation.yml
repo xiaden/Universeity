@@ -1,0 +1,297 @@
+# =============================================================================
+# UMD hosted validation workflow (Plan J, Phase 2)
+#
+# Runs the complete Definition-of-Done validation on a hosted GitHub Actions
+# `ubuntu-latest` runner using its NATIVE Docker/Compose engine:
+#   * lint, strict mypy, unit tests (no DB), and PostgreSQL integration tests,
+#   * image build + pinned Compose stack + migrations/readiness gates,
+#   * the public-boundary E2E scenario (tests/test_api_boundary_e2e.py) against
+#     the live stack, plus external HTTP representative flows,
+#   * named-volume persistence across an explicit api/worker stop/start,
+#   * clean teardown without masking an earlier failure, and
+#   * image-digest + optional-provider-gate release evidence in the job summary.
+#
+# HONESTY CONTRACT:
+#   * NO nested/in-container Docker engine, NO mounting the host Docker
+#     socket, NO containerised-setup action, NO service-container job for
+#     container validation. The docker-e2e job drives the host runner's
+#     native engine.
+#   * The worker is a GATED subsystem (hatchet_sdk + UMD_HATCHET_SERVER_URL/
+#     TOKEN, driven from repo state). If the real worker never becomes ready the
+#     job FAILS with captured logs; readiness is never faked.
+#   * The historical test suite is run unmodified and unweakened. The workflow
+#     only SELECTS it (unit: non-postgres; postgres job: full documented suite
+#     with UMD_TEST_POSTGRES=true; docker-e2e: the boundary scenario against the
+#     live stack). No assertions are edited, skipped, or relaxed here.
+#
+# The only service-container used anywhere is a plain `postgres` service
+# container that feeds the PostgreSQL-marked tests in the `test-postgres` job —
+# explicitly permitted for the DB-backed integration tests; it performs no
+# container/API validation (see the P2-S2 note on "real Postgres service").
+# =============================================================================
+name: validation
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: umd-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # P2-S2 (part 1): lint, strict typecheck, unit tests (no DB)
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Ruff lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dev dependencies
+        run: pip install --no-cache-dir -e ".[dev]"
+      - name: Ruff lint (zero errors required)
+        run: |
+          set -o pipefail
+          ruff check src tests 2>&1 | tee ruff-lint.log
+      - name: Upload lint output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruff-lint-output
+          path: ruff-lint.log
+          if-no-files-found: warn
+
+  typecheck:
+    name: Mypy strict typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dev dependencies
+        run: pip install --no-cache-dir -e ".[dev]"
+      - name: "Mypy strict (pyproject: strict = true)"
+        run: |
+          set -o pipefail
+          mypy src 2>&1 | tee mypy.log
+      - name: Upload typecheck output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mypy-output
+          path: mypy.log
+          if-no-files-found: warn
+
+  test-unit:
+    name: Unit tests (no DB)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dev dependencies
+        run: pip install --no-cache-dir -e ".[dev]"
+      - name: Run unit + storage tests (exclude postgres-marked)
+        run: |
+          set -o pipefail
+          pytest -q -m "not postgres" \
+            --junitxml=unit-junit.xml \
+            --cov=umd --cov-report=xml:unit-coverage.xml \
+            2>&1 | tee unit-tests.log
+      - name: Upload unit test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results
+          path: |
+            unit-junit.xml
+            unit-coverage.xml
+            unit-tests.log
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # P2-S2 (part 2): PostgreSQL integration tests against a real Postgres service
+  # ---------------------------------------------------------------------------
+  test-postgres:
+    name: PostgreSQL integration tests
+    runs-on: ubuntu-latest
+    services:
+      # Plain Postgres feeding the DB-backed tests ONLY. Not container
+      # validation: the docker-e2e job drives the real compose stack natively.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: umd
+          POSTGRES_PASSWORD: umd
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U umd -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      UMD_TEST_POSTGRES: "true"
+      UMD_PG_HOST: 127.0.0.1
+      UMD_PG_PORT: "5432"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dev dependencies
+        run: pip install --no-cache-dir -e ".[dev]"
+      - name: Run full suite with Postgres enabled (historical suite unmodified)
+        run: |
+          set -o pipefail
+          pytest -q \
+            --junitxml=postgres-junit.xml \
+            --cov=umd --cov-report=xml:postgres-coverage.xml \
+            2>&1 | tee postgres-tests.log
+      - name: Upload Postgres test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-test-results
+          path: |
+            postgres-junit.xml
+            postgres-coverage.xml
+            postgres-tests.log
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # P2-S1 / P2-S3 / P2-S4 / P2-S5 / P2-S6: native Docker/Compose E2E
+  # ---------------------------------------------------------------------------
+  docker-e2e:
+    name: Docker E2E (native Compose + API boundary)
+    runs-on: ubuntu-latest
+    # Native engine only: no nested/in-container Docker engine, no host
+    # Docker socket mount, no containerised-setup action, and no service
+    # containers for the stack.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dev dependencies (host, for running pytest over HTTP)
+        run: pip install --no-cache-dir -e ".[dev]"
+
+      # P2-S3: compose interpolation vars the pinned topology requires.
+      # HATCHET_COOKIE_SECRET / HATCHET_MASTER_KEY are REQUIRED (${VAR:?}) by the
+      # hatchet service; generated here, never committed. The worker's Hatchet
+      # connection vars are driven from repo state at runtime (Plan I owns the
+      # worker env wiring) with in-stack defaults that compose may interpolate.
+      - name: Set Compose runtime environment
+        run: |
+          echo "HATCHET_COOKIE_SECRET=$(python3 -c 'import secrets; print(secrets.token_hex(32))')" >> "$GITHUB_ENV"
+          echo "HATCHET_MASTER_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')" >> "$GITHUB_ENV"
+          echo "UMD_HATCHET_SERVER_URL=${UMD_HATCHET_SERVER_URL:-http://hatchet:8080}" >> "$GITHUB_ENV"
+          echo "UMD_HATCHET_TOKEN=${UMD_HATCHET_TOKEN:-umd-ci-token}" >> "$GITHUB_ENV"
+          echo "UMD_POSTGRES_PASSWORD=${UMD_POSTGRES_PASSWORD:-umd}" >> "$GITHUB_ENV"
+
+      - name: Build API/worker image and start pinned Compose stack
+        run: |
+          docker compose -f deploy/compose.yaml --profile sandbox up -d --build
+
+      # P2-S3: migrations run on start (UMD_RUN_MIGRATIONS_ON_START=1 in the
+      # compose anchor); readiness is polled on the published API port.
+      - name: Wait for API readiness (/v1/ready)
+        run: |
+          bash .github/scripts/wait-for-http.sh http://127.0.0.1:8080/v1/ready 240 5
+
+      # P2-S3: the real worker must register with Hatchet. This FAILS the job if
+      # the worker does not become ready (bounded timeout + captured logs).
+      - name: Wait for worker/scheduler readiness (gate)
+        run: |
+          bash .github/scripts/wait-for-worker.sh deploy/compose.yaml worker 240 5
+
+      - name: Record stack state and readiness evidence
+        run: |
+          bash .github/scripts/capture-diagnostics.sh deploy/compose.yaml diag-before
+          docker compose -f deploy/compose.yaml ps
+
+      # P2-S4: external HTTP representative flows + the full public-boundary
+      # scenario against the LIVE stack (no skip in CI).
+      - name: External HTTP representative flows (live service)
+        run: |
+          set -eux
+          curl -fsS http://127.0.0.1:8080/v1/version > /tmp/version.json
+          curl -fsS http://127.0.0.1:8080/v1/capabilities > /tmp/capabilities.json
+          curl -fsS http://127.0.0.1:8080/v1/health > /tmp/health.json
+          echo "version endpoint OK; capabilities endpoint OK; health endpoint OK"
+
+      - name: Run the public-boundary E2E scenario against the live stack
+        run: |
+          set -o pipefail
+          pytest -q tests/test_api_boundary_e2e.py \
+            --junitxml=boundary-junit.xml \
+            2>&1 | tee boundary-tests.log
+
+      # P2-S5: named persistent volumes (ocfl-db, ocfl-data) prove Postgres and
+      # OCFL survive restart via explicit api/worker stop/start.
+      - name: Persistence across api/worker restart (P2-S5)
+        run: |
+          docker compose -f deploy/compose.yaml stop api worker
+          docker compose -f deploy/compose.yaml ps
+          docker compose -f deploy/compose.yaml start api worker
+          bash .github/scripts/wait-for-http.sh http://127.0.0.1:8080/v1/ready 240 5
+          bash .github/scripts/wait-for-worker.sh deploy/compose.yaml worker 240 5
+          # OCFL namaste marker on the named volume proves source storage
+          # survived the restart (readiness also re-verified above).
+          docker compose -f deploy/compose.yaml exec -T api sh -c \
+            'if test -f /data/ocfl/0=ocfl_1.1; then echo "ocfl-data volume persisted (namaste present)"; else echo "ocfl-data MISSING namaste" >&2; exit 1; fi'
+
+      - name: Re-run boundary E2E after restart (prove persistence/resume)
+        run: |
+          set -o pipefail
+          pytest -q tests/test_api_boundary_e2e.py \
+            --junitxml=boundary-after-restart-junit.xml \
+            2>&1 | tee boundary-after-restart.log
+
+      # P2-S6: image digests + optional-provider gate summary (release evidence).
+      - name: Record image digests and provider gate summary
+        run: |
+          bash .github/scripts/record-release-summary.sh deploy/compose.yaml
+
+      # P2-S5/P2-S6: capture failure evidence even when an earlier step failed.
+      - name: Capture diagnostics (always)
+        if: always()
+        run: |
+          bash .github/scripts/capture-diagnostics.sh deploy/compose.yaml diag-final
+
+      - name: Upload Docker E2E evidence (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-e2e-evidence
+          path: |
+            diag-before/
+            diag-final/
+            boundary-junit.xml
+            boundary-after-restart-junit.xml
+            boundary-tests.log
+            boundary-after-restart.log
+          if-no-files-found: warn
+
+      # P2-S6: clean teardown in a final always-run step. Prior step failures
+      # already marked the job failed; teardown runs regardless and does not
+      # override them. continue-on-error keeps a teardown cleanup problem from
+      # overlaying the real result while still running to completion.
+      - name: Teardown Compose stack and volumes (always)
+        if: always()
+        continue-on-error: true
+        run: |
+          docker compose -f deploy/compose.yaml down -v --remove-orphans

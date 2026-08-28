@@ -72,7 +72,7 @@ class AudioPipeline:
 
     @cached_property
     def asr_result(self) -> AsrResult:
-        return asr_mod.ReferenceAsrProvider().asr(self.audio, config=self.config)
+        return asr_mod.run_asr(self.audio, config=self.config)
 
     @cached_property
     def filtered(self) -> hallucination.FilterOutcome:
@@ -87,6 +87,8 @@ class AudioPipeline:
     @cached_property
     def warnings(self) -> list[str]:
         out = list(self.asr_result.warnings)
+        if self.asr_result.gated and self.asr_result.gate_reason:
+            out.append(f"asr gated: {self.asr_result.gate_reason}")
         if self.diarization_result.gated and self.diarization_result.gate_reason:
             out.append(f"diarization gated: {self.diarization_result.gate_reason}")
         return out

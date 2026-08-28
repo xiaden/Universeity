@@ -23,6 +23,7 @@ htmlcov/
 
 # Local runtime data (never commit durable store volumes)
 /.ocfl-root/
+/.model-cache/
 /tmp/
 
 # IDE

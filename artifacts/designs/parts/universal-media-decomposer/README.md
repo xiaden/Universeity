@@ -30,6 +30,19 @@ The estimate classifies this as EPIC and requires sibling plans rather than one 
 | E | `TASK-universal-media-decomposer-E-operations-docs-deployment.md` | Operational hardening, observability, packaging, deployment, documentation, and extension gates | D |
 | F | `TASK-universal-media-decomposer-F-validation-release.md` | Full fixture matrix, replay/E2E/security/operational validation, final adversarial review and repair gate | E |
 
+## Remediation order after historical Plans A–F
+
+Plans A–F above are historical completed work and remain preserved. The authoritative Task.md gaps are remediated in this dependency order:
+
+| Order | Plan | Outcome | Prerequisite |
+|---|---|---|---|
+| G | `TASK-universal-media-decomposer-G-production-runner-api.md` | Real stage registry, durable production runner, and truthful API ingestion | A–F historical baseline |
+| H | `TASK-universal-media-decomposer-H-local-providers-modalities.md` | Validated self-hostable ASR plus real provider/modality composition | G |
+| I | `TASK-universal-media-decomposer-I-hatchet-worker-integration.md` | Pinned operational Hatchet scheduler and bound worker callbacks | G (H may proceed alongside) |
+| J | `TASK-universal-media-decomposer-J-api-boundary-ci-release.md` | Public-boundary E2E, hosted Docker CI, measured docs, final adversarial release gate | H and I |
+
+The remediation does not weaken prior contracts or add a competing scheduler. Hatchet remains the sole v1 scheduler; reference providers and unvalidated platform features are disclosed with explicit capability statuses and release evidence.
+
 No v1 plan introduces a semantic graph database, RDF authority/projection, dedicated vector database, XTDB witness, or Dagster scheduler. Their interfaces and measured promotion triggers remain documented extension paths.
 
 ## Shared contracts

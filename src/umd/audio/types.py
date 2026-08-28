@@ -155,6 +155,14 @@ class AsrResult:
     gated: bool = False
     #: Human-readable reason when ``gated`` is True (e.g. weights absent / not wired).
     gate_reason: str | None = None
+    #: generated-by metadata (P2-S3): the exact model that produced this transcript.
+    model_id: str | None = None
+    #: generated-by metadata: model/weight version actually observed at run time.
+    model_version: str | None = None
+    #: Config digest captured when the transcript was produced (evidence idempotency).
+    config_digest: str | None = None
+    #: ISO-8601 UTC timestamp of transcript generation (timestamped confidence).
+    generated_at: str | None = None
 
 
 @dataclass
@@ -191,6 +199,16 @@ class AudioConfig:
     asr_engine: str = "reference"
     #: Weights directory for the GATED faster-whisper path (None => gated/absent).
     asr_model_dir: str | None = None
+    #: Pinned faster-whisper model id/repo to load from ``asr_model_dir``.
+    asr_model_id: str = "Systran/faster-whisper-tiny.en"
+    #: CPU threads granted to the ASR worker (bounded, never the API process).
+    asr_cpu_threads: int = 4
+    #: faster-whisper decoder threads (CTranslate2 num_workers).
+    asr_num_workers: int = 1
+    #: Beam size for ordinary speech; reduced when music/SFX is suspected.
+    asr_beam_size: int = 5
+    #: faster-whisper compute type (int8 on CPU for self-hostable small models).
+    asr_compute_type: str = "int8"
     #: Gated diarization switch (pyannote behind license/weights gate).
     diarization_enabled: bool = False
     #: Weights directory for GATED pyannote diarization (None => gated/absent).

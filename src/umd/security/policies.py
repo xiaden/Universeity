@@ -96,10 +96,19 @@ PARSER_POLICIES: dict[str, ParserProfile] = {
         # 8192 so the streaming decode can fork on a thread-heavy host while still
         # capping runaway process growth. Address-space (RLIMIT_AS), CPU, time and
         # fd caps still apply to ffmpeg.
+        #
+        # ``memory_bytes`` must sit well above the 512MiB SandboxLimits default:
+        # the ASR stack (numpy/OpenBLAS + ctranslate2) allocates its buffers at
+        # import/load time and hard-aborts ('Memory allocation still failed' /
+        # 'mkl_malloc') under the address-space cliff. A 2GiB RLIMIT_AS reliably
+        # clears it for the validated faster-whisper model (numpy + ctranslate2/
+        # MKL reserve large virtual regions); far above the 512MiB default and
+        # mirroring the video policy's own decoder ceiling bump.
         limits=SandboxLimits(
             timeout_s=120.0,
             max_duration_s=600.0,
             nproc_limit=8192,
+            memory_bytes=2 * 1024 * 1024 * 1024,
         ),
     ),
     "video": ParserProfile(
@@ -112,10 +121,19 @@ PARSER_POLICIES: dict[str, ParserProfile] = {
         # filter, PTS frame anchors, stream inventory). Same RLIMIT_NPROC note
         # applies as audio: nproc is per-UID and thread-heavy hosts would starve
         # the decoder fork; generous-but-bounded with AS/CPU/time/fd still capped.
+        #
+        # ``memory_bytes`` must stay well above the 512MiB SandboxLimits default:
+        # the ffmpeg frame-anchoring pass (`select=...,showinfo` + `-frames:v`)
+        # allocates its decode/filter buffer pool right at the 512MiB AS cliff.
+        # Under the default it intermittently exhausts address space and exits
+        # rc=69 with "Output file is empty, nothing was encoded" -> zero frame
+        # anchors (silent, non-deterministic). A 1GiB RLIMIT_AS reliably clears
+        # that cliff (mirrors the ``pdf`` profile's own decoder ceiling bump).
         limits=SandboxLimits(
             timeout_s=180.0,
             max_duration_s=1200.0,
             nproc_limit=8192,
+            memory_bytes=1024 * 1024 * 1024,
         ),
     ),
     "subtitle": ParserProfile(

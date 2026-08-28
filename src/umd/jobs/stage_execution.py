@@ -41,6 +41,7 @@ from umd.storage.postgres.stage_repository import (
 )
 from umd.storage.postgres.tables import metadata as db_meta
 
+from .dag import STAGE_ORDER
 from .manifest import StageManifest, deterministic_uuid
 
 _run_t = db_meta.tables["stage_run"]
@@ -225,7 +226,7 @@ class DurableStageExecutor:
             # never ran while the key was unclaimed, so this is safe.
             existing = self._existing_run(key)
             if existing == STATUS_COMPLETE:
-                return StageRunRecord(claim=claim, state=STATUS_COMPLETE, replayed=True)
+                return self._replayed_complete(claim)
             if existing in (STATUS_CANCELLED, STATUS_QUARANTINED):
                 return StageRunRecord(claim=claim, state=existing, replayed=True)
             # in-flight or failed -> resume below (re-claim is a no-op on the key).
@@ -304,6 +305,7 @@ class DurableStageExecutor:
                 .values(
                     status=STATUS_COMPLETE,
                     artifact_refs=outcome.artifact_refs,
+                    evidence_refs=outcome.evidence_refs,
                     updated_at=_now(),
                 )
             )
@@ -393,6 +395,61 @@ class DurableStageExecutor:
             return conn.execute(
                 sa.select(_run_t.c.status).where(_run_t.c.idempotency_key == key)
             ).scalar()
+
+    def _replayed_complete(self, claim: StageRunClaim) -> StageRunRecord:
+        """Return a replay of an already-complete run, carrying its committed refs.
+
+        Read back the committed ``artifact_refs``/``evidence_refs`` from the
+        complete ``stage_run`` row so the returned record's outcome retains the
+        committed support chain (downstream threading / any consumer of
+        ``record.outcome`` keeps it), instead of treating replayed output as empty.
+        """
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(_run_t.c.artifact_refs, _run_t.c.evidence_refs).where(
+                    _run_t.c.id == claim.id
+                )
+            ).first()
+        artifact_refs = list(row.artifact_refs or []) if row is not None else []
+        evidence_refs = list(row.evidence_refs or []) if row is not None else []
+        return StageRunRecord(
+            claim=claim,
+            outcome=StageOutcome(artifact_refs=artifact_refs, evidence_refs=evidence_refs),
+            state=STATUS_COMPLETE,
+            replayed=True,
+        )
+
+    def committed_prior_refs(self, job_id: str, up_to_stage: str | None = None) -> list[str]:
+        """Committed artifact refs from COMPLETE ``stage_run`` rows for a job.
+
+        Merges the persisted ``artifact_refs`` of the rows whose stage is strictly
+        before ``up_to_stage`` in ``STAGE_ORDER`` (or all complete rows when
+        ``up_to_stage`` is None/unknown). The runner seeds ``prior_refs`` with this
+        so a retry/rerun/crash-resume reproduces the first-uncommitted stage's
+        ORIGINAL idempotency key — ``evidence_refs`` are idempotency material
+        (manifest.py), so re-seeding ``[]`` would build a different key and insert
+        a duplicate ``stage_run`` row.
+
+        Only ``artifact_refs`` are merged — matching the runner's own
+        :func:`_committed_refs` downstream threading — so the seed reproduces the
+        exact key the stage first ran under.
+        """
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(_run_t.c.stage_name, _run_t.c.artifact_refs).where(
+                    (_run_t.c.job_id == job_id) & (_run_t.c.status == STATUS_COMPLETE)
+                )
+            ).fetchall()
+        limit = STAGE_ORDER.index(up_to_stage) if up_to_stage in STAGE_ORDER else len(STAGE_ORDER)
+        merged: list[str] = []
+        for row in rows:
+            name = row.stage_name
+            if name not in STAGE_ORDER or STAGE_ORDER.index(name) >= limit:
+                continue
+            for ref in row.artifact_refs or []:
+                if ref and ref not in merged:
+                    merged.append(ref)
+        return merged
 
     @staticmethod
     def _to_run_manifest(manifest: StageManifest) -> StageRunManifest:

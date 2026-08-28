@@ -173,6 +173,12 @@ def _clone_kept(asr_result: AsrResult, kept_utterances: list[AsrUtterance]) -> A
         energy_correlation=asr_result.energy_correlation,
         warnings=list(asr_result.warnings),
         unmapped_count=asr_result.unmapped_count,
+        model_id=asr_result.model_id,
+        model_version=asr_result.model_version,
+        config_digest=asr_result.config_digest,
+        generated_at=asr_result.generated_at,
+        gated=asr_result.gated,
+        gate_reason=asr_result.gate_reason,
     )
 
 

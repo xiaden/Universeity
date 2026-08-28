@@ -4,6 +4,21 @@ Assembles the :class:`AppContext` (services over the Phase 1/2 building blocks),
 installs RFC 7807 error handlers, a request correlation-id middleware, real
 per-key/IP rate limiting, and mounts the versioned routers. OpenAPI is generated
 automatically and served at ``/openapi.json``.
+
+Production execution (P3-S1/P3-S4/P3-S5): :func:`build_context` wires the
+*durable* execution path — :class:`PostgresJobRepository` +
+:class:`DurableDAGRunner` over the composed production stage registry
+(:mod:`umd.jobs.production`). ``InMemoryJobStore`` and ``SynchronousRunner`` are
+NEVER instantiated here (they remain test-only doubles importable from
+:mod:`umd.api.runner` / :mod:`umd.jobs.job`).
+
+Execution mechanism: submission drives the durable runner synchronously through
+the public route — the executor's atomic ``StageCompleted`` commits ARE the
+worker callbacks, so a job never reports completion without real durable stage
+output. This is an interim execution path ONLY: Hatchet (Plan I) remains the sole
+production scheduler behind the same ``DAGRunner`` seam. The production stage
+work performs NO in-process decoder/model invocation (pure-Python text ops run
+in-process; modality decoders route through the sandbox dispatch seam).
 """
 
 from __future__ import annotations
@@ -30,17 +45,28 @@ from umd.api.routers import (
     sources,
     system,
 )
-from umd.api.runner import SynchronousRunner
 from umd.application.commands import SemanticCommandService
 from umd.application.jobs import JobService
 from umd.audit.service import AuditService
 from umd.config import Settings, get_settings
-from umd.jobs.job import InMemoryJobStore
+from umd.jobs.production import StageWorkRegistryFactory, build_runtime
+from umd.jobs.runner import DurableDAGRunner
+from umd.jobs.stage_execution import DurableStageExecutor, RealBackoff, RetryPolicy
+from umd.models.registry import ProviderRegistry
+from umd.observability.logging import StructuredLogger
+from umd.projections.base import ReplayDriver
+from umd.projections.checkpoint import ProjectionCheckpointStore
+from umd.projections.current import CurrentTierOneBuilder
 from umd.projections.query import QueryService
 from umd.projections.question import QuestionService
-from umd.projections.search import SearchService
+from umd.projections.search import SearchProjectionBuilder, SearchService
 from umd.resolution.mentions import PostgresMentionRepository
 from umd.resolution.resolution import PostgresSplitEnumerator, Resolver
+from umd.security.capabilities import capability_report
+from umd.security.sandbox import SubprocessSandboxRunner
+from umd.segmentation.segmenters import segment_txt
+from umd.storage.postgres.artifacts import PostgresArtifactStore
+from umd.storage.postgres.job_repository import PostgresJobRepository
 from umd.storage.postgres.ledger import SemanticLedger
 from umd.storage.postgres.repositories import (
     PostgresEvidenceRepository,
@@ -49,6 +75,7 @@ from umd.storage.postgres.repositories import (
     PostgresSourceRepository,
     SourceMembershipService,
 )
+from umd.storage.postgres.stage_repository import JobRunAudit, StageRunRepository
 
 _PROJECTION_QUERY = "current_tier1"
 _PROJECTION_SEARCH = "search"
@@ -65,7 +92,13 @@ def engine_from_settings(settings: Settings) -> sa.Engine:
 
 
 def build_context(*, settings: Settings, engine: sa.Engine, source_store: Any) -> AppContext:
-    """Construct the :class:`AppContext` bundle of services (testable standalone)."""
+    """Construct the :class:`AppContext` bundle of services (testable standalone).
+
+    Phase 3 wires the *production* execution path, never the test-only doubles:
+    ``PostgresJobRepository`` + ``DurableDAGRunner`` over the composed production
+    stage registry (:mod:`umd.jobs.production`). ``InMemoryJobStore`` and
+    ``SynchronousRunner`` are never instantiated here.
+    """
     ledger = SemanticLedger(engine)
     commands = SemanticCommandService(ledger)
     memberships = SourceMembershipService(engine)
@@ -89,8 +122,49 @@ def build_context(*, settings: Settings, engine: sa.Engine, source_store: Any) -
         quarantine=PostgresQuarantine(engine).record,
     )
 
-    job_store = InMemoryJobStore()
-    runner = SynchronousRunner(job_store)
+    # -- production execution wiring (P3-S1) --------------------------------
+    # Build the composed production stage registry once from the production
+    # runtime (never an empty ``{}``), then wire the durable runner + durable job
+    # store. The executor's atomic StageCompleted commits are the worker
+    # callbacks, so a job queued through the public route reaches completion only
+    # via real committed stage output.
+    checkpoint_store = ProjectionCheckpointStore(engine)
+    replay = ReplayDriver(engine, checkpoint_store)
+    providers = ProviderRegistry()
+    runtime = build_runtime(
+        engine=engine,
+        settings=settings,
+        source_store=source_store,
+        commands=commands,
+        ledger=ledger,
+        segmenters={"txt": segment_txt},
+        segments=segments,
+        evidence=evidence,
+        replay=replay,
+        builders={
+            "current_tier1": CurrentTierOneBuilder(),
+            "search": SearchProjectionBuilder(),
+        },
+        providers=providers,
+        sandbox=SubprocessSandboxRunner(),
+        artifacts=PostgresArtifactStore(engine),
+        observability=StructuredLogger("umd-api"),
+        capabilities=capability_report(),
+    )
+    work_registry = StageWorkRegistryFactory.build(runtime)
+
+    job_store = PostgresJobRepository(engine)
+    executor = DurableStageExecutor(
+        engine=engine,
+        commands=commands,
+        ledger=ledger,
+        stage_repo=StageRunRepository(engine),
+        audit=JobRunAudit(engine),
+        quarantine=PostgresQuarantine(engine),
+        retry=RetryPolicy(),
+        backoff=RealBackoff(RetryPolicy()),
+    )
+    runner = DurableDAGRunner(executor=executor, store=job_store)
     jobs = JobService(store=job_store, runner=runner, commands=commands)
 
     query_guard = ConsistencyGuard(ProjectionFreshness(engine, _PROJECTION_QUERY), settings)
@@ -117,11 +191,13 @@ def build_context(*, settings: Settings, engine: sa.Engine, source_store: Any) -
         resolver=resolver,
         consistency=query_guard,
         freshness=query_guard.freshness,
+        work_registry=work_registry,
     )
     ctx.extra["query_guard"] = query_guard
     ctx.extra["search_guard"] = search_guard
     ctx.extra["rate_guard"] = rate_guard
     ctx.extra["job_store"] = job_store
+    ctx.extra["work_registry"] = work_registry
     return ctx
 
 

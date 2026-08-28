@@ -55,6 +55,13 @@ Mutations return a read-your-writes token. Token-bearing Tier-1 reads wait only 
 - Subtitles: independent SRT/ASS/WebVTT/TTML/SAMI/MicroDVD/MPL2/TMP sources; language, timing, styles, speaker/sign/song/typesetting, HI/SDH, encoding, translation differences; mandatory `X-TIMESTAMP-MAP` normalization before pysubs2.
 - `SandboxRunner.run(argv, limits, policy) -> SandboxResult` — array arguments only, read-only spool, archive allowlists, traversal/symlink rejection, bounded CPU/memory/fd/pid/time/duration/pixels/decompressed size, parser failure containment. PyAV/FFmpeg, pandoc, OCR, ASR, diarization, subtitle parsing, linkage, and archive extraction never run in the API process.
 
+## Production execution remediation contracts
+
+- `StageWorkRegistryFactory.build(runtime) -> StageWorkRegistry` — composes every stage in the canonical `STAGE_ORDER` with real modality, analysis, resolution, alignment, reconciliation, and replay-builder work; an absent stage is a configuration failure, never successful completion.
+- `ProductionDAGRunner.run_graph(job_id, source_id, dag_universe, work_registry, stages) -> list[StageRunEvent]` — the production implementation of the existing `DAGRunner` seam; dispatches to the sole Hatchet scheduler and reports durable queued/running/complete/failure state without fake completion. Test-only synchronous doubles are excluded from production factories.
+- `HatchetWorkerFactory.start(runtime, work_registry, executor) -> WorkerHandle` — registers the pinned Hatchet workflows/tasks and binds each callback to `DurableStageExecutor`; readiness requires a live client and real callback registration.
+- `CapabilityReporter.report() -> CapabilityReport` — reports each provider/sandbox/scheduler as `active`, `reference-only`, `configured-but-unavailable`, `gated`, or `disabled`, including gate reason and observed version; unavailable integrations must not be represented as active.
+
 ## Non-negotiable limits and extension paths
 
 V1 graph-like queries are bounded Postgres traversal; Neo4j/GQL, RDF-star, and XTDB are replay-only future extensions behind interfaces. pgvector is monitored at 5M/10M/50M thresholds and may migrate behind `VectorIndex`. Locator stability is bounded by content/parser/decoder/renderer stability; drift is versioned, detectable, rebased, or quarantined. Vecalign is parallel-text-only; adaptations use temporal/embedding/LLM methods with assumptions. Pyannote weights/license, Hatchet pin, splink/DuckDB benchmark, bubblewrap/AppArmor profile, FFmpeg/PyAV CVE watch, AGPL dependencies, and local OCFL spool behavior are explicit build/release gates, not silently resolved.

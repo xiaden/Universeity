@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -121,6 +123,7 @@ def process_raster(
     tool_versions: dict[str, str] | None = None,
     config_digest: str | None = None,
     config: RasterPipelineConfig | None = None,
+    segment_id_for_locator: Callable[[str], str | None] | None = None,
 ) -> RasterProcessResult:
     """Run the full bounded raster pipeline on raw image bytes.
 
@@ -346,6 +349,17 @@ def process_raster(
             )
 
         batch = registry.register(inputs)
+        # Append-only segment linkage: when a resolver is supplied, stamp each
+        # evidence record's ``segment_id`` (the owning segment's DB row id) at
+        # record time instead of a post-hoc UPDATE back-fill. The resolver is
+        # called lazily here (after segments are registered) so it can resolve
+        # freshly-persisted DB row ids. Evidence with no owning segment (e.g.
+        # OCR-region observations) keeps ``segment_id`` NULL, unchanged.
+        if segment_id_for_locator is not None:
+            for ev in evidence:
+                seg_id = segment_id_for_locator(ev.locator) if ev.locator else None
+                if seg_id:
+                    ev.segment_id = uuid.UUID(seg_id)
         recorded = evidence_repo.record(EvidenceBatch(records=evidence))
 
         return RasterProcessResult(

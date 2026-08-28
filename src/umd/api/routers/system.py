@@ -21,6 +21,7 @@ from umd.api.schemas import (
     HealthResponse,
     VersionResponse,
 )
+from umd.jobs.capability import CapabilityReporter
 from umd.observability.metrics import METRICS
 from umd.observability.tracing import otel_export_active
 from umd.projections.embedder import embed_text
@@ -48,9 +49,32 @@ def _projection_components(ctx: AppContext) -> list[HealthComponent]:
     return comps
 
 
+def _scheduler_component() -> HealthComponent:
+    """Honest scheduler/provider capability as a health component (P3-S4).
+
+    The sole v1 scheduler is ``degraded`` whenever it is not ``active`` (absent
+    SDK / no live cluster), matching the DD rule that unavailable integrations are
+    never represented as active. Readiness stays projection-driven (see
+    :func:`readiness`), so this surfaces capability without faking readiness.
+    """
+    sched = CapabilityReporter().report().scheduler
+    detail = {
+        "provider": sched.get("provider"),
+        "status": sched.get("status"),
+        "reason": sched.get("reason"),
+        "sdk_version": sched.get("sdk_version"),
+        "server_image": sched.get("server_image"),
+    }
+    return HealthComponent(
+        name="scheduler",
+        status="ok" if sched.get("status") == "active" else "degraded",
+        detail=detail,
+    )
+
+
 @router.get("/health", response_model=HealthResponse)
 def health(ctx: AppContext = Depends(get_context)) -> HealthResponse:
-    components = _projection_components(ctx)
+    components = _projection_components(ctx) + [_scheduler_component()]
     degraded = any(c.status != "ok" for c in components)
     return HealthResponse(status="degraded" if degraded else "ok", components=components)
 
@@ -69,7 +93,11 @@ def readiness(ctx: AppContext = Depends(get_context)) -> dict[str, Any]:
                     "retry_after": ctx.settings.consistency.rebuild_retry_after,
                 },
             )
-    return {"status": "ready", "components": [c.model_dump() for c in components]}
+    return {
+        "status": "ready",
+        "components": [c.model_dump() for c in components],
+        "scheduler": CapabilityReporter().report().scheduler,
+    }
 
 
 def _vector_capability_report(engine: Any) -> dict[str, Any]:
@@ -106,6 +134,9 @@ def capabilities(ctx: AppContext = Depends(get_context)) -> CapabilitiesResponse
     report["query_max_limit"] = ctx.settings.query_cost.max_limit
     report["relationships_bounded"] = True
     report["semantic_authority"] = "tier0-ledger; projections never authoritative"
+    # Honest scheduler/provider capability (P3-S4): never represented as active
+    # without a live reachable cluster.
+    report["scheduler"] = CapabilityReporter().report().scheduler
     return CapabilitiesResponse(capabilities=report)
 
 

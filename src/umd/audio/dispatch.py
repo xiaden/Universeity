@@ -30,7 +30,7 @@ def main(argv: list[str] | None = None) -> int:
         print("usage: umd.audio.dispatch <input_path>", file=sys.stderr)
         return 2
     config = audio_config_from_env()
-    config_digest_of(config)
+    config.config_digest = config_digest_of(config)
     try:
         audio = decode_to_pcm(Path(args[0]), max_duration_s=config.max_duration_s)
     except AudioDecodeError as exc:

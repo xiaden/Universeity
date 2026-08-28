@@ -208,4 +208,10 @@ def capability_report() -> dict[str, object]:
         report["subtitle"] = subtitle_capability_report()
     except ImportError:  # pragma: no cover - subtitle package absent in minimal installs
         report["subtitle"] = {"error": "subtitle baseline unavailable"}
+    try:
+        from umd.raster.availability import raster_capability_report
+
+        report["raster"] = raster_capability_report()
+    except ImportError:  # pragma: no cover - raster package absent in minimal installs
+        report["raster"] = {"error": "raster baseline unavailable"}
     return report

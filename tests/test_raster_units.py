@@ -251,3 +251,146 @@ def store_type(root: Path):
     from umd.storage.ocfl import SourceStore
 
     return SourceStore.create(root, max_upload_bytes=512 * 1024, max_range_bytes=4096)
+
+
+# ---------------------------------------------------------------------------
+# P1-S3 (spec-first): the production registry invokes real OCR/region/spatial work
+# ---------------------------------------------------------------------------
+
+
+def _production_module():
+    """Import the planned production composition module (Plan G Phase 2).
+
+    ``umd.jobs.production`` does not exist until Plan G's Phase 2 (and Plan H
+    Phase 3 composes the raster branch into it). Importing it here via
+    :func:`importlib.import_module` is exactly what makes this test FAIL for the
+    intended spec-first reason: ``ImportError`` on ``umd.jobs.production``.
+    """
+    import importlib
+
+    return importlib.import_module("umd.jobs.production")
+
+
+@pytest.mark.postgres
+@pytest.mark.skipif(
+    __import__("os").environ.get("UMD_TEST_POSTGRES") != "true",
+    reason="production registry composition requires live PostgreSQL",
+)
+def test_production_registry_raster_stage_records_ocr_and_observations(
+    umd_db,
+) -> None:
+    """The production ``StageWorkRegistryFactory.build(runtime)`` composes the
+    LOW_LEVEL_EXTRACTION stage that consumes committed raster OCR + spatial
+    evidence (locator-bearing, confidence-bearing). It never fabricates OCR when
+    no evidence is committed.
+
+    Plan H P3-S1 feeds real OCR region evidence into this stage; until then the
+    honest stage emits the baseline evidence ref and never invents active OCR.
+    """
+    from job_helpers import ensure_source, make_manifest
+    from umd.jobs.stage_execution import StageOutcome
+
+    mod = _production_module()
+    registry = mod.StageWorkRegistryFactory.build({"engine": umd_db})
+    # LOW_LEVEL_EXTRACTION is the canonical extraction stage that consumes raster OCR.
+    stage = registry["LOW_LEVEL_EXTRACTION"]
+    assert callable(stage), "raster extraction stage is not callable in the registry"
+    assert callable(registry["STRUCTURAL_ANALYSIS"])
+
+    ensure_source(umd_db)
+    manifest = make_manifest("LOW_LEVEL_EXTRACTION", job_id="prod-raster")
+    outcome = stage(manifest)
+    assert isinstance(outcome, StageOutcome)
+    # Evidence refs are locator-bearing and honest: for a fresh source with no
+    # committed OCR the stage emits the baseline ref — it never fabricates OCR.
+    assert outcome.evidence_refs, "stage must record evidence references"
+    assert any("evidence_records" in r or "source" in r for r in outcome.evidence_refs)
+
+
+@pytest.mark.postgres
+@pytest.mark.skipif(
+    __import__("os").environ.get("UMD_TEST_POSTGRES") != "true",
+    reason="production registry composition requires live PostgreSQL",
+)
+def test_production_raster_stage_uses_tesseract_or_truthful_unavailable(
+    umd_db, source_store
+) -> None:
+    """The production raster stage either records real OCR-region evidence (when the
+    configured provider is available) or emits the honest gated/unavailable warning
+    (when it is not) — never a fabricated active OCR claim. The provider-gate
+    truthfulness itself is asserted directly below."""
+    import io
+
+    from umd.domain.models import EvidenceKind
+    from umd.jobs.manifest import StageManifest
+    from umd.storage.ocfl import SourceDescriptor
+    from umd.storage.postgres.artifacts import PostgresArtifactStore
+    from umd.storage.postgres.repositories import (
+        PostgresEvidenceRepository,
+        SourceMembershipService,
+    )
+
+    raw = raster_comic_bytes()
+    man = source_store.put_immutable(io.BytesIO(raw), SourceDescriptor(logical_name="comic.png"))
+    image_sid = "72acc28e-0000-0000-0000-000000000001"
+    memberships = SourceMembershipService(umd_db)
+    memberships.ensure_source(
+        source_id=image_sid,
+        ocfl_ref=man.object_id,
+        sha512=man.sha512,
+        size_bytes=man.size_bytes,
+        media_kind="image",
+        original_name="comic.png",
+        work_id=None,  # type: ignore[arg-type]
+    )
+
+    mod = _production_module()
+    registry = mod.StageWorkRegistryFactory.build(
+        {
+            "engine": umd_db,
+            "source_store": source_store,
+            "artifacts": PostgresArtifactStore(umd_db),
+        }
+    )
+    stage = registry["LOW_LEVEL_EXTRACTION"]
+    assert callable(stage)
+
+    outcome = stage(
+        StageManifest(
+            job_id="prod-raster-unt",
+            stage_name="LOW_LEVEL_EXTRACTION",
+            source_id=image_sid,
+            dag_universe=None,
+            evidence_refs=[],
+            input_manifest={"source_id": image_sid},
+        )
+    )
+
+    committed = PostgresEvidenceRepository(umd_db).get_by_source(image_sid)
+    ocr_or_span = [
+        e for e in committed if e.evidence_kind in (EvidenceKind.OCR_REGION, EvidenceKind.TEXT_SPAN)
+    ]
+    gated_warning = any("ocr gated" in w for w in outcome.warnings)
+    assert ocr_or_span or gated_warning, (
+        "production raster stage must record OCR-region/text evidence for the current "
+        f"provider OR report the honest unavailable gate; warnings={outcome.warnings!r}"
+    )
+
+
+def test_tesseract_status_is_truthful_when_binary_absent() -> None:
+    """The Tesseract provider gate is honest in this environment (no binary): the
+    gate reflects the real binary presence and the provider raises a truthful
+    unavailable error rather than fabricating active OCR output."""
+    import shutil
+
+    real_presence = shutil.which("tesseract") is not None
+    assert _tesseract_available() is (real_presence and _tesseract_available())
+    if _tesseract_available():
+        result = TesseractOcrProvider().ocr(raster_text_only_bytes())
+        assert result.provider == "umd-tesseract"
+    else:
+        with pytest.raises(OcrProviderUnavailable):
+            TesseractOcrProvider().ocr(raster_text_only_bytes())
+    # Regardless, the result/provider never lies about which engine ran.
+    result = run_ocr(raster_text_only_bytes(), "reference")
+    assert result.provider == "umd-reference-ocr"

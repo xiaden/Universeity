@@ -31,6 +31,7 @@ from umd.audio.types import (
     AsrWord,
     AudioConfig,
     AudioMeta,
+    AudioOutput,
     DecodedAudio,
     SpeechSegment,
     VadResult,
@@ -391,7 +392,7 @@ def test_audio_config_from_env_and_digest() -> None:
 
 def test_evidence_plan_assembly_and_promotion_ban() -> None:
     cfg = AudioConfig(declared_language="en")
-    config_digest_of(cfg)
+    cfg.config_digest = config_digest_of(cfg)  # persist digest for evidence idempotency
     out = run_audio_baseline(_phrase("hi", "there"), cfg)
     plan = build_audio_evidence_plan(
         out,
@@ -498,3 +499,157 @@ def test_sandboxed_invoke_audio_baseline() -> None:
     assert any(
         c.speaker_label.startswith("speaker_unknown_") for c in out.diarization.speaker_candidates
     )
+
+
+# ---------------------------------------------------------------------------
+# P2-S4: raw ASR retained when filtered + threshold reclassification
+# ---------------------------------------------------------------------------
+
+
+def _hallucination_dict(outcome: hallucination.FilterOutcome) -> dict:
+    return {
+        "energy_correlation": round(outcome.energy_correlation, 4),
+        "decisions": [
+            {
+                "utterance_index": d.utterance_index,
+                "reference": d.reference,
+                "outcome": d.outcome,
+                "trigger_signal": d.trigger_signal,
+                "signals": d.signals,
+                "replaced_with": d.replaced_with,
+                "filtered_word_indices": d.filtered_word_indices,
+            }
+            for d in outcome.decisions
+        ],
+        "fpr_fnr_note": "measured in fixture tests; not detector-grade",
+    }
+
+
+def test_filtering_never_mutates_raw_asr_and_reclassifies_on_threshold_change() -> None:
+    # A borderline utterance kept at a lenient threshold is filtered at a strict one —
+    # the versioned HallucinationFiltered decision reclassifies descendants. The raw
+    # AsrResult is never mutated by either pass, so it stays recoverable in OCFL.
+    alty = AsrResult(
+        provider="umd-reference-asr",
+        provider_version="umd-reference-asr v1.0",
+        language="en",
+        confidence=0.5,
+        energy_correlation=0.9,
+        utterances=[
+            AsrUtterance(
+                index=1,
+                text="word",
+                start_s=0.0,
+                end_s=0.4,
+                confidence=0.5,
+                words=[
+                    AsrWord(word="w", start_s=0.0, end_s=0.2, confidence=0.5),
+                    AsrWord(word="d", start_s=0.2, end_s=0.4, confidence=0.5),
+                ],
+            )
+        ],
+    )
+    vad_result = VadResult(
+        speech_segments=[SpeechSegment(0.0, 0.5)], total_speech_s=0.5, no_speech_ratio=0.0
+    )
+    lenient = hallucination.filter_hallucinations(
+        alty, AudioConfig(confidence_threshold=0.4), vad_result=vad_result
+    )
+    strict = hallucination.filter_hallucinations(
+        alty, AudioConfig(confidence_threshold=0.6), vad_result=vad_result
+    )
+    assert lenient.decisions[0].outcome == "kept"
+    assert lenient.kept.utterances and lenient.kept.utterances[0].text == "word"
+    assert strict.decisions[0].outcome == "filtered"
+    assert strict.kept.utterances == []
+    # Threshold change reclassifies: the strict pass emits a filtered decision.
+    assert strict.decisions[0].trigger_signal == hallucination.S_LOGPROB
+    # The raw result is untouched -> pre-filter text/words recoverable downstream.
+    assert alty.utterances[0].text == "word"
+    assert alty.utterances[0].words and alty.utterances[0].words[0].word == "w"
+
+
+def test_raw_asr_recoverable_in_evidence_plan_when_filtered() -> None:
+    # Fully-filtered pass: every utterance is dropped from semantic consumption, but
+    # the raw (pre-filter) ASR is still recorded as audio_interval evidence and the
+    # filtered decision becomes a versioned HallucinationFiltered event.
+    alty = _music_corrupted_asr()
+    vad_result = VadResult(
+        speech_segments=[SpeechSegment(0.0, 1.0)], total_speech_s=1.0, no_speech_ratio=0.0
+    )
+    outcome = hallucination.filter_hallucinations(
+        alty, AudioConfig(), source_id="music-src", vad_result=vad_result
+    )
+    assert outcome.kept.utterances == []  # fully filtered
+    assert outcome.decisions[0].outcome == "filtered"
+
+    out = AudioOutput(
+        meta={
+            "format_name": "pcm_s16le",
+            "codec_name": "pcm_s16le",
+            "sample_rate": SR,
+            "channels": 1,
+            "duration_s": 1.0,
+            "bit_rate": None,
+            "decoder": "ffmpeg",
+            "renderer": "reference",
+        },
+        timing={"duration_s": 1.0, "n_samples": SR, "sample_rate": SR, "decoded_mono": True},
+        vad={
+            "has_speech": True,
+            "total_speech_s": 1.0,
+            "no_speech_ratio": 0.0,
+            "speech_segments": [{"start_s": 0.0, "end_s": 1.0}],
+        },
+        language=language.identify_language(_phrase("hi"), declared_language="en"),
+        asr=alty,
+        diarization=diarization.run_diarization(alty, config=AudioConfig()),
+        hallucination=_hallucination_dict(outcome),
+    )
+    plan = build_audio_evidence_plan(
+        out, source_id="a" * 32, source_sha512="0" * 128, config_digest="d"
+    )
+    # Raw utterances survive as audio_interval evidence even though they were filtered.
+    intervals = [e for e in plan.evidence if e.evidence_kind == EvidenceKind.AUDIO_INTERVAL]
+    assert intervals, "raw ASR must be recorded as audio_interval evidence even when filtered"
+    assert intervals[0].quality["text"] == "????"
+    assert intervals[0].quality["confidence_scope"] == "transcription"
+    # The filtered decision becomes a versioned HallucinationFiltered event.
+    assert plan.events and all(
+        e.event_type == EventType.HALLUCINATION_FILTERED.value for e in plan.events
+    )
+    assert plan.events[0].prepare().payload["outcome"] == "filtered"
+    # No semantic promotion: raw stays untrusted evidence (promotion ban).
+    assert (
+        plan.events[0].prepare().payload["signals"][hallucination.S_PROMOTION]["can_auto_promote"]
+        is False
+    )
+
+
+# ---------------------------------------------------------------------------
+# P2-S5: ASR activation is independent of diarization activation
+# ---------------------------------------------------------------------------
+
+
+def test_asr_activation_independent_of_diarization() -> None:
+    # Diarization fully gated -> ASR still produces ordinary speech.
+    gated_out = _run(tone.render_phrase(["hi", "there"]))
+    assert gated_out.asr is not None and gated_out.asr.utterances
+    assert gated_out.diarization.gated is True
+
+    # Diarization gates open (enabled + weights + legal) -> ASR still produces
+    # speech; diarization honestly falls back (weights never validated for runtime).
+    cfg = AudioConfig(
+        diarization_enabled=True,
+        diarization_weights_dir="/opt/pyannote/weights",
+        diarization_legal_gate=True,
+    )
+    open_out = _run(tone.render_phrase(["hi", "there"]), cfg)
+    assert open_out.asr is not None and open_out.asr.utterances
+    assert open_out.diarization.gated is True
+
+    # The reported faster-whisper ASR status is identical with and without the
+    # diarization gates -> enabling diarization cannot gate ASR (and vice versa).
+    cap_open = audio_capability_report(cfg)
+    cap_gated = audio_capability_report(AudioConfig())
+    assert cap_open["asr_engine"] == cap_gated["asr_engine"]

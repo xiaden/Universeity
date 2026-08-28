@@ -42,8 +42,39 @@ class AppContext:
     consistency: Any = None
     #: Projection freshness reader (untokened reads expose freshness metadata).
     freshness: Any = None
+    #: The production stage-work registry (never ``{}``) used by submit / rerun /
+    #: retry / invalidate (P3-S3). Composed once by the app factory from the
+    #: production runtime; routers never pass an empty registry.
+    work_registry: Any = None
     log: Any = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+def serialize_audits(records: Any) -> list[dict[str, Any]]:
+    """Convert :class:`JobAuditRecord` objects to JSON-safe dicts (P3-S4).
+
+    The jobs ``events`` path returns durable ``JobAuditRecord`` rows; they are not
+    natively JSON-serializable, so endpoint boundaries flatten them into dicts.
+    ``records`` may also be an empty list (no-op).
+    """
+    out: list[dict[str, Any]] = []
+    for rec in records or []:
+        if isinstance(rec, dict):
+            out.append(rec)
+            continue
+        created = getattr(rec, "created_at", None)
+        out.append(
+            {
+                "id": getattr(rec, "id", None),
+                "job_id": getattr(rec, "job_id", None),
+                "stage": getattr(rec, "stage_name", None),
+                "action": getattr(rec, "action", None),
+                "attempt": getattr(rec, "attempt", None),
+                "status": getattr(rec, "status", None),
+                "created_at": created.isoformat() if created is not None else None,
+            }
+        )
+    return out
 
 
 def get_context(request: Request) -> AppContext:

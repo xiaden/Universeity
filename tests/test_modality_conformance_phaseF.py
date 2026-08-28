@@ -124,7 +124,7 @@ def test_multi_speaker_audio_produces_distinct_candidates_no_promotion(
     reg, ev = _pipeline(umd_db)
 
     cfg = AudioConfig(declared_language="en")
-    config_digest_of(cfg)
+    cfg.config_digest = config_digest_of(cfg)  # persist digest for evidence idempotency
     out = run_audio_baseline(_wav_decoded(multi_speaker_audio_wav_bytes()), cfg)
     plan = build_audio_evidence_plan(
         out,

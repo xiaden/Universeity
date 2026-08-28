@@ -296,3 +296,123 @@ def test_bitmap_subtitle_codec_classified_quarantine() -> None:
     assert r["extractable"] is False
     assert r["quarantine_reason"], "bitmap track must carry a quarantine classification"
     assert "QUARANTINE" in r["quarantine_reason"]
+
+
+# ---------------------------------------------------------------------------
+# P1-S4: real container fixture — audio reaches ASR, independent subtitles,
+# visual/temporal evidence classified by capability (never fabricated)
+# ---------------------------------------------------------------------------
+
+
+def test_dialogue_video_audio_reaches_asr_and_subtitles_independent(umd_db, source_store) -> None:
+    """A real generated container (:func:`fixtures.dialogue_video_bytes`, FFmpeg-
+    locked: video + tone speech audio + an SRT subtitle) composes: the audio branch
+    is recorded as reaching the audio baseline (which yields ASR utterances), the
+    embedded subtitle track becomes its own independent source/evidence stream, and
+    visual/scene/temporal evidence is emitted or capability-classified."""
+    from fixtures import dialogue_video_bytes, multi_speaker_audio_wav_bytes
+    from umd.audio.pipeline import run_audio_baseline
+    from umd.audio.types import AudioConfig
+    from umd.video.availability import video_capability_report
+    from umd.video.types import VideoConfig
+
+    memberships = SourceMembershipService(umd_db)
+    sid, man = _ensure_source(
+        memberships, source_store, "dialog.mkv", dialogue_video_bytes(), "video"
+    )
+    reg, ev = _pipeline(umd_db)
+    sandbox = SubprocessSandboxRunner()
+
+    # -- video baseline over the real container ------------------------------
+    out = invoke_video_baseline(sandbox, dialogue_video_bytes(), name="dialog.mkv")
+    assert any(t.codec_type == "video" for t in out.inventory)
+    assert any(t.codec_type == "audio" for t in out.inventory)
+    assert any(t.codec_type == "subtitle" for t in out.inventory)
+    assert len(out.scenes) >= 1 and len(out.shots) >= 1
+
+    # Audio branch is composed into the audio baseline (reaches the ASR pipeline).
+    plan = build_video_evidence_plan(
+        out,
+        source_id=sid,
+        source_sha512=man.sha512,
+        work_id=None,  # type: ignore[arg-type]
+    )
+    batch = reg.register(plan.segment_inputs)
+    _ = batch  # registration side effects are what matter
+    ev.record(EvidenceBatch(records=plan.evidence))
+    comp = [e for e in ev.get_by_source(sid) if _q(e, "kind") == "video_audio_composition"]
+    assert comp, "video -> audio baseline composition must be recorded"
+    assert any(a["audio_branch"] == "umd.audio baseline" for a in comp[0].quality["audio_tracks"])
+
+    # The audio content genuinely reaches the ASR pipeline (utterances produced).
+    audio_out = run_audio_baseline(
+        _decoded_tone(multi_speaker_audio_wav_bytes()), AudioConfig(declared_language="en")
+    )
+    assert audio_out.asr is not None and audio_out.asr.utterances, "audio must reach ASR"
+
+    # Visual/frame/scene/temporal evidence is emitted or capability-classified —
+    # never fabricated: pixel-level vision is reported GATED.
+    vcaps = video_capability_report(VideoConfig())
+    assert vcaps["observations"] == "candidate_kind only; pixel vision GATED (no PyAV decode)"
+
+    # Independent subtitle stream: the embedded SRT track is extractable.
+    extracted = extract_embedded_subtitles(sandbox, dialogue_video_bytes(), name="dialog.mkv")
+    assert len(extracted) == 1, "dialogue fixture carries one independent subtitle track"
+    assert extracted[0]["extractable"]
+
+
+def _decoded_tone(wav: bytes):
+    """Decode the deterministic tone WAV into :class:`DecodedAudio` for the ASR path."""
+    import struct
+
+    from umd.audio.types import AudioMeta, DecodedAudio
+
+    assert wav[:4] == b"RIFF"
+    data = b""
+    off = 12
+    rate = 16000
+    while off < len(wav):
+        (size,) = struct.unpack_from("<I", wav, off + 4)
+        body = wav[off + 8 : off + 8 + size]
+        if wav[off : off + 4] == b"fmt ":
+            rate = struct.unpack_from("<I", body, 4)[0]
+        elif wav[off : off + 4] == b"data":
+            data = body
+        off += 8 + size
+    pcm = [struct.unpack_from("<h", data, i * 2)[0] / 32768.0 for i in range(len(data) // 2)]
+    dur = len(pcm) / rate
+    return DecodedAudio(
+        sample_rate=rate,
+        pcm=pcm,
+        duration_s=dur,
+        meta=AudioMeta(
+            format_name="pcm_s16le",
+            codec_name="pcm_s16le",
+            sample_rate=rate,
+            channels=1,
+            duration_s=dur,
+        ),
+    )
+
+
+def _production_module():
+    """Lazy-import the production composition module (Plan G Phase 2)."""
+    import importlib
+
+    return importlib.import_module("umd.jobs.production")
+
+
+def test_video_production_registry_composes_audio_asr_subtitles(umd_db) -> None:
+    """SPEC-FIRST (FAILS until Plan G production.py + Plan H P3-S2 land): the
+    production registry composes the video stage to demux audio into the ASR
+    pipeline, persist every embedded subtitle track independently, and record
+    visual/temporal outputs OR a precise unsupported/quarantine reason — never
+    fabricated evidence. Fails today at ``ImportError`` on ``umd.jobs.production``."""
+    mod = _production_module()
+    registry = mod.StageWorkRegistryFactory.build({"engine": umd_db})
+    # LOW_LEVEL_EXTRACTION is the canonical stage that composes video demux into
+    # audio-ASR + independent-subtitle + visual/temporal evidence work.
+    stage = registry["LOW_LEVEL_EXTRACTION"]
+    assert callable(stage), "video/audio/subtitle extraction stage is not callable"
+    # The structural stage consumes the extracted evidence (never fabricated).
+    assert callable(registry["STRUCTURAL_ANALYSIS"])

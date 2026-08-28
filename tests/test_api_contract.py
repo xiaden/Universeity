@@ -796,3 +796,319 @@ def test_build_source_store_uses_configured_ocfl_root(tmp_path) -> None:
     settings = Settings(ocfl=OcflSettings(root=root))
     store = build_source_store(settings)
     assert store.root == root
+
+
+# ---------------------------------------------------------------------------
+# P1-S2: spec-first production ingestion through the public route (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def test_spec_first_production_ingestion_persists_real_output(api_ctx) -> None:
+    """SPEC-FIRST (FAILS until Phase 3 wires production dispatch).
+
+    Ingest non-empty representative source bytes through the public POST
+    /v1/sources route, poll a NON-fake (Postgres-backed) job, and verify persisted
+    segments, evidence, semantic events, provenance refs, and queryable state —
+    WITHOUT explicitly rebuilding projections and WITHOUT calling internal
+    modality services. Today the fake path (InMemoryJobStore + SynchronousRunner
+    + ``work_registry={}``) reports a fake complete job with no persisted output,
+    so this test fails by design until Phase 3 replaces it.
+    """
+    client, engine = api_ctx.client, api_ctx.engine
+    content = "Sherlock Holmes examined the room. The candle flickered.\n" * 3
+
+    # -- public ingest ------------------------------------------------------
+    r = client.post("/v1/sources", json={"media_kind": "txt", "content": content}, headers=W)
+    assert r.status_code == 201, r.text
+    sid = r.json()["source_id"]
+    job_id = f"job-{sid[:12]}"
+
+    # -- poll the durable (non-fake) job to a terminal state -----------------
+    status = "running"
+    for _ in range(20):
+        rj = client.get(f"/v1/jobs/{job_id}", headers=R)
+        status = rj.json()["status"]
+        if status in ("complete", "failed", "cancelled"):
+            break
+    assert status == "complete", f"job did not reach complete (got {status})"
+
+    # -- persisted segments through the public route ------------------------
+    segs = client.get(f"/v1/sources/{sid}/segments", headers=R)
+    assert segs.status_code == 200, segs.text
+    assert segs.json()["total"] >= 1, "no segments persisted through the public route"
+
+    # -- persisted evidence, queryable per-segment ---------------------------
+    first_seg = segs.json()["items"][0]["segment_id"]
+    ev = client.get(f"/v1/segments/{first_seg}/evidence", headers=R)
+    assert ev.status_code == 200, ev.text
+    assert ev.json()["total"] >= 1, "no evidence persisted through the public route"
+
+    # -- semantic events + provenance refs committed to the ledger ----------
+    with engine.connect() as conn:
+        stage_events = conn.execute(
+            sa.text(
+                "SELECT count(*) FROM semantic_event "
+                "WHERE event_type='StageCompleted' AND payload->>'source_id'=:s"
+            ),
+            {"s": sid},
+        ).scalar()
+    assert stage_events >= 1, "no StageCompleted semantic event persisted for the source"
+    with engine.connect() as conn:
+        n_seg = conn.execute(
+            sa.text("SELECT count(*) FROM segment WHERE source_id=:s"), {"s": sid}
+        ).scalar()
+        n_ev = conn.execute(
+            sa.text("SELECT count(*) FROM evidence WHERE source_id=:s"), {"s": sid}
+        ).scalar()
+    assert n_seg >= 1 and n_ev >= 1, "ledger/registry rows missing for decomposed source"
+
+    # -- queryable structured state WITHOUT a projection rebuild -------------
+    q = client.post(
+        "/v1/query/structured", json={"kind": "SCENE", "filters": {"source_id": sid}}, headers=R
+    )
+    assert q.status_code == 200, q.text
+    assert q.json()["total"] >= 1, "no queryable structured state from decomposed output"
+
+
+# ---------------------------------------------------------------------------
+# P1-S4(e): submission failure is reported, never swallowed (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def test_submission_failure_is_reported_not_swallowed(api_ctx) -> None:
+    """SPEC-FIRST (FAILS until Phase 3): when decomposition dispatch fails, the API
+    must surface it as a structured RFC 7807 error or a durable failed job — never
+    return a successful fake completion or swallow the exception. Today the ingest
+    route swallows submission exceptions and returns 201, so this fails by design.
+    """
+    client = api_ctx.client
+    ctx = client.app.state.ctx
+
+    def boom(**_kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("dispatch backend unavailable")
+
+    ctx.jobs.submit = boom  # type: ignore[method-assign]
+    r = client.post(
+        "/v1/sources", json={"media_kind": "txt", "content": "failing submission"}, headers=W
+    )
+    # Not a successful fake completion; the failure is surfaced to the client.
+    assert r.status_code != 201, r.text
+    doc = r.json()
+    assert doc.get("type", "").startswith("urn:umd:problem:") or r.status_code in (
+        409,
+        500,
+        502,
+        503,
+    )
+
+
+# ---------------------------------------------------------------------------
+# P3-S3: deterministic stage quarantine maps to a structured RFC 7807 422
+# ---------------------------------------------------------------------------
+
+
+def test_stage_quarantined_422_rfc7807_shape(api_ctx) -> None:
+    """A deterministic stage quarantine surfaces as an RFC 7807 422 with
+    code='stage_quarantined' (non-retryable), never a generic 500.
+
+    ``_dispatch`` maps :class:`StageQuarantinedError` to an ``ApiError`` with
+    status 422 / ``retryable=False``; the error handlers serialize it to a
+    ``application/problem+json`` body whose ``type`` is a ``urn:umd:problem:``
+    URI and whose ``retryable`` flag is ``False``.
+    """
+    from umd.jobs.stage_execution import StageQuarantinedError
+
+    client = api_ctx.client
+    ctx = client.app.state.ctx
+
+    def quarantine(**_kwargs):  # type: ignore[no-untyped-def]
+        raise StageQuarantinedError("INGEST", "malformed source", "source:x")
+
+    ctx.jobs.submit = quarantine  # type: ignore[method-assign]
+    r = client.post("/v1/sources", json={"media_kind": "txt", "content": "quarantined"}, headers=W)
+    assert r.status_code == 422, r.text
+    doc = r.json()
+    assert doc["code"] == "stage_quarantined"
+    assert doc["type"].startswith("urn:umd:problem:")
+    assert doc["retryable"] is False
+
+
+# ---------------------------------------------------------------------------
+# P3-S2: bounded-upload enforcement (RFC 7807 413) + multipart forms
+# ---------------------------------------------------------------------------
+
+
+def test_upload_too_large_413_rejected_before_storage(api_ctx) -> None:
+    """An oversize bounded upload is an RFC 7807 413 ``upload_too_large``
+    (non-retryable) raised BEFORE any OCFL / source-row storage side effect.
+    """
+    client, engine = api_ctx.client, api_ctx.engine
+    api_ctx.settings.limits.max_upload_bytes = 5  # tiny bound for the test
+    r = client.post(
+        "/v1/sources",
+        json={"media_kind": "txt", "content": "this is longer than five bytes"},
+        headers=W,
+    )
+    assert r.status_code == 413, r.text
+    doc = r.json()
+    assert doc["code"] == "upload_too_large"
+    assert doc["type"].startswith("urn:umd:problem:")
+    assert doc["retryable"] is False
+    # Rejected up-front: no source row was committed for the oversize payload.
+    with engine.connect() as conn:
+        n = conn.execute(sa.text("SELECT count(*) FROM source")).scalar()
+    assert n == 0, "oversize upload must be rejected before any storage side effect"
+
+
+def test_multipart_upload_ingest_and_job_completes(api_ctx) -> None:
+    """Multipart/form-data upload (P3-S2): a small txt ``file`` part ingests to
+    201 with a source_id, and its job reaches a terminal complete state."""
+    client = api_ctx.client
+    r = client.post(
+        "/v1/sources",
+        files={"file": ("sample.txt", b"hello world", "text/plain")},
+        data={"media_kind": "txt"},
+        headers=W,
+    )
+    assert r.status_code == 201, r.text
+    sid = r.json()["source_id"]
+    assert sid
+    job_id = f"job-{sid[:12]}"
+    status = "running"
+    for _ in range(20):
+        rj = client.get(f"/v1/jobs/{job_id}", headers=R)
+        status = rj.json()["status"]
+        if status in ("complete", "failed", "cancelled"):
+            break
+    assert status == "complete", f"multipart job did not reach complete (got {status})"
+
+
+def test_multipart_missing_file_422(api_ctx) -> None:
+    """A multipart/form-data upload with no ``file`` part is an explicit RFC 7807
+    422 (code='missing_file'), never a silent fallback to the inline-JSON path."""
+    client = api_ctx.client
+    boundary = "xumd-test-boundary"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="media_kind"\r\n\r\n'
+        "txt\r\n"
+        f"--{boundary}--\r\n"
+    ).encode()
+    r = client.post(
+        "/v1/sources",
+        content=body,
+        headers={**W, "Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["code"] == "missing_file"
+
+
+# ---------------------------------------------------------------------------
+# QA R2 M1: route-level smoke tests for cancel / retry / rerun (P3-S3)
+# ---------------------------------------------------------------------------
+# Service-level cancel/retry/rerun behavior is already covered in
+# tests/test_production_runner.py; these exercise the HTTP contract surface
+# (2xx bodies + RFC 7807 failure shape) that was previously untested.
+
+
+def test_route_cancel_returns_200_and_job_reflects_cancelled(api_ctx) -> None:
+    """POST /v1/jobs/{job_id}/cancel -> 200 with action=cancel, and the job's
+    durable aggregate status reflects cancelled."""
+    client = api_ctx.client
+    r = client.post("/v1/sources", json={"media_kind": "txt", "content": "cancel me"}, headers=W)
+    assert r.status_code == 201, r.text
+    sid = r.json()["source_id"]
+    job_id = f"job-{sid[:12]}"
+
+    rc = client.post(f"/v1/jobs/{job_id}/cancel", headers=W)
+    assert rc.status_code == 200, rc.text
+    body = rc.json()
+    assert body["action"] == "cancel"
+    assert body["job_id"] == job_id
+
+    rj = client.get(f"/v1/jobs/{job_id}", headers=R)
+    assert rj.status_code == 200, rj.text
+    assert rj.json()["status"] == "cancelled"
+
+
+def test_route_retry_returns_200_and_job_reaches_terminal_state(api_ctx) -> None:
+    """POST /v1/jobs/{job_id}/retry -> 200 with action=retry, and the retried job
+    lands in a terminal state consistent with the real-registry behavior (all
+    stages already committed -> complete)."""
+    client = api_ctx.client
+    r = client.post("/v1/sources", json={"media_kind": "txt", "content": "retry me"}, headers=W)
+    assert r.status_code == 201, r.text
+    sid = r.json()["source_id"]
+    job_id = f"job-{sid[:12]}"
+
+    rr = client.post(f"/v1/jobs/{job_id}/retry", headers=W)
+    assert rr.status_code == 200, rr.text
+    assert rr.json()["action"] == "retry"
+    assert rr.json()["job_id"] == job_id
+
+    status = "running"
+    for _ in range(20):
+        rj = client.get(f"/v1/jobs/{job_id}", headers=R)
+        status = rj.json()["status"]
+        if status in ("complete", "failed", "cancelled"):
+            break
+    assert status == "complete", f"retried job did not reach a terminal state (got {status})"
+
+
+def test_route_segment_rerun_returns_202_and_ancestors_untouched(api_ctx) -> None:
+    """POST /v1/segments/{segment_id}/rerun -> 202, and descendant-only
+    invalidation is not contradicted: upstream/ancestor stage_run counts are
+    untouched (the rerun schedules only the transitive descendants of
+    LOW_LEVEL_EXTRACTION). The route's ``segment_id`` path param is interpreted
+    by ``rerun_stage`` as a ``source_id`` (see src/umd/api/routers/segments.py),
+    so we pass a real source id to exercise the descendant scheduler against the
+    committed source rather than a segment row."""
+    client, engine = api_ctx.client, api_ctx.engine
+    r = client.post(
+        "/v1/sources",
+        json={"media_kind": "txt", "content": "Sherlock Holmes examined the room"},
+        headers=W,
+    )
+    assert r.status_code == 201, r.text
+    sid = r.json()["source_id"]
+    job_id = f"job-{sid[:12]}"
+
+    rr = client.post(f"/v1/segments/{sid}/rerun", headers=W)
+    assert rr.status_code == 202, rr.text
+    assert rr.json()["action"] == "rerun"
+    assert rr.json()["job_id"] == job_id
+
+    status = "running"
+    for _ in range(20):
+        rj = client.get(f"/v1/jobs/{job_id}", headers=R)
+        status = rj.json()["status"]
+        if status in ("complete", "failed", "cancelled"):
+            break
+    assert status == "complete", f"rerun job did not reach a terminal state (got {status})"
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.text(
+                "SELECT stage_name, count(*) AS n FROM stage_run "
+                "WHERE job_id=:j GROUP BY stage_name"
+            ),
+            {"j": job_id},
+        ).fetchall()
+    counts = {str(row.stage_name): int(row.n) for row in rows}
+    # Ancestors (INGEST..LOW_LEVEL_EXTRACTION) were not re-scheduled by the rerun.
+    for ancestor in ("INGEST", "FORMAT_ANALYSIS", "BASIC_SEGMENTATION", "LOW_LEVEL_EXTRACTION"):
+        assert counts.get(ancestor, 0) == 1, (
+            f"ancestor {ancestor} re-scheduled by descendant-only rerun: {counts}"
+        )
+
+
+def test_route_unknown_job_returns_rfc7807_404(api_ctx) -> None:
+    """Unknown job id on cancel/retry surfaces as an RFC 7807 problem
+    (urn:umd:problem:) 404, not a swallowed or generic error."""
+    client = api_ctx.client
+    for path in ("/v1/jobs/job-unknown/cancel", "/v1/jobs/job-unknown/retry"):
+        r = client.post(path, headers=W)
+        assert r.status_code == 404, (path, r.text)
+        doc = r.json()
+        assert doc.get("type", "").startswith("urn:umd:problem:"), (path, doc)
+        assert doc.get("code") == "not_found", (path, doc)

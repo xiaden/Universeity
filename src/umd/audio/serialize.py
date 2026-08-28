@@ -89,6 +89,10 @@ def _asr_to_dict(a: AsrResult) -> dict[str, Any]:
         "unmapped_count": a.unmapped_count,
         "gated": a.gated,
         "gate_reason": a.gate_reason,
+        "model_id": a.model_id,
+        "model_version": a.model_version,
+        "config_digest": a.config_digest,
+        "generated_at": a.generated_at,
         "utterances": [
             {
                 "index": u.index,
@@ -124,6 +128,10 @@ def _asr_from_dict(d: Any) -> AsrResult:
         unmapped_count=int(d.get("unmapped_count") or 0),
         gated=bool(d.get("gated") or False),
         gate_reason=d.get("gate_reason"),
+        model_id=d.get("model_id"),
+        model_version=d.get("model_version"),
+        config_digest=d.get("config_digest"),
+        generated_at=d.get("generated_at"),
         utterances=[
             AsrUtterance(
                 index=int(u["index"]),

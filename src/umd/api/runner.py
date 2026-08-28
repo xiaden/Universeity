@@ -27,6 +27,7 @@ class SynchronousRunner:
         dag_universe: str,  # noqa: ARG002 - protocol param unused
         work_registry: StageWorkRegistry,  # noqa: ARG002 - protocol param unused
         stages: list[str],
+        rerun_causation: str | None = None,  # noqa: ARG002 - protocol param unused
     ) -> list[StageRunEvent]:
         events: list[StageRunEvent] = []
         for stage in stages:

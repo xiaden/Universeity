@@ -4,6 +4,11 @@ Generated from source strings (no committed binaries) so identical inputs always
 produce identical bytes, which is what deterministic segment/deterministic-key
 tests need. TXT/Markdown are plain text; the EPUB is built with stdlib ``zipfile``;
 the PDFs are assembled by hand with correct xref offsets.
+
+One sanctioned exception: ``ordinary_speech_wav_bytes`` returns a checked-in
+real-speech WAV (``audio_fixtures/ordinary_speech.wav``) so the runnable
+faster-whisper path has genuinely transcribable speech. It is small, pinned, and
+required only by the (gate-skipped) faster-whisper active-path test.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ import tarfile
 import tempfile
 import zipfile
 import zlib
+from pathlib import Path
 
 from PIL import Image, ImageDraw
 
@@ -383,6 +389,29 @@ def multi_speaker_audio_wav_bytes(sample_rate: int = tone.DEFAULT_SAMPLE_RATE) -
 # --- music-under-speech (adversarial audio) -----------------------------------
 
 
+def ordinary_speech_wav_bytes(sample_rate: int = tone.DEFAULT_SAMPLE_RATE) -> bytes:
+    """A single clear ordinary-speech phrase WAV (deterministic, self-hostable).
+
+    This is REAL, whisper-transcribable speech ("hello there.") rendered
+    deterministically from the piper voice ``en_US-amy-low`` and checked in as a
+    small fixture asset (``tests/audio_fixtures/ordinary_speech.wav``). It is the
+    runnable-path input for the faster-whisper spec-first tests when a validated
+    runtime+model cache is present. The sample rate of the asset is 16000 Hz.
+    """
+    if sample_rate != tone.DEFAULT_SAMPLE_RATE:
+        raise ValueError(
+            f"ordinary_speech_wav_bytes only ships a {tone.DEFAULT_SAMPLE_RATE} Hz asset; "
+            f"got sample_rate={sample_rate}"
+        )
+    asset = Path(__file__).parent / "audio_fixtures" / "ordinary_speech.wav"
+    if not asset.is_file():
+        raise FileNotFoundError(
+            "real-speech ASR fixture asset missing; run the ASR validation step that "
+            "generates tests/audio_fixtures/ordinary_speech.wav"
+        )
+    return asset.read_bytes()
+
+
 def music_under_speech_wav_bytes(sample_rate: int = tone.DEFAULT_SAMPLE_RATE) -> bytes:
     """Speech with a loud music tone overlaid mid-phrase (music-under-speech).
 
@@ -444,6 +473,51 @@ def dialogue_video_bytes() -> bytes:
             "language=eng",
             "-t",
             "2",
+            out,
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        with open(out, "rb") as f:
+            return f.read()
+
+
+def speech_video_bytes() -> bytes:
+    """Deterministic ~1s MKV: black video + REAL ordinary-speech audio, no subtitle.
+
+    The audio is the checked-in piper ``ordinary_speech.wav`` muxed losslessly
+    (``pcm_s16le``) so the faster-whisper ACTIVE path can transcribe it through the
+    video branch (Plan H P3-S5 composed-ASR evidence test) without codec distortion.
+    Locked to the tested FFmpeg build.
+    """
+    ffmpeg = _ffmpeg()
+    with tempfile.TemporaryDirectory() as td:
+        wav = td + "/speech.wav"
+        with open(wav, "wb") as f:
+            f.write(ordinary_speech_wav_bytes())
+        out = td + "/out.mkv"
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:r=25:d=1",
+            "-i",
+            wav,
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "pcm_s16le",
+            "-t",
+            "1",
             out,
         ]
         subprocess.run(cmd, check=True, capture_output=True)

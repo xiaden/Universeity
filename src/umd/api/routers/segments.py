@@ -89,7 +89,7 @@ def rerun_segment(
             scope="SOURCE",
             causation="api:segment-rerun",
             dag_universe="base",
-            work_registry={},
+            work_registry=ctx.work_registry,
             job_id=f"job-{segment_id[:12]}",
         )
     except Exception as exc:  # noqa: BLE001

@@ -216,6 +216,7 @@ class JobService:
                 dag_universe=dag_universe,
                 work_registry=work_registry,
                 stages=descendant_stages,
+                rerun_causation=causation,
             )
         return targets
 
@@ -243,6 +244,7 @@ class JobService:
             dag_universe=dag_universe,
             work_registry=work_registry,
             stages=descendant_stages,
+            rerun_causation=causation,
         )
         return StageTargets(
             causation=causation,
@@ -292,6 +294,7 @@ class JobService:
                 dag_universe=dag_universe,
                 work_registry=work_registry,
                 stages=descendant_stages,
+                rerun_causation=f"invalidate:{cause}",
             )
         pause = projection_pause_reason(
             event_type="Invalidated", subject_ref=subject_ref, predicate=predicate, refs=refs

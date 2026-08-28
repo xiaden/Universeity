@@ -15,15 +15,22 @@ config (DD §Limitations; Plan C gate policy). The hermetic, non-gated ASR is th
   * emits transcription-scoped confidence (about the acoustic decode, not
     semantic truth) and an honest ``unmapped`` marker for non-codec audio.
 
-``FasterWhisperAsrProvider`` is the GATED adapter: it raises
-:class:`AsrProviderUnavailable` (typed, reported, never fabricated) unless
-``config.asr_engine == "faster-whisper"`` **and** a weights directory is
-configured and the model is installed.
+``FasterWhisperAsrProvider`` is the validated self-hostable ASR path (P2-S2/S3):
+it loads the pinned model lazily from the cache dir with explicit DD decoder
+settings and a music-aware beam policy, and runs only inside the sandboxed audio
+worker. It raises :class:`AsrProviderUnavailable` (typed, reported, never
+fabricated) unless ``config.asr_engine == "faster-whisper"``, the runtime is
+installed, and a model cache dir is present.
 """
 
 from __future__ import annotations
 
-from typing import Protocol
+import importlib
+import os
+from dataclasses import replace
+from datetime import UTC, datetime
+from hashlib import sha256
+from typing import Any, Protocol, cast
 
 from umd.audio import language, music, tone, vad
 from umd.audio.types import (
@@ -116,56 +123,248 @@ class ReferenceAsrProvider:
 
 
 class FasterWhisperAsrProvider:
-    """GATED faster-whisper adapter (never active without weights/config)."""
+    """faster-whisper ASR provider — lazy model load, explicit decoder settings.
+
+    Genuine (never fabricated) speech-to-text. The pinned CTranslate2 model is
+    loaded **lazily** from the configured cache dir and runs only inside the
+    sandboxed audio worker (``umd.audio.dispatch``), never in the API process and
+    without spawning any subprocess here (faster-whisper manages its own decoder
+    threads bounded by ``asr_cpu_threads`` / ``asr_num_workers``).
+
+    It honors the DD's explicit decoder settings (``word_timestamps``, language
+    detection, VAD with no-speech handling, ``logprob_threshold`` /
+    ``compression_ratio_threshold`` / ``no_speech_threshold``,
+    ``condition_on_previous_text=False``) and a music-aware beam policy (smaller
+    beam when music/SFX is suspected). It raises :class:`AsrProviderUnavailable`
+    (typed, never fabricating) unless the runtime is installed, a model cache dir
+    is present, and the engine is selected.
+    """
 
     name = "faster-whisper"
-    provider_version = "faster-whisper gated"
+    provider_version = "faster-whisper v1.0"
+
+    def __init__(self) -> None:
+        self._model: object | None = None
+        self._model_dir: str | None = None
+        self._model_version: str | None = None
+        self._model_id: str | None = None
 
     def asr(self, audio: DecodedAudio, *, config: AudioConfig) -> AsrResult:
-        del audio  # unused until the trained runtime is wired behind the gate
         if config.asr_engine != "faster-whisper":
             raise AsrProviderUnavailable(
                 "faster-whisper is GATED: UMD_ASR_ENGINE != 'faster-whisper'"
             )
+        # The worker config is already env-populated (audio_config_from_env reads
+        # UMD_ASR_MODEL_CACHE); the provider uses ONLY the explicit config value so a
+        # caller that did not wire a cache dir is never silently served the API env.
         if not config.asr_model_dir:
-            raise AsrProviderUnavailable("faster-whisper is GATED: no weight/model dir configured")
-        raise AsrProviderUnavailable(
-            "faster-whisper configured but trained runtime is not wired; engine stays GATED"
+            raise AsrProviderUnavailable(
+                "faster-whisper configured but no model cache dir (set asr_model_dir)"
+            )
+        model, model_version, model_id = self._load(config.asr_model_dir, config)
+
+        # Music-aware beam policy: greedy (beam=1) when music/SFX is suspected.
+        music_regions, _sfx = music.detect_music_and_sfx(audio)
+        beam = config.asr_beam_size if not music_regions else 1
+
+        segments, info = self._transcribe(model, audio, config, beam)
+
+        utterances = [
+            AsrUtterance(
+                index=idx,
+                text=(seg.text or "").strip(),
+                start_s=float(seg.start),
+                end_s=float(seg.end),
+                words=[
+                    AsrWord(
+                        word=(w.word or "").strip(),
+                        start_s=float(w.start),
+                        end_s=float(w.end),
+                        confidence=float(w.probability),
+                    )
+                    for w in (seg.words or [])
+                ],
+                confidence=_word_conf(seg),
+                language=getattr(info, "language", None),
+                music_suspected=_overlaps_music(float(seg.start), float(seg.end), music_regions),
+            )
+            for idx, seg in enumerate(segments, start=1)
+        ]
+        asr_conf = (
+            sum(u.confidence * u.duration_s for u in utterances)
+            / sum(u.duration_s for u in utterances)
+            if utterances
+            else 0.0
         )
+        return AsrResult(
+            provider=self.name,
+            provider_version=self.provider_version,
+            language=getattr(info, "language", None),
+            utterances=utterances,
+            confidence=asr_conf,
+            energy_correlation=_energy_correlation(audio, utterances),
+            unmapped_count=0,
+            model_id=model_id,
+            model_version=model_version,
+        )
+
+    # -- internals ------------------------------------------------------------
+
+    def _load(self, model_dir: str, config: AudioConfig) -> tuple[object, str | None, str]:
+        if self._model is not None and self._model_dir == model_dir:
+            return self._model, self._model_version, self._model_id or config.asr_model_id
+        if not _faster_whisper_installed():
+            raise AsrProviderUnavailable(
+                "faster-whisper runtime not installed (install the 'asr' optional extra)"
+            )
+        model_dir = os.path.expanduser(model_dir)
+        if not os.path.isdir(model_dir):
+            raise AsrProviderUnavailable(f"faster-whisper model cache dir missing: {model_dir}")
+        model_bin = os.path.join(model_dir, "model.bin")
+        if not os.path.isfile(model_bin):
+            raise AsrProviderUnavailable(
+                f"faster-whisper model cache has no model.bin (invalid CT2 model): {model_dir}"
+            )
+        from faster_whisper import WhisperModel  # optional extra; lazy import
+
+        model = WhisperModel(
+            model_dir,
+            device="cpu",
+            compute_type=config.asr_compute_type,
+            cpu_threads=config.asr_cpu_threads,
+            num_workers=config.asr_num_workers,
+        )
+        model_version = _model_version_fingerprint(model_bin)
+        self._model, self._model_dir = model, model_dir
+        self._model_version, self._model_id = model_version, config.asr_model_id
+        return model, model_version, config.asr_model_id
+
+    def _transcribe(
+        self,
+        model: object,
+        audio: DecodedAudio,
+        config: AudioConfig,
+        beam: int,
+    ) -> tuple[Any, Any]:
+        from importlib import import_module
+
+        np = cast(Any, import_module("numpy"))  # faster-whisper runtime dep; lazy import
+
+        language_code = config.declared_language or config.config_language
+        audio_array = np.asarray(audio.pcm, dtype=np.float32)
+        segments, info = cast(Any, model).transcribe(
+            audio_array,
+            language=language_code,
+            beam_size=beam,
+            word_timestamps=True,
+            vad_filter=True,
+            log_prob_threshold=-1.0,
+            compression_ratio_threshold=2.4,
+            no_speech_threshold=0.6,
+            condition_on_previous_text=False,
+        )
+        return segments, info
+
+
+def _word_conf(seg: object) -> float:
+    """Transcription-scoped confidence for a whisper segment (mean word prob)."""
+    words = getattr(seg, "words", None) or []
+    if not words:
+        return 0.0
+    return sum(float(w.probability) for w in words) / len(words)
+
+
+def _model_version_fingerprint(model_bin: str) -> str:
+    """A short sha256 of the exact weights file (generated-by model version).
+
+    Stream-hashes the file in bounded chunks so a ~75MB ``model.bin`` is never
+    loaded wholesale into memory (the digest semantics are unchanged, so the
+    pinned ``deploy/pins/asr-runtime.md`` match still holds).
+    """
+    h = sha256()
+    with open(model_bin, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return f"weights.sha256={h.hexdigest()[:16]}"
+
+
+def _faster_whisper_installed() -> bool:
+    try:
+        importlib.import_module("faster_whisper")  # noqa: PLC0415 - optional extra probe
+        return True
+    except ImportError:
+        return False
+
+
+def faster_whisper_runtime_ready(model_dir: str | None = None) -> bool:
+    """True when the faster-whisper runtime is importable AND a valid cache is present.
+
+    Mirrors the provider's :meth:`FasterWhisperAsrProvider._load` gate exactly:
+    the faster-whisper package must be importable, the cache dir must exist, and
+    it must contain ``model.bin`` (the file the provider actually loads). This
+    prevents an empty/invalid cache dir from reporting ACTIVE in the capability
+    report while :meth:`asr` would raise :class:`AsrProviderUnavailable`.
+    """
+    if not _faster_whisper_installed():
+        return False
+    cache = model_dir or os.environ.get("UMD_ASR_MODEL_CACHE")
+    if not cache:
+        return False
+    cache = os.path.expanduser(cache)
+    if not os.path.isdir(cache):
+        return False
+    return os.path.isfile(os.path.join(cache, "model.bin"))
 
 
 ASR_PROVIDERS: dict[str, AsrProvider] = {
     "reference": ReferenceAsrProvider(),
+    "faster-whisper": FasterWhisperAsrProvider(),
 }
 
 
 def run_asr(audio: DecodedAudio, *, config: AudioConfig) -> AsrResult:
-    """Dispatch ASR by ``config.asr_engine`` (reference default; faster-whisper GATED).
+    """Single ASR dispatch point: resolve ``config.asr_engine`` -> provider.
 
-    The faster-whisper engine is GATED and raises :class:`AsrProviderUnavailable`
-    while it is not wired. We catch it and return the honest reference transcript
-    explicitly marked ``gated=True`` with the gate reason, so a naive caller is
-    routed through capability reporting instead of an uncaught typed failure.
+    Providers are resolved from :data:`ASR_PROVIDERS`. A provider that raises
+    :class:`AsrProviderUnavailable` (gated/weights-absent/not-installed) is
+    downgraded to the honest reference transcript explicitly marked ``gated=True``
+    with the reason — never fabricated, never claiming the gated runtime is active.
+    Every dispatched result is stamped with generated-by metadata (config digest +
+    generation timestamp) so it is auditable.
     """
     engine = config.asr_engine
-    if engine == "faster-whisper":
-        try:
-            FasterWhisperAsrProvider().asr(audio, config=config)  # raises unless truly active
-        except AsrProviderUnavailable as exc:
-            result = ASR_PROVIDERS["reference"].asr(audio, config=config)
-            return AsrResult(
-                provider=result.provider,
-                provider_version=result.provider_version,
-                language=result.language,
-                utterances=result.utterances,
-                confidence=result.confidence,
-                energy_correlation=result.energy_correlation,
-                unmapped_count=result.unmapped_count,
-                warnings=[*result.warnings, f"faster-whisper gated: {exc}"],
-                gated=True,
-                gate_reason=str(exc),
-            )
-    return ASR_PROVIDERS["reference"].asr(audio, config=config)
+    provider = ASR_PROVIDERS.get(engine)
+    if provider is None:
+        result = ASR_PROVIDERS["reference"].asr(audio, config=config)
+        return _stamp(
+            _gated(result, f"ASR engine {engine!r} is not registered; reference fallback"),
+            config,
+        )
+    try:
+        result = provider.asr(audio, config=config)
+    except AsrProviderUnavailable as exc:
+        result = ASR_PROVIDERS["reference"].asr(audio, config=config)
+        result = _gated(result, str(exc))
+    return _stamp(result, config)
+
+
+def _gated(result: AsrResult, reason: str) -> AsrResult:
+    """Mark a reference-fallback result as gated with an explicit reason."""
+    return replace(
+        result,
+        gated=True,
+        gate_reason=reason,
+        warnings=[*result.warnings, f"ASR gated: {reason}"],
+    )
+
+
+def _stamp(result: AsrResult, config: AudioConfig) -> AsrResult:
+    """Stamp generated-by metadata (config digest + generation timestamp)."""
+    return replace(
+        result,
+        generated_at=result.generated_at or datetime.now(UTC).isoformat(),
+        config_digest=result.config_digest or config.config_digest,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -115,6 +115,19 @@ class RebuildSettings(BaseSettings):
     min_interval_seconds: float = 1.0
 
 
+class RasterSettings(BaseSettings):
+    """Raster OCR provider selection (wired identically to the audio ASR pattern).
+
+    ``reference`` is the deterministic default; ``tesseract`` (and other gated
+    providers) activate only when explicitly configured AND the runtime gate
+    passes. The :meth:`umd.jobs.production._Composer._ocr_provider` reads this so
+    production can select tesseract when it is available; unavailable providers
+    degrade honestly with a gated warning (never a fabricated active OCR claim).
+    """
+
+    ocr_provider: str = "reference"
+
+
 class ProjectionSettings(BaseSettings):
     """Tier-1 projection / blue-green / search / vector knobs (Phase 2)."""
 
@@ -145,6 +158,7 @@ class Settings(BaseSettings):
     postgres: PostgresSettings = Field(default_factory=PostgresSettings)
     ocfl: OcflSettings = Field(default_factory=OcflSettings)
     limits: LimitsSettings = Field(default_factory=LimitsSettings)
+    raster: RasterSettings = Field(default_factory=RasterSettings)
     projection: ProjectionSettings = Field(default_factory=ProjectionSettings)
     rebuild: RebuildSettings = Field(default_factory=RebuildSettings)
     api: ApiSettings = Field(default_factory=ApiSettings)

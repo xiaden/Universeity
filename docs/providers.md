@@ -17,6 +17,12 @@ semantic authority. gated entries are labeled and reported gated by
 - **Semantic authority**: `tier0-ledger; projections never authoritative`.
 - **Linkage** (`umd-reference-linkage`): splink **gated**/not active.
 - **Alignment** (`umd-reference-aligner`): vecalign **gated**/not active.
+- **Raster OCR** (`umd-reference-ocr`): active default (in-process, deterministic
+  template/rule matching — no pixels fabricated, no identity claim). Tesseract is
+  reported **configured-but-unavailable** when the `tesseract` binary is absent,
+  never active; PaddleOCR remains a named **GATE**.
+- **Raster spatial** (`umd-reference-spatial`): active (panel/region + bounded
+  face/object observations as `candidate_kind=observation` only).
 - Modality / provider configuration is versioned; `relationships_bounded=true`,
   `query_max_depth` and `query_max_limit` are reported from the live settings.
 
@@ -24,6 +30,8 @@ semantic authority. gated entries are labeled and reported gated by
 
 | Provider | Role | Posture |
 |---|---|---|
+| tesseract | raster OCR enhancer | **configured-but-unavailable** when the `tesseract` binary is absent (reported, never active); reference OCR active in base |
+| PaddleOCR | raster OCR enhancer | **GATED** (`umd-raster.ocr.PADDLE_GATE`); reference OCR active in base |
 | faster-whisper | ASR | **GATED** — pinned offline weights; best-effort filter signals |
 | pyannote | diarization | **GATED + legal gate** (`UMD_DIARIZATION_LEGAL_GATE`, pinned weights) |
 | PySceneDetect | video scene enhancer | **GATED** (`UMD_SCENE_ENGINE_PYSCENEDETECT`); reference ffmpeg scene in base |

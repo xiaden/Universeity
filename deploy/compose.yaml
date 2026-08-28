@@ -101,7 +101,7 @@ services:
   hatchet:
     # Durable DAG runner (release exact pin is a build gate; see
     # deploy/security/CVE_WATCH.md and the Plan E rollout section).
-    image: ghcr.io/hatchet-dev/hatchet:${HATCHET_VERSION:-v0.50.0}
+    image: ghcr.io/hatchet-dev/hatchet:${HATCHET_VERSION:-v0.105.2}
     environment:
       SERVER_AUTH_COOKIE_SECRET: ${HATCHET_COOKIE_SECRET:?}
       SERVER_ENCRYPTION_MASTER_KEY: ${HATCHET_MASTER_KEY:?}

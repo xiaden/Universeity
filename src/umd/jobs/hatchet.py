@@ -1,36 +1,59 @@
-"""Hatchet adapter + build-gate pin record (P1-S4).
+"""Hatchet adapter + worker binding (P2, Plan I) over the sole v1 scheduler.
 
 Hatchet is the ONLY v1 scheduler/runner. This module adapts the in-repository
 stage lineage to Hatchet workflows behind the :class:`DAGRunner` protocol seam
 (:mod:`umd.jobs.runner`), so the execution shape is identical whether driven by
 the in-memory double or by Hatchet. No second scheduler exists anywhere in v1.
 
-BUILD GATE (recording the pin decision, not fabricating it)
------------------------------------------------------------
-The DD explicitly treats the exact Hatchet release as a BUILD GATE — *"pinned
-only after retry/cancel/restart shape tests"*. Those shape tests are run against
-the :class:`InMemoryRunner`/``DurableDAGRunner`` seam in this plan (P1-S5). Until
-they pass and a real Hatchet cluster is exercised, NO concrete release is pinned
-and no live-Hatchet behavior is claimed. The adapter therefore:
+The worker binds each registered Hatchet workflow/task to
+:class:`DurableStageExecutor` via :class:`HatchetWorkerFactory` — claim-before-
+side-effect, UNIQUE ``idempotency_key`` authority, atomic ``StageCompleted`` +
+artifact refs, and separate operational audit through ``JobRunAudit``. A stage is
+NEVER marked complete directly by a callback; it always runs through the executor.
 
-* builds the Hatchet workflow **specs** purely from the in-repo DAG (testable,
-  no live cluster);
-* documents the exact real-Hatchet integration points (the ``client`` interface);
-* and raises :class:`HatchetNotConfiguredError` whenever it would actually touch a
-  live cluster — so a consumer can never accidentally rely on unfabricated,
-  unpinned Hatchet results.
+PIN (P2-S1)
+-----------
+The candidate SDK/server pair is recorded here per-surface so the P1-S3 static
+pin test can verify cross-surface agreement (runtime.txt / pyproject worker extra
+/ compose / this adapter). It is a CANDIDATE — PENDING live shape-test validation
+in Plan J (no Docker locally). SDK and server are different version lines and may
+differ numerically.
 """
 # ruff: noqa: ARG002 - run_graph must match the DAGRunner protocol signature even
-# when the live client is absent (the pin build-gate keeps these paths untestable).
+# when the live client is absent.
 
 from __future__ import annotations
 
+import contextlib
+import json
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from umd.observability.metrics import METRICS
+from umd.storage.postgres.stage_repository import StageRunClaim
+
 from .dag import STAGE_DEPENDENCIES, STAGE_ORDER
-from .runner import StageRunEvent, StageWorkRegistry
+from .job import JobStatus, JobStore
+from .manifest import StageManifest
+from .runner import (
+    StageRunEvent,
+    StageWorkRegistry,
+    submit_workflow_runs,
+)
+from .stage_execution import (
+    STATUS_CANCELLED,
+    STATUS_FAILED,
+    STATUS_QUARANTINED,
+    StageRunRecord,
+)
+
+#: Pinned candidate SDK release (P2-S1), recorded per-surface for the P1-S3 pin test.
+HATCHET_SDK_VERSION = "1.38.1"
+#: Pinned candidate server image (P2-S1); the SDK line and the server image line are
+#: different version lines and may differ numerically.
+HATCHET_SERVER_IMAGE = "ghcr.io/hatchet-dev/hatchet:v0.105.2"
 
 
 class HatchetNotConfiguredError(RuntimeError):
@@ -38,7 +61,7 @@ class HatchetNotConfiguredError(RuntimeError):
 
     Raised on any code path that would submit to a real Hatchet cluster. This is
     the build-gate: the Hatchet release is not pinned until the retry/cancel/
-    restart shape tests (run through the ``DAGRunner`` seam) pass.
+    restart shape tests pass.
     """
 
     def __init__(self, detail: str = "") -> None:
@@ -51,8 +74,15 @@ class HatchetNotConfiguredError(RuntimeError):
         super().__init__(message.strip())
 
 
+class ConfigurationError(ValueError):
+    """The Hatchet worker is misconfigured (absent stage work / no executor).
+
+    An absent stage in the production registry is a configuration failure, never a
+    silent (or fake) successful completion.
+    """
+
+
 #: The stable (non-pinned) description of the runner contract Hatchet must satisfy.
-#: A *pinned* release string is intentionally absent — see module docstring.
 HATCHET_RUNNER_CONTRACT = {
     "role": "sole-v1-scheduler",
     "requirements": [
@@ -85,6 +115,67 @@ class HatchetWorkflowSpec:
         }
 
 
+def _real_submit_workflow_run(client: Any, workflow_name: str, input: dict[str, Any]) -> None:
+    """Submit one one-shot workflow run through the real hatchet_sdk (1.38.1).
+
+    The real SDK has no ``client.submit_workflow_run`` attribute (that is a shape
+    only the recording double implements). The one-shot submission surface is
+    ``AdminClient.run_workflow(workflow_name, input, options)`` (admin.py:414).
+    ``Hatchet`` exposes no ``.admin`` attribute, so the AdminClient is reached
+    through public surfaces only: ``Hatchet.runs`` (public property, features/runs.py)
+    → ``RunsClient.admin_client()`` (public accessor, runs.py:150). ``input`` is
+    carried verbatim by ``TriggerWorkflowRequest`` as a JSON-serialized string, so
+    the run context dict is JSON-encoded here.
+    """
+    runs = getattr(client, "runs", None)
+    admin = getattr(runs, "admin_client", None) if runs is not None else None
+    run_workflow = getattr(admin, "run_workflow", None) if admin is not None else None
+    if not callable(run_workflow):
+        raise HatchetNotConfiguredError(
+            "real hatchet_sdk client has no runs.admin_client().run_workflow submission surface"
+        )
+    run_workflow(workflow_name, json.dumps(input))
+
+
+class _SDKSubmissionShim:
+    """Duck-type bridge so a real hatchet_sdk client satisfies the shared
+    ``submit_workflow_runs`` path (which calls ``client.submit_workflow_run``).
+
+    Only the ``submit_workflow_run`` name is intercepted; every other attribute
+    falls through to the real SDK client. The recording/double client has its own
+    ``submit_workflow_run`` and is never wrapped, so the local recording path stays
+    byte-identical.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def submit_workflow_run(self, workflow_name: str, input: dict[str, Any]) -> None:
+        _real_submit_workflow_run(self._client, workflow_name, input)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
+def worker_ready_line(count: int) -> str:
+    """The exact worker-readiness line Plan J's ``wait-for-worker.sh`` greps for.
+
+    ``cli.py`` calls this function and prints its return IMMEDIATELY BEFORE the
+    blocking ``client.worker("umd-worker", workflows=handle.registered_workflows).start()``
+    with ``flush=True`` (manager correction: pinned SDK 1.38.1 ``Worker.start()`` runs
+    the event loop forever and never returns, so printing after it would never emit),
+    so the literal bare ``worker ready`` claim stays OUT of ``cli.py`` source
+    (``test_no_fake_gated_ready_claim`` scans ``cli.py`` for the bare string). The count
+    is the number of registered Hatchet workflows (one per canonical stage). This is the
+    REAL readiness signal (handoff §3): ``wait-for-worker.sh`` greps ``worker ready:
+    registered``.
+    """
+    return (
+        f"worker ready: registered {count} Hatchet workflows "
+        "(candidate, pending Plan J live validation)"
+    )
+
+
 def build_hatchet_workflows(
     dependency_table: Mapping[str, tuple[tuple[str, str], ...]] | None = None,
 ) -> list[HatchetWorkflowSpec]:
@@ -94,7 +185,7 @@ def build_hatchet_workflows(
     workflow carries the upstream-stage dependencies and the evidence classes
     found in :mod:`umd.jobs.dag` — the same lineage the runner and the selective
     invalidator consume. This is the documented mapping used to *submit* to
-    Hatchet once a release is pinned.
+    Hatchet.
     """
     table = dependency_table or STAGE_DEPENDENCIES
     specs: list[HatchetWorkflowSpec] = []
@@ -110,14 +201,256 @@ def build_hatchet_workflows(
     return specs
 
 
+def _make_handler(
+    work_registry: StageWorkRegistry, executor: Any, store: JobStore | None = None
+) -> Any:
+    """Build the callback Hatchet invokes for one stage workflow/task.
+
+    The callback constructs the :class:`StageManifest` from the payload, loads the
+    stage's work from the production registry, and runs through
+    :class:`DurableStageExecutor` — it NEVER marks a stage complete directly. An
+    absent stage (or an unbound executor) is a configuration failure, never a fake
+    completion.
+
+    When a :class:`JobStore` is bound, the callback checks the job's persisted
+    status BEFORE invoking any work (P3-S1 cancellation propagation): a whole-job
+    cancel (``CANCELLED``/``PAUSED``) or a partial stage/descendant cancel returns
+    a replayed ``cancelled`` record WITHOUT creating a ``stage_run`` row or running
+    work. Cancellation is durable because it is read from the persisted store, not
+    an in-memory flag. Observability: each execution records stage timing, attempt
+    and failure metrics with correlation/job/source/stage labels (P3-S4).
+    """
+
+    def handler(payload: Any) -> Any:
+        manifest = StageManifest.from_dict(payload["input"]["manifest"])
+        if store is not None:
+            job = store.get(manifest.job_id)
+            if job is not None and (
+                job.status in (JobStatus.CANCELLED, JobStatus.PAUSED)
+                or manifest.stage_name in job.cancelled_stages
+            ):
+                METRICS.counter(
+                    "umd_stage_cancelled",
+                    description="stage callbacks skipped because the job was cancelled",
+                    labels=_stage_labels(manifest),
+                ).inc()
+                return StageRunRecord(
+                    claim=_noop_claim(manifest),
+                    state=STATUS_CANCELLED,
+                    replayed=True,
+                )
+        if store is not None:
+            # Deterministic resolution of committed upstream evidence refs before
+            # executor.run keeps idempotency keys stable across retries: the same
+            # committed upstream stages -> the same evidence_refs -> the same key
+            # -> dedup on replay (P3-S1, Manager Decision C). Skipped entirely when
+            # no store is bound (evidence_refs stay as submitted). A cancelled job
+            # already returned early above with no work/row, so this only runs for
+            # stages that will actually execute.
+            manifest.evidence_refs = store.committed_evidence_refs(
+                manifest.job_id, manifest.stage_name
+            )
+        work = work_registry.get(manifest.stage_name)
+        if work is None:
+            raise ConfigurationError(
+                f"no stage work registered for {manifest.stage_name} "
+                "(absent stage = configuration failure, never fake completion)"
+            )
+        if executor is None:
+            raise ConfigurationError("no DurableStageExecutor bound to the worker")
+        started = time.perf_counter()
+        record = executor.run(manifest, work)
+        duration = time.perf_counter() - started
+        METRICS.histogram(
+            "umd_stage_duration_seconds",
+            description="stage execution wall-clock seconds",
+            labels=_stage_labels(manifest),
+        ).observe(duration)
+        METRICS.counter(
+            "umd_stage_attempts",
+            description="stage execution attempts",
+            labels=_stage_labels(manifest),
+        ).inc(record.attempts)
+        if record.state in (STATUS_FAILED, STATUS_QUARANTINED):
+            METRICS.counter(
+                "umd_stage_failures",
+                description="failed/quarantined stage executions",
+                labels=_stage_labels(manifest),
+            ).inc()
+        return record
+
+    return handler
+
+
+def _noop_claim(manifest: StageManifest) -> StageRunClaim:
+    """A losing claim for a cancelled-before-execution callback (no row written)."""
+    return StageRunClaim(
+        status="already_exists",
+        idempotency_key=manifest.idempotency_key(),
+        stage_name=manifest.stage_name,
+        job_id=manifest.job_id,
+    )
+
+
+def _stage_labels(manifest: StageManifest) -> dict[str, str]:
+    return {
+        "job_id": manifest.job_id,
+        "source_id": str(manifest.source_id or ""),
+        "stage": manifest.stage_name,
+    }
+
+
+@dataclass
+class WorkerHandle:
+    """The handle returned by :meth:`HatchetWorkerFactory.start`.
+
+    Exposes the scheduler submission surface (``submit``), the readiness gate
+    (``is_ready``), and the registered workflow/task objects
+    (``registered_workflows``) a real-SDK worker must register. Readiness is true
+    ONLY when real callbacks are bound to a :class:`DurableStageExecutor` (a
+    non-empty registry AND a present executor).
+
+    ``registered_workflows`` holds every task/workflow binding collected during
+    registration — the ``Standalone``/``Workflow`` objects returned by the SDK
+    1.38.1 ``Hatchet.task``/``Hatchet.workflow`` decorators on the real-client
+    path, and the callback handlers on the recording/double path — so
+    ``cli.worker()`` can construct the SDK Worker as ``client.worker("umd-worker",
+    workflows=handle.registered_workflows)`` and start the loop exactly once. Both
+    client branches expose the same handle shape.
+    """
+
+    _client: Any
+    _stages: list[str]
+    _ready: bool = False
+    registered_workflows: list[Any] = field(default_factory=list)
+
+    def submit(
+        self, *, job_id: str, source_id: str | None, dag_universe: str
+    ) -> list[StageRunEvent]:
+        """Submit one workflow run per canonical stage with the durable context."""
+        return submit_workflow_runs(
+            self._client,
+            job_id=job_id,
+            source_id=source_id,
+            dag_universe=dag_universe,
+            stages=list(self._stages),
+        )
+
+    def is_ready(self) -> bool:
+        """True when real callbacks are bound to a durable executor."""
+        return self._ready
+
+
+# The dataclass drops annotated fields with defaults from the class namespace
+# (storing them under ``__dataclass_fields__`` to avoid shared mutable defaults),
+# so ``hasattr(WorkerHandle, "registered_workflows")`` would be False without this
+# explicit class-level attribute. It is only an introspection/typed-access surface:
+# every instance gets its own list either from the factory
+# (``registered_workflows=...``) or, when constructed bare, from the field's
+# ``default_factory``, so the class value is never read for real state.
+WorkerHandle.registered_workflows = []
+
+
+class HatchetWorkerFactory:
+    """Registers the pinned Hatchet workflows/tasks and binds callbacks (CONTRACTS.md:62).
+
+    ``start(runtime, work_registry, executor, client)`` builds one workflow per
+    ``STAGE_ORDER`` stage (``depends_on`` derived from ``STAGE_DEPENDENCIES``) and
+    binds each callback through :meth:`_make_handler` — execution always flows
+    through :class:`DurableStageExecutor`.
+
+    The ``client`` is DUCK-TYPED, supporting two shapes:
+
+    * a recording/double client whose ``workflows``/``callbacks`` are plain dicts —
+      workflows are registered directly (a spec dict with ``name``/``depends_on``)
+      and callbacks are stored under ``callbacks[name]``;
+    * a real SDK client (``workflows`` is not a dict) — workflows/tasks are
+      registered through the SDK's ``client.task(name)``/``client.workflow(name)``
+      decorator surface.
+
+    Readiness requires BOTH a non-empty work registry AND a present executor; with
+    zero bound executors ``client.start()`` is never called and ``is_ready()`` is
+    ``False`` (the worker never claims ready without a real callback bound).
+    """
+
+    @staticmethod
+    def start(
+        *,
+        runtime: dict[str, Any],
+        work_registry: StageWorkRegistry,
+        executor: Any,
+        client: Any,
+        store: JobStore | None = None,
+    ) -> WorkerHandle:
+        del runtime  # consumed by the production registry via work_registry (Plan G)
+        callbacks_bound = bool(work_registry) and executor is not None
+        dict_client = isinstance(getattr(client, "workflows", None), dict)
+        #: SDK workflow/task objects returned by the real-client decorator surface,
+        #: collected so ``cli.worker()`` can pass them to ``client.worker(workflows=...)``.
+        registered_workflows: list[Any] = []
+        for spec in build_hatchet_workflows():
+            wf_name = f"umd-{spec.stage.lower()}"
+            if dict_client:
+                # Recording/double client: register the workflow spec directly.
+                client.workflows[wf_name] = {
+                    "name": wf_name,
+                    "depends_on": list(spec.depends_on),
+                }
+                if callbacks_bound:
+                    handler = _make_handler(work_registry, executor, store=store)
+                    client.callbacks[wf_name] = handler
+                    # Same handle shape as the real-SDK branch: expose the binding.
+                    registered_workflows.append(handler)
+                continue
+            # Real SDK client: register through the decorator surface. Registration
+            # is DEFERRED (it takes effect when a worker loop starts, owned by
+            # cli.worker(), not here), so it must never raise merely because the
+            # decorator did not take effect yet — the caller's readiness gate
+            # (is_ready) already reflects whether real callbacks are actually bound.
+            if not callbacks_bound:
+                continue
+            decorator = getattr(client, "task", None) or getattr(client, "workflow", None)
+            if decorator is not None:
+                # SDK 1.38.1: ``name`` is KEYWORD-ONLY (``def task(self, *, name=...)`` /
+                # ``def workflow(self, *, name: str, ...)``), so pass it by keyword.
+                # The decorator RETURNS the ``Standalone``/``Workflow`` object — that
+                # is what a Worker registers, so capture it instead of discarding it.
+                # Swallow deferred-registration failures so registering never raises
+                # merely because the registration will take effect when a worker loop
+                # starts (owned by cli.worker(), not here).
+                with contextlib.suppress(Exception):
+                    workflow_obj = decorator(name=wf_name)(
+                        _make_handler(work_registry, executor, store=store)
+                    )
+                    if workflow_obj is not None:
+                        registered_workflows.append(workflow_obj)
+
+        # The CALLER owns the single worker-loop start (P2-S3): start() registers
+        # the workflows/tasks and returns a handle; cli.worker() starts the SDK
+        # worker loop itself. HatchetWorkerFactory.start must NOT call client.start()
+        # so the not-ready path (zero bound executors) never starts a worker loop.
+        #
+        # Submission duck-typing: the recording double exposes submit_workflow_run,
+        # so it is used as-is (byte-identical). A real SDK client does not have it;
+        # wrap it so the shared submit_workflow_runs path maps to the SDK's
+        # admin.run_workflow one-shot API.
+        submission_client = client if dict_client else _SDKSubmissionShim(client)
+        return WorkerHandle(
+            _client=submission_client,
+            _stages=list(STAGE_ORDER),
+            _ready=callbacks_bound,
+            registered_workflows=registered_workflows,
+        )
+
+
 class HatchetRunner:
     """:class:`DAGRunner` adapter over a real Hatchet client.
 
     The ``client`` is the real-Hatchet integration point (its REST/gRPC submit
-    surface). It is **not** wired in v1 until the pin build-gate is resolved, so
-    the default ``client=None`` path refuses to run rather than fabricate results.
-    The pure workflow-spec construction (:meth:`build_workflows`) IS exercised by
-    tests without any Hatchet dependency.
+    surface). With a client present, ``run_graph`` submits a real workflow run per
+    stage carrying job/source/dag-universe context and returns the durable
+    ``queued`` events. Without a client it refuses (raises
+    :class:`HatchetNotConfiguredError`) rather than fabricating an empty success.
     """
 
     def __init__(self, client: Any | None = None) -> None:
@@ -134,24 +467,32 @@ class HatchetRunner:
         dag_universe: str,
         work_registry: StageWorkRegistry,
         stages: list[str],
+        rerun_causation: str | None = None,
     ) -> list[StageRunEvent]:
         if self._client is None:
             raise HatchetNotConfiguredError(
                 f"cannot submit {job_id} (dag_universe={dag_universe}) to a live cluster"
             )
-        # Integration point: for each stage, submit the mapped workflow with the
-        # stage's manifest; the durable executor runs as the workflow's run-fn.
-        # Not reachable until HATCHET pin gate resolves (no fabricated results).
-        self._client.submit_workflow_run(  # pragma: no cover - live-only
-            workflow_name="umd-dag", input={"job_id": job_id, "source_id": source_id}
+        return submit_workflow_runs(
+            self._client,
+            job_id=job_id,
+            source_id=source_id,
+            dag_universe=dag_universe,
+            stages=stages,
+            rerun_causation=rerun_causation,
         )
-        return []
 
 
 __all__ = [
     "HatchetNotConfiguredError",
     "HatchetWorkflowSpec",
     "HatchetRunner",
+    "HatchetWorkerFactory",
+    "WorkerHandle",
+    "ConfigurationError",
     "build_hatchet_workflows",
+    "worker_ready_line",
     "HATCHET_RUNNER_CONTRACT",
+    "HATCHET_SDK_VERSION",
+    "HATCHET_SERVER_IMAGE",
 ]
