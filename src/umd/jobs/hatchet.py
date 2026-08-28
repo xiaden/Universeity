@@ -25,7 +25,9 @@ differ numerically.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -52,8 +54,11 @@ from .stage_execution import (
 #: Pinned candidate SDK release (P2-S1), recorded per-surface for the P1-S3 pin test.
 HATCHET_SDK_VERSION = "1.38.1"
 #: Pinned candidate server image (P2-S1); the SDK line and the server image line are
-#: different version lines and may differ numerically.
-HATCHET_SERVER_IMAGE = "ghcr.io/hatchet-dev/hatchet:v0.105.2"
+#: different version lines and may differ numerically. P2-S4: the split topology uses
+#: the real ghcr.io sub-path images; the engine image is the scheduler/runner surface
+#: this capability advertises. The top-level ``ghcr.io/hatchet-dev/hatchet`` reference
+#: is DENIED (403) on ghcr.io and must never be used.
+HATCHET_SERVER_IMAGE = "ghcr.io/hatchet-dev/hatchet/hatchet-engine:v0.105.2"
 
 
 class HatchetNotConfiguredError(RuntimeError):
@@ -443,6 +448,54 @@ class HatchetWorkerFactory:
         )
 
 
+class _UnconfiguredClient:
+    """An honest no-live-Hatchet submission surface (CONTRACTS.md:61/:63).
+
+    Returned by :func:`build_hatchet_client` when the SDK is absent or the server
+    URL/token are not configured, so a release factory can still select
+    :class:`ProductionDAGRunner` while submission REFUSES loudly (never a silent
+    fake success). ``submit_workflow_run`` raises :class:`HatchetNotConfiguredError`;
+    every other attribute is absent. This is NOT a recording double and never
+    counts as execution evidence.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self._reason = reason
+
+    def submit_workflow_run(self, workflow_name: str, input: dict[str, Any]) -> None:
+        raise HatchetNotConfiguredError(f"cannot submit {workflow_name!r}: {self._reason}")
+
+
+def build_hatchet_client(settings: Any = None) -> Any:
+    """Build the release submission client (a ``submit_workflow_run`` surface).
+
+    Returns a real hatchet_sdk client wrapped in :class:`_SDKSubmissionShim` when
+    the SDK is importable AND ``UMD_HATCHET_SERVER_URL``/``UMD_HATCHET_TOKEN`` are
+    configured; otherwise returns an honest :class:`_UnconfiguredClient` whose
+    submission raises :class:`HatchetNotConfiguredError`. This is the single shared
+    client assembly used by the API release factory (P1-S3); the worker (Plan G/H
+    cli) builds its SDK ``Hatchet`` separately for registration/looping.
+    """
+    del settings  # client config is env-driven today (UMD_HATCHET_*); kept for parity
+    if importlib.util.find_spec("hatchet_sdk") is None:
+        return _UnconfiguredClient("hatchet_sdk not installed")
+    import hatchet_sdk as sdk  # type: ignore[import-not-found]
+
+    server_url = os.environ.get("UMD_HATCHET_SERVER_URL")
+    token = os.environ.get("UMD_HATCHET_TOKEN")
+    if not (server_url and token):
+        return _UnconfiguredClient(
+            "UMD_HATCHET_SERVER_URL / UMD_HATCHET_TOKEN not set; no reachable cluster"
+        )
+    config = sdk.ClientConfig(token=token)
+    if not os.environ.get("HATCHET_CLIENT_HOST_PORT"):
+        from urllib.parse import urlsplit
+
+        host = (urlsplit(server_url).hostname) or "localhost"
+        config.host_port = f"{host}:7070"
+    return _SDKSubmissionShim(sdk.Hatchet(config=config))
+
+
 class HatchetRunner:
     """:class:`DAGRunner` adapter over a real Hatchet client.
 
@@ -487,6 +540,7 @@ __all__ = [
     "HatchetNotConfiguredError",
     "HatchetWorkflowSpec",
     "HatchetRunner",
+    "build_hatchet_client",
     "HatchetWorkerFactory",
     "WorkerHandle",
     "ConfigurationError",

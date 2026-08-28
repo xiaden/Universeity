@@ -52,7 +52,7 @@ def _build_app(umd_db: sa.Engine, tmp_path: Path):
         consistency=ConsistencySettings(lag_wait_multiplier=1, max_waiters=16),
         lag_budget_seconds=0.05,
     )
-    app = create_app(engine=umd_db, source_store=store, settings=settings)
+    app = create_app(engine=umd_db, source_store=store, settings=settings, runner="hermetic")
     client = TestClient(app)
     return client
 

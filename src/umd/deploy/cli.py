@@ -11,7 +11,6 @@ from __future__ import annotations
 import importlib
 import os
 import sys
-from typing import Any
 from urllib.parse import urlsplit
 
 from umd.config import get_settings
@@ -35,6 +34,15 @@ def worker() -> int:
     either is absent this exits non-zero with an actionable message rather than
     silently registering nothing — a worker that reports ready while running zero
     executors would be a lie.
+
+    The worker assembles the **same shared runtime as the API** (the Phase 1
+    shared assembly via :func:`umd.api.app.build_context`): Postgres repositories,
+    the semantic ledger/commands, the OCFL source store, the production stage
+    registry over the full runtime, the :class:`DurableStageExecutor`, quarantine,
+    and the durable job store. Callbacks bind to the executor from this SAME
+    assembly so the API and worker can never diverge on stage work or ownership
+    (no degraded worker runtime). Missing SDK, URL, token, registry entries, or
+    bound executors exits non-zero and never claims ready.
     """
     try:
         sdk = importlib.import_module("hatchet_sdk")
@@ -56,57 +64,40 @@ def worker() -> int:
         )
         return 2
 
-    # Assemble the full runtime before registering any callback: configured
-    # settings, Postgres engine + job/audit/quarantine/stage repositories, OCFL
-    # store, semantic ledger, provider registry, sandbox policy, and the durable
-    # executor. Callbacks bind to the executor; readiness comes only after real
-    # callbacks are bound.
-    from umd.api.app import engine_from_settings
-    from umd.application.commands import SemanticCommandService
+    from umd.api.app import build_context, engine_from_settings
+    from umd.api.entrypoints import build_source_store
     from umd.jobs.hatchet import HatchetWorkerFactory, worker_ready_line
-    from umd.jobs.production import StageWorkRegistryFactory
-    from umd.jobs.stage_execution import (
-        DurableStageExecutor,
-        NoWaitBackoff,
-        RetryPolicy,
-    )
-    from umd.storage.postgres.job_repository import PostgresJobRepository
-    from umd.storage.postgres.ledger import SemanticLedger
-    from umd.storage.postgres.repositories import PostgresQuarantine
-    from umd.storage.postgres.stage_repository import JobRunAudit, StageRunRepository
 
+    # The SAME shared runtime assembly the API release factory uses (Plan K P1-S3).
+    # The worker only consumes the composed production registry, the durable
+    # executor, and the durable JobStore — all built identically to the API's.
+    # build_context's default release runner is ProductionDAGRunner; the worker
+    # does not dispatch through it (it receives submitted runs from Hatchet).
     settings = get_settings()
     engine = engine_from_settings(settings)
-    # Durable JobStore bound to the worker (P3-S1): the callbacks resolve committed
-    # upstream evidence refs and read the PERSISTED job status for cancellation
-    # from this store — durable cancellation/evidence threading in production, not
-    # only in tests.
-    store = PostgresJobRepository(engine)
-    ledger = SemanticLedger(engine)
-    executor = DurableStageExecutor(
+    ctx = build_context(
+        settings=settings,
         engine=engine,
-        commands=SemanticCommandService(ledger),
-        ledger=ledger,
-        stage_repo=StageRunRepository(engine),
-        audit=JobRunAudit(engine),
-        quarantine=PostgresQuarantine(engine),
-        retry=RetryPolicy(),
-        backoff=NoWaitBackoff(),
+        source_store=build_source_store(settings),
     )
-    runtime: dict[str, Any] = {"engine": engine}
-    work_registry = StageWorkRegistryFactory.build(runtime)
+    work_registry = ctx.extra["work_registry"]
+    executor = ctx.extra["executor"]
+    store = ctx.extra["job_store"]
+
     # SDK 1.38.1 has NO ``Hatchet(api_url=..., token=...)`` kwargs — the client is
     # constructed from a ``ClientConfig`` (config.py:215). ``UMD_HATCHET_SERVER_URL``
     # is the server's HTTP(S) URL; the SDK talks to the engine's gRPC admin listener
-    # via ``host_port`` (default ``<hostname>:7070``). We derive ``host_port`` from the
-    # server URL's hostname so the gRPC admin client reaches the same node, while
-    # honoring the SDK's own ``HATCHET_CLIENT_HOST_PORT`` env override when set.
+    # via ``host_port``. In the split topology the gRPC admin listener lives on the
+    # ENGINE (default 7070), not the dashboard. We derive ``host_port`` from the
+    # server URL's hostname by default and honor the SDK's own
+    # ``HATCHET_CLIENT_HOST_PORT`` env override when set (compose sets it to the
+    # engine address so gRPC routes to hatchet-engine, never the dashboard).
     config = sdk.ClientConfig(token=token)
     if not os.environ.get("HATCHET_CLIENT_HOST_PORT"):
         config.host_port = f"{(urlsplit(server_url).hostname) or 'localhost'}:7070"
     client = sdk.Hatchet(config=config)
     handle = HatchetWorkerFactory.start(
-        runtime=runtime,
+        runtime={},
         work_registry=work_registry,
         executor=executor,
         client=client,

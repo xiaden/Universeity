@@ -76,23 +76,14 @@ def _stage_run_status(umd_db: sa.Engine, key: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# P1-S3: production context wiring (FAILS until Phase 3)
+# P1-S2/P1-S3: production context wiring — release factory selects ProductionDAGRunner
 # ---------------------------------------------------------------------------
 
 
-def test_production_context_uses_durable_postgres_backends(
-    umd_db: sa.Engine, source_store: Any
-) -> None:
-    """Production ``build_context()`` must wire PostgresJobRepository + the
-    durable runner seam, never InMemoryJobStore or SynchronousRunner."""
-    from umd.api.app import build_context
-    from umd.api.runner import SynchronousRunner
+def _prod_settings():
     from umd.config import AuthSettings, ConsistencySettings, RateLimitSettings, Settings
-    from umd.jobs.job import InMemoryJobStore
-    from umd.jobs.runner import DurableDAGRunner
-    from umd.storage.postgres.job_repository import PostgresJobRepository
 
-    settings = Settings(
+    return Settings(
         auth=AuthSettings(api_keys=[], write_keys=[]),
         rate_limit=RateLimitSettings(
             enabled=False, requests_per_window=0, window_seconds=60.0, burst=0
@@ -100,16 +91,103 @@ def test_production_context_uses_durable_postgres_backends(
         consistency=ConsistencySettings(lag_wait_multiplier=1, max_waiters=16),
         lag_budget_seconds=0.05,
     )
-    ctx = build_context(settings=settings, engine=umd_db, source_store=source_store)
+
+
+def test_production_context_uses_durable_postgres_backends(
+    umd_db: sa.Engine, source_store: Any
+) -> None:
+    """Production ``build_context()`` must wire PostgresJobRepository + the
+    release :class:`ProductionDAGRunner`, never InMemoryJobStore or SynchronousRunner
+    (Plan K P1-S2)."""
+    from umd.api.app import build_context
+    from umd.api.runner import SynchronousRunner
+    from umd.jobs.job import InMemoryJobStore
+    from umd.jobs.runner import DurableDAGRunner, ProductionDAGRunner
+    from umd.storage.postgres.job_repository import PostgresJobRepository
+
+    ctx = build_context(settings=_prod_settings(), engine=umd_db, source_store=source_store)
     store = ctx.extra["job_store"]
     runner = ctx.jobs._runner  # noqa: SLF001 - deliberate: inspect the injected seam
 
     # Production job state is durable Postgres-backed, never an in-memory double.
     assert isinstance(store, PostgresJobRepository)
     assert not isinstance(store, InMemoryJobStore)
-    # The production dispatch seam is the durable runner, never the test-only double.
-    assert isinstance(runner, DurableDAGRunner)
+    # The RELEASE dispatch seam selects ProductionDAGRunner (Hatchet-backed), never
+    # the test-only SynchronousRunner nor the hermetic DurableDAGRunner seam.
+    assert isinstance(runner, ProductionDAGRunner)
+    assert not isinstance(runner, DurableDAGRunner)
     assert not isinstance(runner, SynchronousRunner)
+    # Without a live Hatchet cluster the release runner honestly refuses submission.
+    from umd.jobs.hatchet import HatchetNotConfiguredError
+
+    with pytest.raises(HatchetNotConfiguredError):
+        runner.run_graph(
+            job_id="release-refusal",
+            source_id="src-x",
+            dag_universe="base",
+            work_registry=dict(ALL_WORK),
+            stages=["INGEST"],
+        )
+    assert ctx.extra.get("production_wired") is True
+
+
+def test_hermetic_runner_is_explicit_test_construction_only(
+    umd_db: sa.Engine, source_store: Any
+) -> None:
+    """``runner="hermetic"`` explicitly assembles the in-process DurableDAGRunner
+    over the same executor/store; it is never the release default (P1-S3)."""
+    from umd.api.app import build_context
+    from umd.jobs.runner import DurableDAGRunner, ProductionDAGRunner
+
+    ctx = build_context(
+        settings=_prod_settings(), engine=umd_db, source_store=source_store, runner="hermetic"
+    )
+    runner = ctx.jobs._runner  # noqa: SLF001
+    assert isinstance(runner, DurableDAGRunner)
+    assert not isinstance(runner, ProductionDAGRunner)
+    assert ctx.extra.get("production_wired") is False
+
+
+def test_queued_submission_is_not_completion(umd_db: sa.Engine) -> None:
+    """An asynchronous submission that returns ``queued`` events is never
+    reported as COMPLETE and does not regress RUNNING -> PENDING (P1-S2/P1-S4)."""
+    from umd.application.jobs import JobService
+    from umd.jobs.job import JobStatus
+    from umd.jobs.runner import StageRunEvent
+    from umd.storage.postgres.job_repository import PostgresJobRepository
+
+    class _QueuedRunner:
+        def run_graph(self, **_kwargs):  # noqa: ARG002 - fixture runner
+            return [StageRunEvent(stage=s, status="queued") for s in STAGE_ORDER]
+
+    ensure_source(umd_db)
+    store = PostgresJobRepository(umd_db)
+    svc = JobService(store=store, runner=_QueuedRunner())
+    svc.submit(job_id="queued-job", source_id=SOURCE_ID, dag_universe="base", work_registry={})
+    assert svc.status("queued-job") == JobStatus.RUNNING
+    assert svc.status("queued-job") != JobStatus.COMPLETE
+    assert svc.status("queued-job") != JobStatus.PENDING
+    rec = store.get("queued-job")
+    assert rec is not None and rec.status == JobStatus.RUNNING
+
+
+def test_absent_stage_work_is_a_configuration_failure(umd_db: sa.Engine) -> None:
+    """Composing the stage registry with an absent canonical stage raises
+    ConfigurationError — an absent stage is a configuration failure, never
+    successful completion (CONTRACTS.md:60, P1-S2)."""
+    from umd.jobs.production import ConfigurationError, StageWorkRegistryFactory
+
+    # A registry declared to compose NO stages is a configuration failure.
+    with pytest.raises(ConfigurationError):
+        StageWorkRegistryFactory.build({"engine": umd_db, "stages": {}})
+    # Omitting a single canonical stage (INGEST) is likewise a configuration failure.
+    with pytest.raises(ConfigurationError):
+        StageWorkRegistryFactory.build(
+            {"engine": umd_db, "stages": [s for s in STAGE_ORDER if s != "INGEST"]}
+        )
+    # Positive control: a full build composes every canonical stage.
+    full = StageWorkRegistryFactory.build({"engine": umd_db})
+    assert set(full) == set(STAGE_ORDER)
 
 
 # ---------------------------------------------------------------------------
@@ -358,3 +436,61 @@ def test_real_registry_retry_deduplicates_and_threads_evidence(umd_db: sa.Engine
             {"j": "prod-retry"},
         ).scalar()
     assert ev, "resumed stage_run row must retain committed evidence_refs"
+
+
+def test_p15_migrations_and_atomic_completion_commit_together(umd_db: sa.Engine) -> None:
+    """P1-S5: the 0001-0007 migration chain (incl. stage_run.evidence_refs) is
+    applied, and DurableStageExecutor claim-before-side-effect +
+    SemanticLedger.complete_and_append atomically persist artifacts/evidence,
+    StageCompleted, and the operational audit together."""
+    ensure_source(umd_db)
+    # 0007 introduced stage_run.evidence_refs; it must be present on the live table.
+    with umd_db.connect() as conn:
+        cols = {
+            r[0]
+            for r in conn.execute(
+                sa.text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name='stage_run'"
+                )
+            )
+        }
+        assert "evidence_refs" in cols, "migration 0007 (stage_run.evidence_refs) not applied"
+
+    from umd.jobs.stage_execution import StageOutcome
+
+    executor, _ledger = build_executor(umd_db)
+
+    def evidenced_work(_manifest: Any) -> Any:
+        return StageOutcome(
+            artifact_refs=["urn:umd:artifact:alpha"],
+            evidence_refs=["urn:umd:evidence:beta"],
+        )
+
+    manifest = make_manifest("BASIC_SEGMENTATION")
+    record = executor.run(manifest, evidenced_work)
+    assert record.state == "complete"
+    key = manifest.idempotency_key()
+
+    with umd_db.connect() as conn:
+        row = conn.execute(
+            sa.text(
+                "SELECT status, evidence_refs, artifact_refs "
+                "FROM stage_run WHERE idempotency_key=:k"
+            ),
+            {"k": key},
+        ).first()
+        assert row is not None and row[0] == "complete"
+        assert row[1] == ["urn:umd:evidence:beta"], "evidence_refs persisted atomically"
+        assert row[2] == ["urn:umd:artifact:alpha"], "artifact_refs persisted atomically"
+        # SemanticLedger.complete_and_append lands the StageCompleted event atomically.
+        events = conn.execute(
+            sa.text("SELECT count(*) FROM semantic_event WHERE event_type='StageCompleted'")
+        ).scalar()
+        assert events >= 1, "StageCompleted semantic event must be appended"
+        # Separate operational audit is written in the same completion.
+        audit = conn.execute(
+            sa.text("SELECT count(*) FROM job_run_audit WHERE stage_name=:s AND action='complete'"),
+            {"s": "BASIC_SEGMENTATION"},
+        ).scalar()
+        assert audit >= 1, "operational audit must record stage completion"

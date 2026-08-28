@@ -49,8 +49,10 @@ from umd.application.commands import SemanticCommandService
 from umd.application.jobs import JobService
 from umd.audit.service import AuditService
 from umd.config import Settings, get_settings
+from umd.jobs.capability import CapabilityReporter, HatchetConnectivityProbe
+from umd.jobs.hatchet import build_hatchet_client
 from umd.jobs.production import StageWorkRegistryFactory, build_runtime
-from umd.jobs.runner import DurableDAGRunner
+from umd.jobs.runner import DurableDAGRunner, ProductionDAGRunner
 from umd.jobs.stage_execution import DurableStageExecutor, RealBackoff, RetryPolicy
 from umd.models.registry import ProviderRegistry
 from umd.observability.logging import StructuredLogger
@@ -91,13 +93,30 @@ def engine_from_settings(settings: Settings) -> sa.Engine:
     )
 
 
-def build_context(*, settings: Settings, engine: sa.Engine, source_store: Any) -> AppContext:
+def build_context(
+    *,
+    settings: Settings,
+    engine: sa.Engine,
+    source_store: Any,
+    runner: Any = None,
+) -> AppContext:
     """Construct the :class:`AppContext` bundle of services (testable standalone).
 
-    Phase 3 wires the *production* execution path, never the test-only doubles:
-    ``PostgresJobRepository`` + ``DurableDAGRunner`` over the composed production
-    stage registry (:mod:`umd.jobs.production`). ``InMemoryJobStore`` and
-    ``SynchronousRunner`` are never instantiated here.
+    Phase 1 (Plan K) wires ONE shared runtime assembly used by both the API and
+    the worker: Postgres repositories, the :class:`SemanticLedger`/commands, the
+    OCFL ``SourceStore``, :class:`StageWorkRegistryFactory` over the composed
+    production stage registry, provider/modality bindings, the sandbox, the
+    artifact/replay/projection builders, observability, ``StageRunRepository``,
+    ``JobRunAudit``, quarantine, the retry policy, and the real Hatchet
+    client/``ProductionDAGRunner``.
+
+    The *release* runner (``runner=None``) is :class:`ProductionDAGRunner` over the
+    real Hatchet client (:func:`build_hatchet_client`); ``InMemoryJobStore`` and
+    ``SynchronousRunner`` are NEVER instantiated here. :class:`DurableDAGRunner`
+    is retained ONLY behind explicit hermetic/test construction — pass
+    ``runner="hermetic"`` to assemble the same runtime over the in-process durable
+    executor seam (used by hermetic API/integration tests and local dev; the
+    scheduler capability then reports non-``active``).
     """
     ledger = SemanticLedger(engine)
     commands = SemanticCommandService(ledger)
@@ -164,8 +183,24 @@ def build_context(*, settings: Settings, engine: sa.Engine, source_store: Any) -
         retry=RetryPolicy(),
         backoff=RealBackoff(RetryPolicy()),
     )
-    runner = DurableDAGRunner(executor=executor, store=job_store)
-    jobs = JobService(store=job_store, runner=runner, commands=commands)
+
+    # -- runner selection (Plan K P1-S3) -----------------------------------
+    # The RELEASE factory selects ProductionDAGRunner over the real Hatchet client
+    # (or an honest _UnconfiguredClient that refuses submission when no cluster is
+    # configured). DurableDAGRunner is retained only behind explicit hermetic/test
+    # construction (runner="hermetic"), assembled over the SAME executor/store.
+    hatchet_client = build_hatchet_client(settings)
+    release_runner: Any
+    if runner is None:
+        release_runner = ProductionDAGRunner(hatchet_client)
+        production_wired = True
+    elif runner == "hermetic":
+        release_runner = DurableDAGRunner(executor=executor, store=job_store)
+        production_wired = False
+    else:
+        release_runner = runner
+        production_wired = isinstance(release_runner, ProductionDAGRunner)
+    jobs = JobService(store=job_store, runner=release_runner, commands=commands)
 
     query_guard = ConsistencyGuard(ProjectionFreshness(engine, _PROJECTION_QUERY), settings)
     search_guard = ConsistencyGuard(ProjectionFreshness(engine, _PROJECTION_SEARCH), settings)
@@ -198,6 +233,17 @@ def build_context(*, settings: Settings, engine: sa.Engine, source_store: Any) -
     ctx.extra["rate_guard"] = rate_guard
     ctx.extra["job_store"] = job_store
     ctx.extra["work_registry"] = work_registry
+    ctx.extra["executor"] = executor
+    ctx.extra["runner"] = release_runner
+    ctx.extra["production_wired"] = production_wired
+    # P1-S6: the wired capability reporter knows whether the production
+    # ProductionDAGRunner is actually assembled (a hermetic DurableDAGRunner seam
+    # can never establish scheduler ``active``). system.py reads it from here
+    # instead of constructing a fresh reporter per request.
+    ctx.extra["capability_reporter"] = CapabilityReporter(
+        production_wired=production_wired,
+        probe=HatchetConnectivityProbe(release_runner, client=hatchet_client),
+    )
     return ctx
 
 
@@ -206,10 +252,16 @@ def create_app(
     engine: sa.Engine,
     source_store: Any,
     settings: Settings | None = None,
+    runner: Any = None,
 ) -> FastAPI:
-    """Create the FastAPI application bound to ``engine`` and ``source_store``."""
+    """Create the FastAPI application bound to ``engine`` and ``source_store``.
+
+    ``runner`` is forwarded to :func:`build_context`; ``None`` selects the release
+    ``ProductionDAGRunner`` while ``"hermetic"`` selects the explicit in-process
+    durable seam for hermetic API/integration tests.
+    """
     settings = settings or get_settings()
-    ctx = build_context(settings=settings, engine=engine, source_store=source_store)
+    ctx = build_context(settings=settings, engine=engine, source_store=source_store, runner=runner)
 
     app = FastAPI(
         title="Universeity UMD REST API",

@@ -49,7 +49,18 @@ def _projection_components(ctx: AppContext) -> list[HealthComponent]:
     return comps
 
 
-def _scheduler_component() -> HealthComponent:
+def _wired_reporter(ctx: AppContext) -> CapabilityReporter:
+    """Return the wired capability reporter (Plan K P1-S6).
+
+    ``build_context`` constructs one reporter that knows whether the production
+    :class:`ProductionDAGRunner` is actually assembled and can run a verified live
+    connectivity probe; a fresh per-request ``CapabilityReporter()`` would lose that
+    wiring and could never report scheduler ``active`` honestly.
+    """
+    return ctx.extra.get("capability_reporter") or CapabilityReporter()
+
+
+def _scheduler_component(ctx: AppContext) -> HealthComponent:
     """Honest scheduler/provider capability as a health component (P3-S4).
 
     The sole v1 scheduler is ``degraded`` whenever it is not ``active`` (absent
@@ -57,7 +68,7 @@ def _scheduler_component() -> HealthComponent:
     never represented as active. Readiness stays projection-driven (see
     :func:`readiness`), so this surfaces capability without faking readiness.
     """
-    sched = CapabilityReporter().report().scheduler
+    sched = _wired_reporter(ctx).report().scheduler
     detail = {
         "provider": sched.get("provider"),
         "status": sched.get("status"),
@@ -74,7 +85,7 @@ def _scheduler_component() -> HealthComponent:
 
 @router.get("/health", response_model=HealthResponse)
 def health(ctx: AppContext = Depends(get_context)) -> HealthResponse:
-    components = _projection_components(ctx) + [_scheduler_component()]
+    components = _projection_components(ctx) + [_scheduler_component(ctx)]
     degraded = any(c.status != "ok" for c in components)
     return HealthResponse(status="degraded" if degraded else "ok", components=components)
 
@@ -96,7 +107,7 @@ def readiness(ctx: AppContext = Depends(get_context)) -> dict[str, Any]:
     return {
         "status": "ready",
         "components": [c.model_dump() for c in components],
-        "scheduler": CapabilityReporter().report().scheduler,
+        "scheduler": _wired_reporter(ctx).report().scheduler,
     }
 
 
@@ -135,8 +146,8 @@ def capabilities(ctx: AppContext = Depends(get_context)) -> CapabilitiesResponse
     report["relationships_bounded"] = True
     report["semantic_authority"] = "tier0-ledger; projections never authoritative"
     # Honest scheduler/provider capability (P3-S4): never represented as active
-    # without a live reachable cluster.
-    report["scheduler"] = CapabilityReporter().report().scheduler
+    # without ProductionDAGRunner wiring + a verified live connectivity probe.
+    report["scheduler"] = _wired_reporter(ctx).report().scheduler
     return CapabilitiesResponse(capabilities=report)
 
 

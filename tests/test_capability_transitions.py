@@ -152,16 +152,12 @@ def test_evidence_warnings_expose_same_status_as_capability_report() -> None:
 
 
 def _faster_whisper_ready() -> bool:
-    import importlib
-    import os
-    from pathlib import Path
+    """Honest readiness probe reusing the runtime gate as the single source of truth."""
+    # faster_whisper_runtime_ready requires the runtime importable AND model.bin
+    # present in the cache dir (an existing-but-empty cache dir must skip, not fail).
+    from umd.audio.asr import faster_whisper_runtime_ready
 
-    try:
-        importlib.import_module("faster_whisper")
-    except ImportError:
-        return False
-    cache = os.environ.get("UMD_ASR_MODEL_CACHE")
-    return bool(cache) and Path(cache).is_dir()
+    return faster_whisper_runtime_ready()
 
 
 @pytest.mark.skipif(
@@ -202,7 +198,7 @@ def api_ctx(umd_db, source_store):
         consistency=ConsistencySettings(lag_wait_multiplier=1, max_waiters=16),
         lag_budget_seconds=0.05,
     )
-    app = create_app(engine=umd_db, source_store=source_store, settings=settings)
+    app = create_app(engine=umd_db, source_store=source_store, settings=settings, runner="hermetic")
     with TestClient(app) as client:
         yield SimpleNamespace(client=client)
 
@@ -227,3 +223,88 @@ def test_api_capabilities_expose_same_audio_statuses(api_ctx) -> None:
     assert api_report["audio"]["asr_engine"]["faster_whisper"]["active"] is False
     # Aggregate report is JSON-serializable and flat-audio is consistent.
     flatten_audio_capabilities(api_report["audio"])
+
+
+# ---------------------------------------------------------------------------
+# Plan K P1-S6: a live scheduler capability is never inferred from a hermetic
+# seam, a version ping, or a recording double.
+# ---------------------------------------------------------------------------
+
+
+def test_scheduler_never_active_from_hermetic_seam() -> None:
+    """A hermetic DurableDAGRunner seam (production_wired=False) can never report
+    the scheduler as ``active`` — it is an executor-facing test/dev driver."""
+    from umd.jobs.capability import CapabilityReporter
+
+    sched = CapabilityReporter(production_wired=False).report().scheduler
+    assert sched["status"] != ACTIVE
+    assert sched["status"] == CONFIGURED_UNAVAILABLE
+
+
+def test_scheduler_active_requires_wiring_and_verified_live_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``active`` requires ProductionDAGRunner wiring + SDK + config + a verified
+    live-connectivity probe with an observed version (P1-S6)."""
+    import importlib
+
+    from umd.jobs.capability import CapabilityReporter, SchedulerConnectivity
+
+    monkeypatch.setenv("UMD_HATCHET_SERVER_URL", "https://hatchet.example:443")
+    monkeypatch.setenv("UMD_HATCHET_TOKEN", "test-token")
+    real_find_spec = importlib.util.find_spec
+
+    def fake_find_spec(name: str):
+        if name == "hatchet_sdk":
+            return object()
+        return real_find_spec(name)
+
+    monkeypatch.setattr("umd.jobs.capability.importlib.util.find_spec", fake_find_spec)
+
+    class Reachable:
+        def check(self):
+            return SchedulerConnectivity(True, "live engine verified", version="1.38.1")
+
+    sched = CapabilityReporter(production_wired=True, probe=Reachable()).report().scheduler
+    assert sched["status"] == ACTIVE
+    assert sched["observed_version"] == "1.38.1"
+
+
+def test_scheduler_not_active_without_probe_or_reachability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wiring alone (no probe, or an unreachable probe) is never ``active``."""
+    import importlib
+
+    from umd.jobs.capability import CapabilityReporter, SchedulerConnectivity
+
+    monkeypatch.setenv("UMD_HATCHET_SERVER_URL", "https://hatchet.example:443")
+    monkeypatch.setenv("UMD_HATCHET_TOKEN", "test-token")
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(
+        "umd.jobs.capability.importlib.util.find_spec",
+        lambda name: object() if name == "hatchet_sdk" else real_find_spec(name),
+    )
+
+    # Wired but no probe wired -> not active.
+    assert CapabilityReporter(production_wired=True).report().scheduler["status"] != ACTIVE
+
+    # Wired + probe that does NOT verify a live engine -> not active.
+    class Unreachable:
+        def check(self):
+            return SchedulerConnectivity(False, "no live engine reachable")
+
+    sched = CapabilityReporter(production_wired=True, probe=Unreachable()).report().scheduler
+    assert sched["status"] != ACTIVE
+
+
+def test_recording_double_or_readiness_text_is_not_execution_evidence() -> None:
+    """A recording double, an unconfigured refusal, or a bare client object never
+    yields ``reachable`` — only a real live operation can (P1-S6)."""
+    from umd.jobs.capability import HatchetConnectivityProbe
+    from umd.jobs.hatchet import _UnconfiguredClient
+
+    probe = HatchetConnectivityProbe(client=_UnconfiguredClient("no cluster"))
+    assert probe.check().reachable is False
+    # A bare object with no real admin surface is not evidence of a live engine.
+    assert HatchetConnectivityProbe(client=object()).check().reachable is False

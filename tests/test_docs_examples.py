@@ -68,7 +68,9 @@ def _build(engine: sa.Engine, *, force_search_resume: bool = True) -> None:
 
 def test_docs_python_client_is_runnable_and_current(umd_db: sa.Engine, source_store) -> None:
     example = _load_example()
-    app = create_app(engine=umd_db, source_store=source_store, settings=_client_settings())
+    app = create_app(
+        engine=umd_db, source_store=source_store, settings=_client_settings(), runner="hermetic"
+    )
     api = example.PublicContractClient(
         base_url="http://localhost:8080", app=app, api_key="write-key"
     )

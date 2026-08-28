@@ -24,8 +24,29 @@ from alembic.config import Config as AlembicConfig
 
 from umd.storage.ocfl import SourceStore
 
-# Recommended Postgres 17 client tools (server-side binaries are not on $PATH).
-PG_BIN = os.environ.get("UMD_PG_BIN", "/usr/lib/postgresql/17/bin")
+
+# Postgres client tools (pg_dump/pg_restore/psql) used by the backup/restore
+# tests. Resolved robustly so both a fixed versioned path AND a plain `$PATH`
+# install work on hosted runners:
+#   * UMD_PG_BIN env is authoritative when set;
+#   * otherwise, if the binaries are on $PATH we derive the dir from pg_dump;
+#   * otherwise we fall back to the conventional Ubuntu Debian path.
+def _resolve_pg_bin() -> str:
+    explicit = os.environ.get("UMD_PG_BIN")
+    if explicit:
+        return explicit
+    from shutil import which
+
+    pg_dump = which("pg_dump")
+    if pg_dump:
+        # Use the found binary's own directory. Do NOT .resolve(): on Debian/Ubuntu
+        # `pg_dump` is a symlink to the pg_wrapper, so resolving follows it to the
+        # wrapper dir (which has no pg_dump), breaking backup/restore tests.
+        return str(Path(pg_dump).parent)
+    return "/usr/lib/postgresql/17/bin"
+
+
+PG_BIN = _resolve_pg_bin()
 PG_HOST = os.environ.get("UMD_PG_HOST", "127.0.0.1")
 PG_PORT = os.environ.get("UMD_PG_PORT", "5432")
 
@@ -166,3 +187,41 @@ def umd_db(migrated_db: sa.Engine) -> Iterator[sa.Engine]:
     _truncate(migrated_db)
     yield migrated_db
     _truncate(migrated_db)
+
+
+# ---------------------------------------------------------------------------
+# P4-S7 race reconciliation: the SHARED compose `umd` database.
+#
+# The Phase-3 flagged race: dedicated ``test_live_hatchet_*`` execution tests
+# polled a throwaway migrated db while the compose worker (the real execution
+# target) wrote to the compose `umd` db -> nondeterministic timeouts on hosted CI.
+#
+# Reconciliation decision (documented, P4-S7): the compose worker is the SOLE
+# execution target and the shared compose `umd` database is the SINGLE source of
+# truth. Live cluster tests connect to ``live_db`` (the shared compose db the
+# in-stack worker/API write to) and assert via the public API + that shared db.
+# No competing in-process worker is spawned, no test is skipped/weakened, and no
+# test gets its own Hatchet engine. The DSN is env-overridable
+# (``UMD_LIVE_POSTGRES_DSN``) and defaults to the compose-published `umd` db.
+# ---------------------------------------------------------------------------
+@pytest.fixture(scope="session")
+def live_db() -> Iterator[sa.Engine]:
+    """The SHARED compose ``umd`` database the in-stack worker/API write to.
+
+    Used ONLY by live cluster tests so they poll the SAME Postgres the compose
+    worker writes to (single source of truth). Requires a live cluster + the
+    shared db to be reachable; skips honestly otherwise (named local gate).
+    """
+    if not (os.environ.get("UMD_HATCHET_SERVER_URL") and os.environ.get("UMD_HATCHET_TOKEN")):
+        pytest.skip("no live Hatchet cluster (set UMD_HATCHET_SERVER_URL/UMD_HATCHET_TOKEN)")
+    dsn = os.environ.get(
+        "UMD_LIVE_POSTGRES_DSN",
+        f"postgresql+psycopg://umd:umd@{PG_HOST}:{PG_PORT}/umd",
+    )
+    engine = sa.create_engine(dsn, poolclass=sa.pool.NullPool)
+    try:
+        with engine.connect():
+            pass  # reachability gate for the shared compose db
+        yield engine
+    finally:
+        engine.dispose()

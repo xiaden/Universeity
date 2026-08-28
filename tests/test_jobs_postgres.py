@@ -196,3 +196,66 @@ def test_dag_version_drain_cancels_in_flight_old_universe(umd_db: sa.Engine) -> 
     result = gate.activate_new_universe("v1-dag:base")
     assert result.drained_jobs == 1
     assert "drain-job" in result.cancelled_job_ids
+
+
+def test_dag_gate_keeps_completed_drains_only_other_universe_inflight(
+    umd_db: sa.Engine,
+) -> None:
+    """P2-S6 migration/drain contract: activating a new DAG universe cancels ONLY
+    in-flight (PENDING/RUNNING/PAUSED) jobs under a DIFFERENT universe and leaves
+    already-completed jobs intact (their results stay readable). Draining never
+    re-keys completed work and never aliases stage idempotency across universes."""
+    from umd.jobs.drain import SimpleUniverseGate
+
+    ensure_source(umd_db)
+    store = PostgresJobRepository(umd_db)
+    store.create(job_id="gate-finished", source_id=SOURCE_ID, dag_universe="v1-dag:old")
+    store.update_status("gate-finished", JobStatus.COMPLETE)
+    store.create(job_id="gate-inflight", source_id=SOURCE_ID, dag_universe="v1-dag:old")
+    store.update_status("gate-inflight", JobStatus.RUNNING)
+    store.create(job_id="gate-new", source_id=SOURCE_ID, dag_universe="v1-dag:new")
+    store.update_status("gate-new", JobStatus.RUNNING)
+
+    finished = store.get("gate-finished")
+    inflight = store.get("gate-inflight")
+    new_universe = store.get("gate-new")
+    snapshot = [j for j in (finished, inflight, new_universe) if j is not None]
+    gate = SimpleUniverseGate(store, snapshot=snapshot)
+    result = gate.activate_new_universe("v1-dag:new")
+
+    # Only the old-universe in-flight job is drained; completed and new-universe
+    # jobs are untouched (their results / lineage remain readable).
+    assert result.drained_jobs == 1
+    assert result.cancelled_job_ids == ("gate-inflight",)
+    assert store.get("gate-finished").status == JobStatus.COMPLETE
+    assert store.get("gate-inflight").status == JobStatus.CANCELLED
+    assert store.get("gate-new").status == JobStatus.RUNNING
+
+
+def test_dag_gate_universe_distinct_keys_no_cross_universe_aliasing(
+    umd_db: sa.Engine,
+) -> None:
+    """P2-S6 idempotency contract: the same stage under two DAG universes yields
+    DISTINCT idempotency keys (the universe folds into the key), so draining a
+    universe can never collide with or re-derive a committed run from another
+    universe — no cross-universe aliasing."""
+    ensure_source(umd_db)
+    from umd.jobs.manifest import StageManifest
+
+    m_old = StageManifest(
+        job_id="no-alias",
+        stage_name="INGEST",
+        source_id=SOURCE_ID,
+        dag_universe="v1-dag:old",
+        evidence_refs=[],
+        input_manifest={"source_id": SOURCE_ID},
+    )
+    m_new = StageManifest(
+        job_id="no-alias",
+        stage_name="INGEST",
+        source_id=SOURCE_ID,
+        dag_universe="v1-dag:new",
+        evidence_refs=[],
+        input_manifest={"source_id": SOURCE_ID},
+    )
+    assert m_old.idempotency_key() != m_new.idempotency_key()

@@ -19,6 +19,7 @@ jsonschema==4.26.0
 pypdf==6.16.2
 pillow==11.3.0
 pysubs2==1.9.0
+python-multipart==0.0.32
 uvicorn==0.30.7
 
 # Transitive runtime (locked at resolved versions for reproducible containers):
@@ -55,6 +56,11 @@ mypy==2.3.1
 #   hatchet-sdk==1.38.1     (SDK pin; CANDIDATE — PENDING live shape-test validation in Plan J)
 #   hatchet-server==0.105.2  (server image pin; CANDIDATE — PENDING live shape-test validation
 #                             in Plan J; no Docker locally so NOT release evidence).
+#
+#   P3-S2: the Dockerfile `worker` build target installs the pinned `.[worker]`
+#   extra (hatchet-sdk==1.38.1) and smoke-tests the SDK import WITHOUT promoting
+#   the pair. Installing the SDK in the worker image is NOT promotion; the pair
+#   remains CANDIDATE/PENDING until real live validation on a hosted runner.
 #   (upgrade = bump both surfaces in lockstep, new DAG universe, drain in-flight before activation)
 #   hatchet-sdk (pinned exact — a build gate; see CVE_WATCH.md)
 #   splink>=4, duckdb        (MIT)

@@ -87,8 +87,11 @@ class AudioPipeline:
     @cached_property
     def warnings(self) -> list[str]:
         out = list(self.asr_result.warnings)
-        if self.asr_result.gated and self.asr_result.gate_reason:
-            out.append(f"asr gated: {self.asr_result.gate_reason}")
+        # The ASR gating signal is already carried once by ``asr_result.warnings``:
+        # ``asr_mod._gated`` appends ``ASR gated: <reason>`` when the dispatched
+        # provider downgrades to the gated reference fallback. Appending our own
+        # ``asr gated:`` here would duplicate the same signal with inconsistent
+        # casing, so we keep ``asr.warnings`` as the single carrier.
         if self.diarization_result.gated and self.diarization_result.gate_reason:
             out.append(f"diarization gated: {self.diarization_result.gate_reason}")
         return out

@@ -26,10 +26,8 @@ What can pass now and is pinned:
 
 from __future__ import annotations
 
-import importlib
 import os
 import struct
-from pathlib import Path
 
 import pytest
 
@@ -59,13 +57,13 @@ def _model_cache() -> str | None:
 
 
 def _faster_whisper_ready() -> bool:
-    """Honest readiness probe: runtime installed AND a validated model cache exists."""
-    try:
-        importlib.import_module("faster_whisper")
-    except ImportError:
-        return False
-    cache = _model_cache()
-    return bool(cache) and Path(cache).is_dir()
+    """Honest readiness probe: runtime installed AND a validated model cache exists.
+
+    Reuses :func:`umd.audio.asr.faster_whisper_runtime_ready` as the single source
+    of truth — it requires the runtime to be importable AND ``model.bin`` present
+    in the cache dir (an existing-but-empty cache dir must skip, not hard-fail).
+    """
+    return asr_mod.faster_whisper_runtime_ready()
 
 
 # --- ordinary-speech fixture helpers ----------------------------------------
@@ -198,12 +196,10 @@ def test_faster_whisper_dispatch_yields_timestamps_and_provenance() -> None:
 
 
 def test_audio_pipeline_dispatches_configured_provider_not_reference() -> None:
-    """SPEC-FIRST (FAILS until P2-S3): a *configured* ASR provider must be dispatched
-    to by ``AudioPipeline.asr_result`` rather than hardcoding the reference provider.
-
-    Today ``AudioPipeline.asr_result`` calls ``ReferenceAsrProvider().asr(...)``
-    directly, so a registered configured provider is never invoked — the test fails
-    by design until Phase 2 P2-S3 centralizes selection (via ``run_asr``).
+    """A *configured* ASR provider is dispatched to by ``AudioPipeline.asr_result``
+    rather than hardcoding the reference provider (P2-S3 centralizes selection via
+    ``run_asr``). PASSES now: a registered configured provider must be invoked — this
+    pins the regression that a bypass back to the hardcoded reference would break.
     """
     calls: list[str] = []
 

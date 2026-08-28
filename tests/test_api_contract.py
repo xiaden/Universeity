@@ -71,7 +71,12 @@ def _client_settings(*, rate_enabled: bool = True) -> Settings:
 
 @pytest.fixture()
 def api_ctx(umd_db: sa.Engine, source_store):
-    app = create_app(engine=umd_db, source_store=source_store, settings=_client_settings())
+    # Hermetic runner: these contract tests exercise the full API surface with an
+    # in-process durable runner (no live Hatchet cluster). The RELEASE factory
+    # (runner=None) selects ProductionDAGRunner and is tested separately.
+    app = create_app(
+        engine=umd_db, source_store=source_store, settings=_client_settings(), runner="hermetic"
+    )
     with TestClient(app) as client:
         yield SimpleNamespace(client=client, engine=umd_db, settings=app.state.ctx.settings)
 
@@ -776,14 +781,22 @@ def test_app_factory_builds_wired_app_over_real_postgres(
 
         # Configured OCFL root wiring: a real ingest writes source bytes under the
         # configured root and commits the source row to the configured DSN.
+        # Release factory wires ProductionDAGRunner (never a test-only double).
+        from umd.jobs.runner import ProductionDAGRunner
+
+        assert isinstance(app.state.ctx.jobs._runner, ProductionDAGRunner)  # noqa: SLF001
+
+        # A real ingest writes source bytes to the configured OCFL root and commits a
+        # source row to the configured DSN. Without a live Hatchet scheduler the
+        # release factory honestly refuses dispatch (500 dispatch_failed) rather than
+        # fabricating completion, while the pre-dispatch OCFL/source-row side effects
+        # are committed.
         resp = client.post("/v1/sources", json={"media_kind": "txt", "content": "wired app"})
-        assert resp.status_code == 201, resp.text
-        sid = resp.json()["source_id"]
+        assert resp.status_code == 500, resp.text
+        assert resp.json()["code"] == "dispatch_failed"
         assert list(ocfl_root.rglob("inventory.json")), "no OCFL object under configured root"
         with engine.connect() as conn:
-            row = conn.execute(
-                sa.text("SELECT sha512, ocfl_ref FROM source WHERE id=:id"), {"id": sid}
-            ).first()
+            row = conn.execute(sa.text("SELECT sha512, ocfl_ref FROM source")).first()
         assert row is not None and row[0] and row[1]
 
 
@@ -1112,3 +1125,23 @@ def test_route_unknown_job_returns_rfc7807_404(api_ctx) -> None:
         doc = r.json()
         assert doc.get("type", "").startswith("urn:umd:problem:"), (path, doc)
         assert doc.get("code") == "not_found", (path, doc)
+
+
+def test_release_factory_never_constructs_test_doubles(umd_db, source_store) -> None:
+    """Plan K P1-S2: the release API factory selects ProductionDAGRunner and never
+    constructs SynchronousRunner / InMemoryJobStore / the hermetic DurableDAGRunner."""
+    from umd.api.runner import SynchronousRunner
+    from umd.jobs.job import InMemoryJobStore
+    from umd.jobs.runner import DurableDAGRunner, ProductionDAGRunner
+    from umd.storage.postgres.job_repository import PostgresJobRepository
+
+    app = create_app(engine=umd_db, source_store=source_store, settings=_client_settings())
+    ctx = app.state.ctx
+    store = ctx.extra["job_store"]
+    runner = ctx.jobs._runner  # noqa: SLF001
+    assert isinstance(store, PostgresJobRepository)
+    assert not isinstance(store, InMemoryJobStore)
+    assert isinstance(runner, ProductionDAGRunner)
+    assert not isinstance(runner, DurableDAGRunner)
+    assert not isinstance(runner, SynchronousRunner)
+    assert ctx.extra.get("production_wired") is True

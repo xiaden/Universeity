@@ -102,15 +102,37 @@ _segment_t = db_meta.tables["segment"]
 #: materially affects the evidence it emits.
 _TEXT_EVIDENCE_CONFIG_DIGEST = "umd-txt@1"  # plain-text normalization/evidence bindings
 _MEDIA_FORMAT_EVIDENCE_CONFIG_DIGEST = "umd-format@1"  # non-text media format analysis
-#: Stable per-binding config digest for the video-stage audio-ASR branch evidence
-#: recorder. Stamped on every audio_interval/timing/language/metadata row the video
-#: branch emits so `uq_evidence_identity` (source_id, locator, evidence_kind,
-#: config_digest) dedups a crash-retry re-record instead of duplicating rows.
-_VIDEO_AUDIO_EVIDENCE_CONFIG_DIGEST = "umd-video-audio@1"
+#: Base prefix for the video-stage audio-ASR branch evidence config digest. Unlike
+#: the other static per-binding digests, the video audio-ASR digest MUST encode the
+#: ASR engine + model id (see ``_video_audio_config_digest``): `uq_evidence_identity`
+#: (source_id, locator, evidence_kind, config_digest) dedups identical re-records on a
+#: re-run, and a static digest would silently retain the prior engine's transcript
+#: rows when a rerun switches engine/model. Append the provider + model_id so the
+#: quadruple differs across engines/models.
+_VIDEO_AUDIO_EVIDENCE_CONFIG_DIGEST_PREFIX = "umd-video-audio"
 
 #: Open-vocabulary predicate for the reconciled-source state assertion emitted by
 #: SEMANTIC_RECONCILIATION (data addition, not a schema migration).
 register_predicate("RECONCILED_SOURCE", "The reconciled semantic state derived for a source.")
+
+
+def _video_audio_config_digest(asr: Any | None) -> str:
+    """Config digest for the video-stage audio-ASR branch evidence recorder.
+
+    Encodes the actual ASR engine + model id observed at run time so that
+    ``uq_evidence_identity`` (source_id, locator, evidence_kind, config_digest) does
+    NOT silently retain a prior engine's/model's transcript rows when a rerun of the
+    video branch switches engine (reference → faster-whisper) or model. Mirrors how
+    the base audio path distinguishes engines via ``config_digest_of``; the video
+    branch has no in-hand ``AudioConfig`` so it derives the digest from the worker's
+    dispatched ``AsrResult`` (the same provider/model id ``_stamp_asr_provenance``
+    reads). Falls back to a bare prefix when model_id is absent (e.g. a provider
+    model is never set) so the digest is always non-null for evidence dedup.
+    """
+    if asr is not None and getattr(asr, "provider", None):
+        model_id = getattr(asr, "model_id", None) or "default"
+        return f"{_VIDEO_AUDIO_EVIDENCE_CONFIG_DIGEST_PREFIX}@{asr.provider}:{model_id}"
+    return f"{_VIDEO_AUDIO_EVIDENCE_CONFIG_DIGEST_PREFIX}@unknown"
 
 
 class ConfigurationError(ValueError):
@@ -641,7 +663,7 @@ class _Composer:
                 source_id=src["id"],
                 source_sha512=src["sha512"],
                 work_id=None,
-                config_digest=_VIDEO_AUDIO_EVIDENCE_CONFIG_DIGEST,
+                config_digest=_video_audio_config_digest(output.asr),
             )
             # Stamp model/config provenance + the promotion ban onto the composed
             # ASR evidence: the base audio plan already carries provider/version in

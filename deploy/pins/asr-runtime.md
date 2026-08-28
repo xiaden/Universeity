@@ -33,9 +33,10 @@ are recorded here for reproducible containers (build-time SBOM must match).
 | License | MIT (model weights) — permissive, reviewed (deploy/security/LICENSE_REVIEW.md) |
 
 The model cache dir is validated at runtime by `faster_whisper_runtime_ready()`
-(importable runtime **and** cache dir present). The provider never fabricates a
-transcript when either is absent — it raises `AsrProviderUnavailable` and
-`run_asr` downgrades to the honest gated reference path.
+(importable runtime **and** cache dir present **and** `model.bin` present). The
+provider never fabricates a transcript when any of these is absent — it raises
+`AsrProviderUnavailable` and `run_asr` downgrades to the honest gated reference
+path.
 
 ## CPU resource limits
 

@@ -26,8 +26,8 @@ from typing import Any
 from umd.application.commands import SemanticCommandService
 from umd.jobs.dag import STAGE_DEPENDENTS, STAGE_ORDER
 from umd.jobs.invalidation import StageTargets
-from umd.jobs.job import JobRecord, JobStatus, JobStore
-from umd.jobs.runner import DAGRunner, StageWorkRegistry
+from umd.jobs.job import JobRecord, JobStatus, JobStore, StageState
+from umd.jobs.runner import DAGRunner, StageRunEvent, StageWorkRegistry
 
 #: Authority-relevant predicates that must pause authority-built Tier-1 projections.
 _AUTHORITY_PREDICATES = frozenset(
@@ -105,13 +105,23 @@ class JobService:
         )
         if job.status == JobStatus.PENDING:
             self._store.update_status(job.id, JobStatus.RUNNING)
-            self._runner.run_graph(
-                job_id=job.id,
-                source_id=source_id,
-                dag_universe=dag_universe,
-                work_registry=work_registry,
-                stages=list(STAGE_ORDER),
-            )
+            try:
+                events = self._runner.run_graph(
+                    job_id=job.id,
+                    source_id=source_id,
+                    dag_universe=dag_universe,
+                    work_registry=work_registry,
+                    stages=list(STAGE_ORDER),
+                )
+            except Exception:
+                # A submission failure is surfaced honestly and durably: the job is
+                # marked FAILED (persisted) so it can never masquerade as queued or
+                # complete, then the exception propagates to the RFC 7807 handler.
+                self._store.update_status(job.id, JobStatus.FAILED, error="submission failed")
+                raise
+            # Persist queued stage state BEFORE reconciliation so an async submission
+            # (queued, callbacks pending) is never reconciled back to PENDING.
+            self._persist_queued(job.id, events)
             self._refresh_status(job.id)
         return self._store.get(job.id) or job
 
@@ -178,13 +188,14 @@ class JobService:
             self._store.set_cancelled_stages(job_id, set())
             targets = [s for s in STAGE_ORDER if states.get(s, "pending") != "complete"]
         if targets:
-            self._runner.run_graph(
+            events = self._runner.run_graph(
                 job_id=job_id,
                 source_id=rec.source_id,
                 dag_universe=dag_universe,
                 work_registry=work_registry,
                 stages=targets,
             )
+            self._persist_queued(job_id, events)
         self._refresh_status(job_id)
         return self._store.get(job_id) or rec
 
@@ -210,7 +221,7 @@ class JobService:
         targets = self._planner.plan(causation, scope, stage, self._lineage)
         descendant_stages = [t.stage for t in targets.targets]
         if descendant_stages:
-            self._runner.run_graph(
+            events = self._runner.run_graph(
                 job_id=job_id,
                 source_id=source_id,
                 dag_universe=dag_universe,
@@ -218,6 +229,7 @@ class JobService:
                 stages=descendant_stages,
                 rerun_causation=causation,
             )
+            self._persist_queued(job_id, events)
         return targets
 
     def rerun_source(
@@ -238,7 +250,7 @@ class JobService:
         """
         via_ingest = self._planner.plan(causation, scope, None, self._lineage)
         descendant_stages = [s for s in STAGE_ORDER if s != "INGEST"]
-        self._runner.run_graph(
+        events = self._runner.run_graph(
             job_id=job_id,
             source_id=source_id,
             dag_universe=dag_universe,
@@ -246,6 +258,7 @@ class JobService:
             stages=descendant_stages,
             rerun_causation=causation,
         )
+        self._persist_queued(job_id, events)
         return StageTargets(
             causation=causation,
             scope=scope,
@@ -288,7 +301,7 @@ class JobService:
                 correlation_id=job_id,
             )
         if descendant_stages:
-            self._runner.run_graph(
+            events = self._runner.run_graph(
                 job_id=job_id,
                 source_id=source_id,
                 dag_universe=dag_universe,
@@ -296,6 +309,7 @@ class JobService:
                 stages=descendant_stages,
                 rerun_causation=f"invalidate:{cause}",
             )
+            self._persist_queued(job_id, events)
         pause = projection_pause_reason(
             event_type="Invalidated", subject_ref=subject_ref, predicate=predicate, refs=refs
         )
@@ -306,6 +320,22 @@ class JobService:
         targets = self._planner.plan(f"cancel:{stage}", "SOURCE", stage, self._lineage)
         return [stage] + [t.stage for t in targets.targets]
 
+    def _persist_queued(self, job_id: str, events: list[StageRunEvent]) -> None:
+        """Durably record queued stage state before status reconciliation (P1-S4).
+
+        A submission through an asynchronous runner (:class:`ProductionDAGRunner`)
+        returns ``queued`` events with no committed stage output yet. Recording them
+        here (before ``_refresh_status``) means the store reflects that the job was
+        genuinely submitted-and-queued, so it can never be reconciled back to
+        ``PENDING`` (RUNNING->PENDING regression). Stores that persist per-stage
+        state durably do so; the durable aggregate ``RUNNING`` status in the job
+        table is the authority that survives restart for backends that fold stage
+        status from executor-owned ``stage_run`` rows.
+        """
+        for ev in events:
+            if ev.status == "queued":
+                self._store.record_stage(job_id, StageState(stage_name=ev.stage, status="queued"))
+
     def _refresh_status(self, job_id: str) -> None:
         self._store.update_status(job_id, self.status(job_id))
 
@@ -314,7 +344,10 @@ def _derive_status(rec: JobRecord, states: list[Any]) -> str:
     if rec.status in (JobStatus.CANCELLED, JobStatus.PAUSED, JobStatus.FAILED):
         return rec.status
     if not states:
-        return JobStatus.PENDING
+        # No per-stage outcome yet: a job that was submitted (aggregate RUNNING) is
+        # queued/in-flight, NOT pending. Returning the durable aggregate status here
+        # prevents a RUNNING->PENDING regression for asynchronous submissions.
+        return rec.status
     statuses = {s.status for s in states}
     if "quarantined" in statuses or "failed" in statuses:
         return JobStatus.FAILED

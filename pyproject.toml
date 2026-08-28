@@ -39,6 +39,10 @@ dependencies = [
     # in umd.subtitle.formats and reports the parser capability in availability.
     # MIT-licensed, pinned to 1.9.0 per the DD subtitle packaging pin.
     "pysubs2==1.9.0",
+    # Bounded multipart uploads (Phase C, P3-S2): FastAPI's `request.form()`
+    # (used by the /v1/sources streaming-upload path in umd.api.routers.sources)
+    # requires python-multipart at runtime. Pinned to the resolved 0.0.32 line.
+    "python-multipart==0.0.32",
 ]
 
 [project.optional-dependencies]

@@ -919,23 +919,27 @@ def test_capability_reporter_scheduler_never_active_locally(
 
 @pytest.mark.cluster
 def test_live_hatchet_duplicate_and_restart_preserve_single_completion(
-    umd_db: sa.Engine,
+    live_db: sa.Engine,
 ) -> None:
     """Through the real Hatchet binding, duplicate/restart submissions keep ONE
     stage_run and ONE StageCompleted (no re-execution of committed work).
 
-    Uses the REAL binding: a real ``hatchet_sdk`` client, a real work registry, and
-    a real durable executor bound. The compose worker executes the submitted runs
-    on the stack, so this test POLLS Postgres (up to 120s) until the expected
-    DISTINCT stage_run ``idempotency_key`` count for the job equals ``len(STAGE_ORDER)``
-    (duplicate submission must NOT add extra keys).
+    P4-S7 RACE RECONCILIATION: the compose worker is the SOLE execution target and
+    the shared compose ``umd`` database is the SINGLE source of truth. This test
+    does NOT spawn a competing in-process worker loop (``HatchetWorkerFactory.start``
+    only REGISTERS workflow/task callbacks on the real SDK client; it never calls
+    ``client.start()`` — the caller owns the loop). The in-stack compose worker
+    executes the submitted runs and writes to the shared compose ``umd`` db, so this
+    test polls ``live_db`` (the same shared db the compose worker writes to) until the
+    expected DISTINCT stage_run ``idempotency_key`` count for the job equals
+    ``len(STAGE_ORDER)`` (duplicate submission must NOT add extra keys).
     """
     _require_live_hatchet()
-    _ensure_source(umd_db)
+    _ensure_source(live_db)
     factory = _worker_factory()
-    executor, _ledger = _build_executor(umd_db)
+    executor, _ledger = _build_executor(live_db)
     worker = factory.start(
-        runtime={"engine": umd_db},
+        runtime={"engine": live_db},
         work_registry={s: _ok for s in STAGE_ORDER},
         executor=executor,
         client=_real_client(),
@@ -943,56 +947,62 @@ def test_live_hatchet_duplicate_and_restart_preserve_single_completion(
     worker.submit(job_id="live-dup", source_id=_SOURCE_ID, dag_universe="v1-dag:base")
     worker.submit(job_id="live-dup", source_id=_SOURCE_ID, dag_universe="v1-dag:base")
     _poll_until(
-        umd_db,
-        lambda: _distinct_idempotency_keys(umd_db, "live-dup") == len(STAGE_ORDER),
+        live_db,
+        lambda: _distinct_idempotency_keys(live_db, "live-dup") == len(STAGE_ORDER),
         what=f"DISTINCT stage_run idempotency_key count == {len(STAGE_ORDER)} for live-dup",
     )
 
 
 @pytest.mark.cluster
 def test_live_hatchet_retry_and_quarantine_single_authoritative_completion(
-    umd_db: sa.Engine,
+    live_db: sa.Engine,
 ) -> None:
     """Through the real Hatchet binding, transient failures retry with bounded
     backoff and deterministic failures quarantine — one authoritative completion.
 
-    Real binding; polls Postgres (up to 120s) until the StageCompleted count for the
-    job equals ``len(STAGE_ORDER)`` (exactly one authoritative completion per
-    stage).
+    P4-S7 RACE RECONCILIATION: the compose worker is the SOLE execution target and
+    the shared compose ``umd`` database is the SINGLE source of truth. No competing
+    in-process worker loop is spawned (``HatchetWorkerFactory.start`` registers
+    callbacks only; the caller owns the loop). The compose worker executes the
+    submitted runs and writes to the shared compose ``umd`` db; this test polls
+    ``live_db`` (up to 120s) until the StageCompleted count for the job equals
+    ``len(STAGE_ORDER)`` (exactly one authoritative completion per stage).
     """
     _require_live_hatchet()
-    _ensure_source(umd_db)
+    _ensure_source(live_db)
     factory = _worker_factory()
-    executor, _ledger = _build_executor(umd_db)
+    executor, _ledger = _build_executor(live_db)
     worker = factory.start(
-        runtime={"engine": umd_db},
+        runtime={"engine": live_db},
         work_registry={s: _ok for s in STAGE_ORDER},
         executor=executor,
         client=_real_client(),
     )
     worker.submit(job_id="live-shape", source_id=_SOURCE_ID, dag_universe="v1-dag:base")
     _poll_until(
-        umd_db,
-        lambda: _stage_completed_for_job(umd_db, "live-shape") == len(STAGE_ORDER),
+        live_db,
+        lambda: _stage_completed_for_job(live_db, "live-shape") == len(STAGE_ORDER),
         what=f"StageCompleted count == {len(STAGE_ORDER)} for live-shape",
     )
 
 
 @pytest.mark.cluster
-def test_live_hatchet_universe_change_drains_and_rekeys(umd_db: sa.Engine) -> None:
+def test_live_hatchet_universe_change_drains_and_rekeys(live_db: sa.Engine) -> None:
     """Activating a new DAG universe drains/cancels in-flight work and yields
     distinct stage keys (no cross-universe idempotency aliasing).
 
-    Real binding; submits the same job in two DAG universes and polls Postgres
-    (up to 120s) until the stage_run input_manifest records TWO DISTINCT
+    P4-S7 RACE RECONCILIATION: the compose worker is the SOLE execution target and
+    the shared compose ``umd`` database is the SINGLE source of truth (no competing
+    in-process worker loop). Submits the same job in two DAG universes and polls
+    ``live_db`` (up to 120s) until the stage_run input_manifest records TWO DISTINCT
     ``dag_universe`` values (no cross-universe aliasing).
     """
     _require_live_hatchet()
-    _ensure_source(umd_db)
+    _ensure_source(live_db)
     factory = _worker_factory()
-    executor, _ledger = _build_executor(umd_db)
+    executor, _ledger = _build_executor(live_db)
     worker = factory.start(
-        runtime={"engine": umd_db},
+        runtime={"engine": live_db},
         work_registry={s: _ok for s in STAGE_ORDER},
         executor=executor,
         client=_real_client(),
@@ -1000,10 +1010,63 @@ def test_live_hatchet_universe_change_drains_and_rekeys(umd_db: sa.Engine) -> No
     worker.submit(job_id="live-universe", source_id=_SOURCE_ID, dag_universe="v1-dag:old")
     worker.submit(job_id="live-universe", source_id=_SOURCE_ID, dag_universe="v1-dag:new")
     _poll_until(
-        umd_db,
-        lambda: _distinct_dag_universes(umd_db, "live-universe") == 2,
+        live_db,
+        lambda: _distinct_dag_universes(live_db, "live-universe") == 2,
         what="two DISTINCT dag_universe values in stage_run input_manifest for live-universe",
     )
+
+
+# ---------------------------------------------------------------------------
+# P2-S1: real-stack registration (engine-visible, exact umd-<stage> names)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.cluster
+@pytest.mark.docker
+def test_live_hatchet_engine_visible_registration_exact_umd_stages(
+    live_db: sa.Engine,
+) -> None:
+    """Through the real Hatchet binding, the worker registers engine-visible
+    workflow/task callbacks for EVERY canonical stage under the exact
+    ``umd-<stage>`` names with real executor callbacks bound (registration).
+
+    Unlike the recording-client shape test (which records into dicts), this drives
+    the REAL ``hatchet_sdk`` client: :meth:`HatchetWorkerFactory.start` registers
+    each stage's callback on the live SDK surface and exposes the bound workflows
+    via ``WorkerHandle.registered_workflows``. ``is_ready()`` is only True when the
+    real callback registration succeeded AND a real executor is bound. The engine
+    is the authority — a non-empty, exactly-named registration is the precondition
+    for any submitted run to execute (proven end-to-end by the other live tests).
+    This test only REGISTERS (``HatchetWorkerFactory.start`` never starts a worker
+    loop, so it does not compete with the compose worker) and uses the shared
+    compose ``live_db`` for the executor binding.
+    """
+    _require_live_hatchet()
+    _ensure_source(live_db)
+    factory = _worker_factory()
+    executor, _ledger = _build_executor(live_db)
+    worker = factory.start(
+        runtime={"engine": live_db},
+        work_registry={s: _ok for s in STAGE_ORDER},
+        executor=executor,
+        client=_real_client(),
+    )
+    assert worker.is_ready() is True, "real worker did not report ready with bound executors"
+    workflows = worker.registered_workflows
+    assert workflows, "no engine-visible workflows were registered on the real client"
+    assert len(workflows) == len(STAGE_ORDER), (
+        f"registered {len(workflows)} workflows; expected {len(STAGE_ORDER)}"
+    )
+    names: set[str] = set()
+    for wf in workflows:
+        if isinstance(wf, dict):
+            names.add(str(wf.get("name", "")))
+        else:
+            names.add(str(getattr(wf, "name", "")))
+    for stage in STAGE_ORDER:
+        assert f"umd-{stage.lower()}" in names, (
+            f"stage {stage} not registered on the real client as umd-{stage.lower()}"
+        )
 
 
 # ---------------------------------------------------------------------------
