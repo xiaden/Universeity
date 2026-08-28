@@ -4,7 +4,7 @@
 
 These plans implement the approved design at:
 
-- `/workspace/Universeity/artifacts/designs/pending/DD-universal-media-decomposer.md`
+- `/workspace/Universeity/artifacts/designs/pending/DD-universal-media-decomposer-ci-repair.md` for the CI-repair release-gate work (the historical A–F design remains at the earlier path).
 
 The authoritative requirements are `/workspace/Universeity/Task.md` lines 1–1738. Supporting evidence is:
 
@@ -40,6 +40,14 @@ Plans A–F above are historical completed work and remain preserved. The author
 | H | `TASK-universal-media-decomposer-H-local-providers-modalities.md` | Validated self-hostable ASR plus real provider/modality composition | G |
 | I | `TASK-universal-media-decomposer-I-hatchet-worker-integration.md` | Pinned operational Hatchet scheduler and bound worker callbacks | G (H may proceed alongside) |
 | J | `TASK-universal-media-decomposer-J-api-boundary-ci-release.md` | Public-boundary E2E, hosted Docker CI, measured docs, final adversarial release gate | H and I |
+
+## CI-repair supersession order
+
+The approved CI-repair DD and PatternEnforcer approval identify the remaining G–J release seams as one new, sequential repair family. Execute K after the preserved G/H/I foundations and the completed J Phases 1–2 baseline; K owns the open production, deployment, hosted-evidence, documentation, QA, and DoD closure work. It supersedes only unresolved/open portions of G/H/I and unfinished J Phases 3–4, so no historical plan is re-executed and no duplicate scheduler, worker, E2E, or DoD authority is created.
+
+| Order | Plan | Outcome | Prerequisite |
+|---|---|---|---|
+| K | `TASK-universal-media-decomposer-K-ci-repair-release-gate.md` | Production runtime/API wiring, split Hatchet/live callbacks, hosted toolchain and fail-closed gate, HTTP-only heterogeneous proof, post-green docs, final QA and 35-row DoD matrix | Preserved G/H/I foundations; J Phases 1–2 baseline |
 
 The remediation does not weaken prior contracts or add a competing scheduler. Hatchet remains the sole v1 scheduler; reference providers and unvalidated platform features are disclosed with explicit capability statuses and release evidence.
 

@@ -68,7 +68,11 @@ always reports their true active/gated state.
   *independent* sources (never flattened) with verbatim payload retention. Extracted
   audio now runs ASR in the video stage on the extracted audio track (not a separate
   fixture), with an honest gated fallback when the configured engine/model cache is
-  unavailable (no fabricated transcript).
+  unavailable (no fabricated transcript). **Bounded range processing:** the modality
+  branches (video/audio/subtitle) read source bytes via the bounded `get_range` cap
+  (default `max_read_buffer_bytes=1MiB`); larger media degrade to an honest
+  quarantine/unsupported warning per branch rather than silent truncation, and
+  range-based chunk processing is the extension path for large containers.
 
 ## Operational taxes
 
