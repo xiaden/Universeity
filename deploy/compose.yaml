@@ -193,14 +193,14 @@ services:
     restart: on-failure
 
   hatchet-dashboard:
-    # The HTTP UI (host 8080 -> container :80). Not the gRPC surface; no worker
+    # The HTTP UI (host 8081 -> container :80). Not the gRPC surface; no worker
     # ever routes its admin channel here.
     image: ghcr.io/hatchet-dev/hatchet/hatchet-dashboard:${HATCHET_VERSION:-v0.105.2}
     command: sh ./entrypoint.sh --config /hatchet/config
     environment:
       DATABASE_URL: postgres://umd:${UMD_POSTGRES_PASSWORD:-umd}@db:5432/umd
     ports:
-      - "${HATCHET_DASHBOARD_PORT:-8080}:80"
+      - "${HATCHET_DASHBOARD_PORT:-8081}:80"
     volumes:
       - hatchet-config:/hatchet/config
       - hatchet-certs:/hatchet/certs

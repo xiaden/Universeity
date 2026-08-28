@@ -205,14 +205,11 @@ jobs:
     # Native engine only: no nested/in-container Docker engine, no host Docker
     # socket mount, no containerised-setup action, and no service containers for
     # the stack. The complete split topology runs UNCONDITIONALLY (no opt-in flag).
-    env:
-      # Required Compose secrets. HATCHET_COOKIE_SECRET / HATCHET_MASTER_KEY are
-      # ${VAR:?}-required by compose (C7); generated here, never committed. The API
-      # and the Hatchet dashboard must not both publish host 8080, so the dashboard
-      # host port is 8081 while the API stays on 8080.
-      UMD_API_PORT: "${UMD_API_PORT:-8080}"
-      HATCHET_DASHBOARD_PORT: "${HATCHET_DASHBOARD_PORT:-8081}"
-      UMD_POSTGRES_PASSWORD: "${UMD_POSTGRES_PASSWORD:-umd}"
+      # Required Compose secrets are set per-step (the setup step below writes
+      # them to $GITHUB_ENV). HATCHET_COOKIE_SECRET / HATCHET_MASTER_KEY are
+      # ${VAR:?}-required by compose (C7); generated here, never committed. The
+      # API and the Hatchet dashboard must not both publish host 8080, so the
+      # dashboard host port is 8081 while the API stays on 8080.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
