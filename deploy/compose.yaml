@@ -43,7 +43,7 @@ services:
       POSTGRES_PASSWORD: ${UMD_POSTGRES_PASSWORD:-umd}
       POSTGRES_DB: umd
     volumes:
-      - ocfl-db:/var/lib/postgresql/data
+      - ocfl-db:/var/lib/postgresql
     # Publish 5432 to the host so the host-run live suite (tests/test_hatchet_live.py,
     # test_api_boundary_e2e.py) can reach the SAME Postgres the in-stack worker/API
     # use via conftest's UMD_PG_HOST/UMD_PG_PORT surface. The live tests must share

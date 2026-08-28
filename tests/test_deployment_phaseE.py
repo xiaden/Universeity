@@ -133,7 +133,7 @@ def test_compose_hatchet_split_topology_subpath_images() -> None:
         assert f"ghcr.io/hatchet-dev/hatchet/{svc}:" in compose, f"missing {svc} sub-path image"
     # The engine is the gRPC surface (7070); the dashboard is the HTTP UI (:80).
     assert '- "7070:7070"' in compose  # engine gRPC admin listener
-    assert '- "${HATCHET_DASHBOARD_PORT:-8080}:80"' in compose  # dashboard HTTP UI
+    assert '- "${HATCHET_DASHBOARD_PORT:-8081}:80"' in compose  # dashboard HTTP UI
     # Top-level image (403 on ghcr.io) must never be referenced as an image.
     assert not re.search(r"^\s*image: ghcr\.io/hatchet-dev/hatchet:", compose, re.M)
 
