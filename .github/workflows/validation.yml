@@ -151,6 +151,31 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      # P2-S2: the historical suite runs unmodified and unweakened, but several
+      # ``postgres``-marked tests exercise REAL media/backup tooling that the
+      # hosted runner does not ship by default:
+      #   * ffmpeg -> test_production_media_branches / video tests (real demux,
+      #     scenes/shots; the OCR branch degrades to the reference fallback so no
+      #     OCR binary is needed).
+      #   * postgresql client tools (pg_dump/psql) matching the postgres:17
+      #     service container -> test_separation_ownership backup/restore.
+      # We install those tools so the REAL branches run (never skipped/weakened).
+      - name: Install runtime media + Postgres client tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          # Postgres client tools MUST match the postgres:17 service version
+          # (pg_dump/psql from an older major cannot dump/read a newer server).
+          # On the Ubuntu 24.04 hosted runner the base repos only ship PG 16, so
+          # enable the PGDG apt repo to install the 17 client to match the service.
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSLo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+          # Expose the Debian versioned pg client dir (matches postgres:17 service).
+          echo "UMD_PG_BIN=/usr/lib/postgresql/17/bin" >> "$GITHUB_ENV"
       - name: Install dev dependencies
         run: pip install --no-cache-dir -e ".[dev]"
       - name: Run full suite with Postgres enabled (historical suite unmodified)
@@ -175,11 +200,19 @@ jobs:
   # P2-S1 / P2-S3 / P2-S4 / P2-S5 / P2-S6: native Docker/Compose E2E
   # ---------------------------------------------------------------------------
   docker-e2e:
-    name: Docker E2E (native Compose + API boundary)
+    name: Docker E2E (native Compose, fail-closed live Hatchet gate)
     runs-on: ubuntu-latest
-    # Native engine only: no nested/in-container Docker engine, no host
-    # Docker socket mount, no containerised-setup action, and no service
-    # containers for the stack.
+    # Native engine only: no nested/in-container Docker engine, no host Docker
+    # socket mount, no containerised-setup action, and no service containers for
+    # the stack. The complete split topology runs UNCONDITIONALLY (no opt-in flag).
+    env:
+      # Required Compose secrets. HATCHET_COOKIE_SECRET / HATCHET_MASTER_KEY are
+      # ${VAR:?}-required by compose (C7); generated here, never committed. The API
+      # and the Hatchet dashboard must not both publish host 8080, so the dashboard
+      # host port is 8081 while the API stays on 8080.
+      UMD_API_PORT: "${UMD_API_PORT:-8080}"
+      HATCHET_DASHBOARD_PORT: "${HATCHET_DASHBOARD_PORT:-8081}"
+      UMD_POSTGRES_PASSWORD: "${UMD_POSTGRES_PASSWORD:-umd}"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -189,32 +222,85 @@ jobs:
       - name: Install dev dependencies (host, for running pytest over HTTP)
         run: pip install --no-cache-dir -e ".[dev]"
 
-      # P2-S3: compose interpolation vars the pinned topology requires.
+      # P3-S3: compose interpolation vars the pinned topology requires.
       # HATCHET_COOKIE_SECRET / HATCHET_MASTER_KEY are REQUIRED (${VAR:?}) by the
-      # hatchet service; generated here, never committed. The worker's Hatchet
-      # connection vars are driven from repo state at runtime (Plan I owns the
-      # worker env wiring) with in-stack defaults that compose may interpolate.
-      - name: Set Compose runtime environment
+      # split Hatchet services; generated here, never committed.
+      - name: Set Compose runtime environment (required secrets, never committed)
         run: |
           echo "HATCHET_COOKIE_SECRET=$(python3 -c 'import secrets; print(secrets.token_hex(32))')" >> "$GITHUB_ENV"
           echo "HATCHET_MASTER_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')" >> "$GITHUB_ENV"
-          echo "UMD_HATCHET_SERVER_URL=${UMD_HATCHET_SERVER_URL:-http://hatchet:8080}" >> "$GITHUB_ENV"
-          echo "UMD_HATCHET_TOKEN=${UMD_HATCHET_TOKEN:-umd-ci-token}" >> "$GITHUB_ENV"
+          echo "HATCHET_VERSION=${HATCHET_VERSION:-v0.105.2}" >> "$GITHUB_ENV"
+          echo "UMD_API_PORT=${UMD_API_PORT:-8080}" >> "$GITHUB_ENV"
+          echo "HATCHET_DASHBOARD_PORT=${HATCHET_DASHBOARD_PORT:-8081}" >> "$GITHUB_ENV"
           echo "UMD_POSTGRES_PASSWORD=${UMD_POSTGRES_PASSWORD:-umd}" >> "$GITHUB_ENV"
 
-      - name: Build API/worker image and start pinned Compose stack
+      # P3-S4: exact-image preflight BEFORE any Compose startup. Every split image
+      # must exist at the exact pinned tag (the historical top-level
+      # ghcr.io/hatchet-dev/hatchet reference is 403-denied; the real images are
+      # sub-paths). Digests + candidate-pin outcome are captured for the summary.
+      - name: Preflight Hatchet split images at the exact pinned tag
         run: |
-          docker compose -f deploy/compose.yaml --profile sandbox up -d --build
+          bash .github/scripts/preflight-hatchet-images.sh "${HATCHET_VERSION:-v0.105.2}"
 
-      # P2-S3: migrations run on start (UMD_RUN_MIGRATIONS_ON_START=1 in the
-      # compose anchor); readiness is polled on the published API port.
+      # P3-S3/P3-S4: bring up the config-generation half first (db + migrate +
+      # admin) so hatchet-admin's quickstart populates the shared /hatchet/config,
+      # then mint a REAL tenant JWT from the generated config BEFORE the worker/api
+      # containers are created (they read UMD_HATCHET_TOKEN at container creation
+      # time). The umd-ci-token placeholder is never used — it is not a JWT and can
+      # never register a worker.
+      - name: Start config generation (db migrate admin) and mint real tenant JWT
+        run: |
+          set -eux
+          docker compose -f deploy/compose.yaml up -d db hatchet-migrate hatchet-admin
+          ok=""
+          for i in $(seq 1 60); do
+            if docker compose -f deploy/compose.yaml run --rm --no-deps hatchet-admin \
+                sh -c 'test -n "$(ls -A /hatchet/config 2>/dev/null)"' 2>/dev/null; then
+              ok=1; break
+            fi
+            sleep 5
+          done
+          if [ -z "$ok" ]; then
+            echo "hatchet-admin did not generate /hatchet/config within timeout" >&2
+            exit 1
+          fi
+          TENANT_ID="$(docker compose -f deploy/compose.yaml exec -T db psql -U umd -d umd -tAc \
+            'SELECT id::text FROM tenants ORDER BY created_at LIMIT 1' 2>/dev/null | tr -d '[:space:]')"
+          if [ -z "$TENANT_ID" ]; then
+            echo "could not discover a Hatchet tenant id; cannot mint a real JWT" >&2
+            exit 1
+          fi
+          TOKEN="$(docker compose -f deploy/compose.yaml run --rm --no-deps hatchet-admin \
+            /hatchet/hatchet-admin token create --config /hatchet/config --tenant-id "$TENANT_ID")"
+          if [ -z "$TOKEN" ]; then
+            echo "token minting produced no JWT" >&2
+            exit 1
+          fi
+          echo "HATCHET_TENANT_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          echo "UMD_HATCHET_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          # Host-facing surfaces for the host-run live suite: gRPC routes to the
+          # engine (published 7070); server URL = published dashboard (8081).
+          echo "UMD_HATCHET_SERVER_URL=http://127.0.0.1:${HATCHET_DASHBOARD_PORT:-8081}" >> "$GITHUB_ENV"
+          echo "UMD_HATCHET_CLIENT_HOST_PORT=7070" >> "$GITHUB_ENV"
+
+      # P3-S3: start the COMPLETE split topology UNCONDITIONALLY (no opt-in flag):
+      # db, api, worker, sandbox-runner (optional sandbox profile), hatchet-migrate,
+      # hatchet-admin, hatchet-engine, hatchet-dashboard. The live worker gate below
+      # depends on the `worker` service registering with the engine for real.
+      - name: Start complete split topology (full stack, unconditional)
+        run: |
+          docker compose -f deploy/compose.yaml --profile sandbox up -d --build \
+            db api worker sandbox-runner \
+            hatchet-migrate hatchet-admin hatchet-engine hatchet-dashboard
+
       - name: Wait for API readiness (/v1/ready)
         run: |
-          bash .github/scripts/wait-for-http.sh http://127.0.0.1:8080/v1/ready 240 5
+          bash .github/scripts/wait-for-http.sh "http://127.0.0.1:${UMD_API_PORT:-8080}/v1/ready" 240 5
 
-      # P2-S3: the real worker must register with Hatchet. This FAILS the job if
-      # the worker does not become ready (bounded timeout + captured logs).
-      - name: Wait for worker/scheduler readiness (gate)
+      # P3-S3/P3-S4: genuine worker registration gate — always enforced, never
+      # opt-in. The job FAILS if the real worker never becomes ready
+      # (wait-for-worker.sh greps 'worker ready: registered'). No fake readiness.
+      - name: Wait for genuine worker/scheduler registration (fail-closed gate)
         run: |
           bash .github/scripts/wait-for-worker.sh deploy/compose.yaml worker 240 5
 
@@ -223,50 +309,114 @@ jobs:
           bash .github/scripts/capture-diagnostics.sh deploy/compose.yaml diag-before
           docker compose -f deploy/compose.yaml ps
 
-      # P2-S4: external HTTP representative flows + the full public-boundary
-      # scenario against the LIVE stack (no skip in CI).
       - name: External HTTP representative flows (live service)
         run: |
           set -eux
-          curl -fsS http://127.0.0.1:8080/v1/version > /tmp/version.json
-          curl -fsS http://127.0.0.1:8080/v1/capabilities > /tmp/capabilities.json
-          curl -fsS http://127.0.0.1:8080/v1/health > /tmp/health.json
-          echo "version endpoint OK; capabilities endpoint OK; health endpoint OK"
+          P="${UMD_API_PORT:-8080}"
+          curl -fsS "http://127.0.0.1:${P}/v1/version" > /tmp/version.json
+          curl -fsS "http://127.0.0.1:${P}/v1/capabilities" > /tmp/capabilities.json
+          curl -fsS "http://127.0.0.1:${P}/v1/health" > /tmp/health.json
+          curl -fsS "http://127.0.0.1:${P}/v1/ready" > /tmp/ready.json
+          echo "version/capabilities/health/ready endpoints OK"
 
-      - name: Run the public-boundary E2E scenario against the live stack
+      # P3-S3: real live suite on the Compose network. FAILS if any cluster/docker
+      # test SKIPS (a skipped mandatory live test is a failed release gate) or a
+      # live job does not complete. Writes the live-worker-gate verdict.
+      - name: Run live Hatchet suite (gate on real execution, fail on skip)
         run: |
           set -o pipefail
-          pytest -q tests/test_api_boundary_e2e.py \
-            --junitxml=boundary-junit.xml \
-            2>&1 | tee boundary-tests.log
+          UMD_TEST_POSTGRES=true \
+          UMD_HATCHET_SERVER_URL="http://127.0.0.1:${HATCHET_DASHBOARD_PORT:-8081}" \
+          UMD_HATCHET_TOKEN="$HATCHET_TENANT_TOKEN" \
+          UMD_HATCHET_CLIENT_HOST_PORT="7070" \
+          pytest -q tests/test_hatchet_live.py -m "cluster or docker" \
+            --junitxml=live-junit.xml 2>&1 | tee live-tests.log
+          skipped="$(python3 -c "import xml.etree.ElementTree as ET;r=ET.parse('live-junit.xml').getroot();print(r.get('skipped','0'))")"
+          if [ "${skipped:-0}" != "0" ]; then
+            echo "live-worker-gate: FAIL (${skipped} live test(s) skipped)" >&2
+            exit 1
+          fi
+          echo "PASS" > live-worker-gate.txt
+          echo "live-worker-gate: PASS"
 
-      # P2-S5: named persistent volumes (ocfl-db, ocfl-data) prove Postgres and
-      # OCFL survive restart via explicit api/worker stop/start.
-      - name: Persistence across api/worker restart (P2-S5)
+      # P4-S7: the complete hosted acceptance command after stack boot. ALL
+      # mandatory live tests must EXECUTE on protected/main — a skip is a failed
+      # release gate (no environment-flag omission may hide a live test). The
+      # public-boundary E2E runs against the running service over external HTTP
+      # only (UMD_API_BASE_URL), and its scenario never self-skips on capability
+      # checks — it only skips when the service is genuinely unreachable, which
+      # cannot happen here because the stack is up and /v1/ready has already passed.
+      - name: Run the public-boundary E2E scenario against the live stack (P4-S7)
+        run: |
+          set -o pipefail
+          UMD_TEST_POSTGRES=true \
+          UMD_API_BASE_URL="http://127.0.0.1:${UMD_API_PORT:-8080}" \
+          UMD_HATCHET_SERVER_URL="http://127.0.0.1:${HATCHET_DASHBOARD_PORT:-8081}" \
+          UMD_HATCHET_TOKEN="$HATCHET_TENANT_TOKEN" \
+          UMD_HATCHET_CLIENT_HOST_PORT="7070" \
+          pytest -q tests/test_api_boundary_e2e.py \
+            --junitxml=boundary-junit.xml 2>&1 | tee boundary-tests.log
+          skipped="$(python3 -c "import xml.etree.ElementTree as ET;r=ET.parse('boundary-junit.xml').getroot();print(r.get('skipped','0'))")"
+          if [ "${skipped:-0}" != "0" ]; then
+            echo "public-boundary-gate: FAIL (${skipped} live boundary test(s) skipped)" >&2
+            exit 1
+          fi
+          echo "PASS" > public-boundary-gate.txt
+          echo "public-boundary-gate: PASS"
+
+      # P3-S5/P2-S5: named persistent volumes (ocfl-db, ocfl-data) prove Postgres
+      # and OCFL survive restart via explicit api/worker stop/start (never down -v).
+      - name: Persistence across api/worker restart (stop/start, volumes preserved)
         run: |
           docker compose -f deploy/compose.yaml stop api worker
           docker compose -f deploy/compose.yaml ps
           docker compose -f deploy/compose.yaml start api worker
-          bash .github/scripts/wait-for-http.sh http://127.0.0.1:8080/v1/ready 240 5
+          bash .github/scripts/wait-for-http.sh "http://127.0.0.1:${UMD_API_PORT:-8080}/v1/ready" 240 5
           bash .github/scripts/wait-for-worker.sh deploy/compose.yaml worker 240 5
-          # OCFL namaste marker on the named volume proves source storage
-          # survived the restart (readiness also re-verified above).
           docker compose -f deploy/compose.yaml exec -T api sh -c \
             'if test -f /data/ocfl/0=ocfl_1.1; then echo "ocfl-data volume persisted (namaste present)"; else echo "ocfl-data MISSING namaste" >&2; exit 1; fi'
 
       - name: Re-run boundary E2E after restart (prove persistence/resume)
         run: |
           set -o pipefail
+          UMD_TEST_POSTGRES=true \
+          UMD_API_BASE_URL="http://127.0.0.1:${UMD_API_PORT:-8080}" \
+          UMD_HATCHET_SERVER_URL="http://127.0.0.1:${HATCHET_DASHBOARD_PORT:-8081}" \
+          UMD_HATCHET_TOKEN="$HATCHET_TENANT_TOKEN" \
+          UMD_HATCHET_CLIENT_HOST_PORT="7070" \
           pytest -q tests/test_api_boundary_e2e.py \
-            --junitxml=boundary-after-restart-junit.xml \
-            2>&1 | tee boundary-after-restart.log
+            --junitxml=boundary-after-restart-junit.xml 2>&1 | tee boundary-after-restart.log
+          skipped="$(python3 -c "import xml.etree.ElementTree as ET;r=ET.parse('boundary-after-restart-junit.xml').getroot();print(r.get('skipped','0'))")"
+          if [ "${skipped:-0}" != "0" ]; then
+            echo "public-boundary-after-restart-gate: FAIL (${skipped} skipped)" >&2
+            exit 1
+          fi
+          echo "PASS" > public-boundary-after-restart-gate.txt
+          echo "public-boundary-after-restart-gate: PASS"
 
-      # P2-S6: image digests + optional-provider gate summary (release evidence).
-      - name: Record image digests and provider gate summary
+      # P3-S3: the always-running aggregate live-worker release gate. Runs under
+      # if: always() so a live-path failure OR a live-path skip fails the job
+      # explicitly, even if a prior step already failed. Fails closed: no PASS
+      # verdict recorded = FAIL.
+      - name: Aggregate live-worker release gate (always, fail-closed)
+        if: always()
+        run: |
+          status="$(cat live-worker-gate.txt 2>/dev/null || echo FAIL)"
+          echo "live-worker-gate: $status"
+          bstatus="$(cat public-boundary-gate.txt 2>/dev/null || echo FAIL)"
+          echo "public-boundary-gate: $bstatus"
+          rstatus="$(cat public-boundary-after-restart-gate.txt 2>/dev/null || echo FAIL)"
+          echo "public-boundary-after-restart-gate: $rstatus"
+          if [ "$status" != "PASS" ] || [ "$bstatus" != "PASS" ] || [ "$rstatus" != "PASS" ]; then
+            echo "aggregate gate: live-worker or public-boundary validation did not PASS (live=$status boundary=$bstatus after-restart=$rstatus)" >&2
+            exit 1
+          fi
+
+      - name: Record image digests, provider gates, live-worker-gate evidence
         run: |
           bash .github/scripts/record-release-summary.sh deploy/compose.yaml
 
-      # P2-S5/P2-S6: capture failure evidence even when an earlier step failed.
+      # P3-S5: capture failure evidence even when an earlier step failed.
       - name: Capture diagnostics (always)
         if: always()
         run: |
@@ -280,16 +430,21 @@ jobs:
           path: |
             diag-before/
             diag-final/
+            live-junit.xml
+            live-tests.log
             boundary-junit.xml
             boundary-after-restart-junit.xml
             boundary-tests.log
             boundary-after-restart.log
+            live-worker-gate.txt
+            public-boundary-gate.txt
+            public-boundary-after-restart-gate.txt
+            image-digests.txt
           if-no-files-found: warn
 
-      # P2-S6: clean teardown in a final always-run step. Prior step failures
-      # already marked the job failed; teardown runs regardless and does not
-      # override them. continue-on-error keeps a teardown cleanup problem from
-      # overlaying the real result while still running to completion.
+      # P3-S5: teardown only at the VERY END, after all evidence is captured.
+      # Named volumes are dropped only here (the persistence steps above used
+      # stop/start). continue-on-error keeps teardown from masking the real result.
       - name: Teardown Compose stack and volumes (always)
         if: always()
         continue-on-error: true

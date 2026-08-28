@@ -43,3 +43,21 @@ EXPOSE 8080
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["api"]
+
+# ---------------------------------------------------------------------------
+# Worker image (P3-S2): the API role stays lean (base runtime deps only); the
+# worker role installs the pinned OPT-IN `.[worker]` extra (hatchet-sdk==1.38.1)
+# and smoke-tests the SDK import WITHOUT promoting the candidate pair. Hatchet
+# is a GATED dependency: the SDK<->server pair remains CANDIDATE/PENDING live
+# validation (deploy/pins/runtime.txt) — installing it here does not promote it.
+# The base-image/provider/security boundaries, immutable source/tool provenance,
+# and explicit optional capability statuses are preserved (no new secrets, no
+# privileged posture, no base dependency change). Compose's `worker` and
+# `sandbox-runner` services select this target via `build.target: worker`.
+# ---------------------------------------------------------------------------
+FROM runtime AS worker
+USER root
+RUN pip install --no-cache-dir ".[worker]" \
+    && python -c "import hatchet_sdk; print('hatchet_sdk import OK (CANDIDATE pair, pending live validation)')"
+USER umd
+CMD ["worker"]

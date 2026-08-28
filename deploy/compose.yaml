@@ -44,6 +44,13 @@ services:
       POSTGRES_DB: umd
     volumes:
       - ocfl-db:/var/lib/postgresql/data
+    # Publish 5432 to the host so the host-run live suite (tests/test_hatchet_live.py,
+    # test_api_boundary_e2e.py) can reach the SAME Postgres the in-stack worker/API
+    # use via conftest's UMD_PG_HOST/UMD_PG_PORT surface. The live tests must share
+    # this database with the compose worker (not a throwaway) for deterministic
+    # stage_run/StageCompleted evidence.
+    ports:
+      - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U umd -d umd"]
       interval: 5s
@@ -58,6 +65,13 @@ services:
     environment:
       UMD_ROLE: api
       <<: *umd-api-env
+      # P3-S3: the API release factory dispatches through ProductionDAGRunner to the
+      # sole v1 scheduler, so it consumes the SAME real-tenant-JWT Hatchet surface as
+      # the worker (build_hatchet_client reads these env vars). gRPC host_port routes
+      # to the ENGINE (7070), never the dashboard.
+      UMD_HATCHET_SERVER_URL: http://hatchet-dashboard:8080
+      UMD_HATCHET_TOKEN: ${HATCHET_TENANT_TOKEN:-}
+      HATCHET_CLIENT_HOST_PORT: hatchet-engine:7070
     env_file:
       - path: ../.env.example
         required: false
@@ -82,10 +96,23 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      # P3-S2: the worker role uses the `worker` build target (installs the pinned
+      # `.[worker]` extra + SDK import smoke test); the API stays on the lean base.
+      target: worker
     command: ["worker"]
     environment:
       UMD_ROLE: worker
       <<: *umd-api-env
+      # Hatchet worker configuration. UMD_HATCHET_TOKEN MUST be a REAL tenant JWT
+      # (minted after hatchet-admin config generation via `hatchet-admin token
+      # create --config /hatchet/config --tenant-id <uuid>`); the umd-ci-token
+      # placeholder is NOT a JWT and can never register. HATCHET_CLIENT_HOST_PORT
+      # routes the worker's gRPC admin channel to the ENGINE (7070), never the
+      # dashboard. UMD_HATCHET_SERVER_URL is the dashboard HTTP URL (required by
+      # the worker gate; the gRPC host_port override bypasses the URL hostname).
+      UMD_HATCHET_SERVER_URL: http://hatchet-dashboard:8080
+      UMD_HATCHET_TOKEN: ${HATCHET_TENANT_TOKEN:-}
+      HATCHET_CLIENT_HOST_PORT: hatchet-engine:7070
     env_file:
       - path: ../.env.example
         required: false
@@ -94,21 +121,97 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      hatchet:
+      hatchet-engine:
         condition: service_started
     restart: unless-stopped
 
-  hatchet:
-    # Durable DAG runner (release exact pin is a build gate; see
-    # deploy/security/CVE_WATCH.md and the Plan E rollout section).
-    image: ghcr.io/hatchet-dev/hatchet:${HATCHET_VERSION:-v0.105.2}
+  # ---- Hatchet split topology (sole v1 scheduler) ---------------------------
+  # Real ghcr.io sub-path images at the pinned release. The top-level
+  # `ghcr.io/hatchet-dev/hatchet` reference is DENIED on ghcr.io and must never be
+  # used. Order: hatchet-migrate -> hatchet-admin (setup-config generates the
+  # /hatchet/config) -> hatchet-engine (gRPC 7070) + hatchet-dashboard (:80).
+  hatchet-migrate:
+    image: ghcr.io/hatchet-dev/hatchet/hatchet-migrate:${HATCHET_VERSION:-v0.105.2}
+    command: /hatchet/hatchet-migrate
     environment:
-      SERVER_AUTH_COOKIE_SECRET: ${HATCHET_COOKIE_SECRET:?}
-      SERVER_ENCRYPTION_MASTER_KEY: ${HATCHET_MASTER_KEY:?}
+      DATABASE_URL: postgres://umd:${UMD_POSTGRES_PASSWORD:-umd}@db:5432/umd
     depends_on:
       db:
-        condition: service_started
-    restart: unless-stopped
+        condition: service_healthy
+    restart: on-failure
+
+  hatchet-admin:
+    # setup-config: generates the shared /hatchet/config consumed by engine and
+    # dashboard. Postgres doubles as the message broker (SERVER_MSGQUEUE_KIND=postgres),
+    # so no RabbitMQ service is needed. C7: HATCHET_COOKIE_SECRET / HATCHET_MASTER_KEY
+    # stay required ${VAR:?} interpolations.
+    image: ghcr.io/hatchet-dev/hatchet/hatchet-admin:${HATCHET_VERSION:-v0.105.2}
+    command: /hatchet/hatchet-admin quickstart --skip certs --generated-config-dir /hatchet/config --overwrite=false
+    environment:
+      DATABASE_URL: postgres://umd:${UMD_POSTGRES_PASSWORD:-umd}@db:5432/umd
+      SERVER_MSGQUEUE_KIND: postgres
+      SERVER_AUTH_COOKIE_SECRET: ${HATCHET_COOKIE_SECRET:?}
+      SERVER_ENCRYPTION_MASTER_KEY: ${HATCHET_MASTER_KEY:?}
+      SERVER_AUTH_COOKIE_DOMAIN: localhost:8080
+      SERVER_AUTH_COOKIE_INSECURE: "t"
+      SERVER_GRPC_BIND_ADDRESS: "0.0.0.0"
+      SERVER_GRPC_INSECURE: "t"
+      SERVER_GRPC_BROADCAST_ADDRESS: hatchet-engine:7070
+      SERVER_INTERNAL_CLIENT_INTERNAL_GRPC_BROADCAST_ADDRESS: hatchet-engine:7070
+    volumes:
+      - hatchet-config:/hatchet/config
+      - hatchet-certs:/hatchet/certs
+    depends_on:
+      hatchet-migrate:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+    restart: on-failure
+
+  hatchet-engine:
+    # The scheduler/runner surface the SDK reaches over gRPC (default 7070). The
+    # host mapping keeps the published port 7070 so cli.worker's default host_port
+    # derivation and the in-network test runner both route here, not the dashboard.
+    image: ghcr.io/hatchet-dev/hatchet/hatchet-engine:${HATCHET_VERSION:-v0.105.2}
+    command: /hatchet/hatchet-engine --config /hatchet/config
+    environment:
+      DATABASE_URL: postgres://umd:${UMD_POSTGRES_PASSWORD:-umd}@db:5432/umd
+      SERVER_GRPC_BIND_ADDRESS: "0.0.0.0"
+      SERVER_GRPC_INSECURE: "t"
+    ports:
+      - "7070:7070"
+    volumes:
+      - hatchet-config:/hatchet/config
+      - hatchet-certs:/hatchet/certs
+    depends_on:
+      hatchet-admin:
+        condition: service_completed_successfully
+      hatchet-migrate:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+    restart: on-failure
+
+  hatchet-dashboard:
+    # The HTTP UI (host 8080 -> container :80). Not the gRPC surface; no worker
+    # ever routes its admin channel here.
+    image: ghcr.io/hatchet-dev/hatchet/hatchet-dashboard:${HATCHET_VERSION:-v0.105.2}
+    command: sh ./entrypoint.sh --config /hatchet/config
+    environment:
+      DATABASE_URL: postgres://umd:${UMD_POSTGRES_PASSWORD:-umd}@db:5432/umd
+    ports:
+      - "${HATCHET_DASHBOARD_PORT:-8080}:80"
+    volumes:
+      - hatchet-config:/hatchet/config
+      - hatchet-certs:/hatchet/certs
+    depends_on:
+      hatchet-admin:
+        condition: service_completed_successfully
+      hatchet-migrate:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+    restart: on-failure
 
   # ---- OPTIONAL / profile-gated ---------------------------------------------
   sandbox-runner:
@@ -120,6 +223,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      target: worker
     command: ["worker"]
     profiles: ["sandbox"]
     environment:
@@ -172,3 +276,6 @@ volumes:
   sandbox-tmp:
   ollama-cache:
   minio-data:
+  # Hatchet split-topology shared state (engine + dashboard both mount these).
+  hatchet-config:
+  hatchet-certs:
