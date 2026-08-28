@@ -261,10 +261,19 @@ jobs:
             echo "hatchet-admin did not generate /hatchet/config within timeout" >&2
             exit 1
           fi
-          TENANT_ID="$(docker compose -f deploy/compose.yaml exec -T db psql -U umd -d umd -tAc \
-            'SELECT id::text FROM tenants ORDER BY created_at LIMIT 1' 2>/dev/null | tr -d '[:space:]')"
+          # Tenant discovery: quickstart writes config BEFORE creating the tenant row, so
+          # poll for the row itself (bounded). psql errors are intentionally NOT silenced.
+          TENANT_ID=""
+          for i in $(seq 1 30); do
+            TENANT_ID="$(docker compose -f deploy/compose.yaml exec -T db psql -U umd -d umd -tAc \
+              'SELECT id::text FROM tenants ORDER BY created_at LIMIT 1' | tr -d '[:space:]')"
+            if [ -n "$TENANT_ID" ]; then
+              break
+            fi
+            sleep 2
+          done
           if [ -z "$TENANT_ID" ]; then
-            echo "could not discover a Hatchet tenant id; cannot mint a real JWT" >&2
+            echo "could not discover a Hatchet tenant id after polling; cannot mint a real JWT" >&2
             exit 1
           fi
           TOKEN="$(docker compose -f deploy/compose.yaml run --rm --no-deps hatchet-admin \
