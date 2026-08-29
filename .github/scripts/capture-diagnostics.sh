@@ -70,6 +70,18 @@ else
   echo "live-worker-gate: FAIL (no verdict recorded)" > "$out_dir/live-worker-gate.txt"
 fi
 
+# P3-S2/P3-S3: bundle the hosted tenant-selection identity + engine-visible
+# machine-readable verdicts and the optional A3' declaration probe into the bundle
+# (captured BEFORE teardown so the evidence survives). The per-check diag files
+# (v1-task-summary, engine-visible-durability, callback-owned-rows,
+# identity-agreement, engine-visible-schema, v1-task-transition-history) are already
+# written into $out_dir by engine-visible-proof.sh's diag_dir argument.
+for f in tenant-identity.txt engine-visible-proof.txt engine-verdicts.txt a3-declaration-probe.txt; do
+  if [ -f "$f" ]; then
+    cp "$f" "$out_dir/" 2>/dev/null || true
+  fi
+done
+
 # P3-S5: JUnit / coverage artifacts produced by earlier test steps, if present.
 for f in live-junit.xml live-tests.log boundary-junit.xml boundary-tests.log \
          boundary-after-restart-junit.xml boundary-after-restart.log \

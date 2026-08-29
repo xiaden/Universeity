@@ -39,6 +39,11 @@ psql() {
 fail() {
   echo "engine-visible-proof: FAIL: $*" >&2
   echo "FAIL" > engine-visible-proof.txt
+  # machine-readable verdict (P3-S3): absent/reason rows are release-blocking.
+  {
+    echo "engine-visible-proof=FAIL"
+    echo "reason=$*"
+  } > engine-verdicts.txt
   exit 1
 }
 
@@ -143,17 +148,18 @@ fi
 
 # ============================================================================
 # Check 2: latest-version v1_task.is_durable=true for every canonical umd-<stage>
-#   Submitted tasks belong to the current registered workflow version; every task
-#   for a canonical umd-<stage> workflow must be durable. bool_and(true,...)=t and
-#   count>0 required per stage.
+#   AT-18 is a LATEST-VERSION check: per workflow name, the max-version row(s)
+#   must have is_durable=true. Stale historical versions can never satisfy it, so
+#   we keep only the max-version v1_task rows (MAX("WorkflowVersion"."version")
+#   per "Workflow"."name") and require bool_and(is_durable)=t with count>0 there.
 # ============================================================================
-DUR_OUT="$(psql -tAc "SELECT w.\"name\", bool_and(t.is_durable), count(*) FROM v1_task t JOIN \"WorkflowVersion\" wv ON wv.\"id\" = t.workflow_version_id JOIN \"Workflow\" w ON w.\"id\" = wv.\"workflowId\" WHERE t.tenant_id = '$selected_tenant' AND w.\"name\" LIKE 'umd-%' GROUP BY w.\"name\" ORDER BY w.\"name\"")"
+DUR_OUT="$(psql -tAc "SELECT wf, bool_and(is_durable), count(*) FROM (SELECT w.\"name\" AS wf, wv.\"version\" AS ver, t.is_durable, MAX(wv.\"version\") OVER (PARTITION BY w.\"name\") AS maxver FROM v1_task t JOIN \"WorkflowVersion\" wv ON wv.\"id\" = t.workflow_version_id JOIN \"Workflow\" w ON w.\"id\" = wv.\"workflowId\" WHERE t.tenant_id = '$selected_tenant' AND w.\"name\" LIKE 'umd-%') sub WHERE sub.ver = sub.maxver GROUP BY sub.wf ORDER BY sub.wf")"
 printf '%s\n' "$DUR_OUT" > "$diag_dir/engine-visible-durability.txt"
 for stage in $UMD_STAGES; do
   wf="umd-$stage"
   line="$(printf '%s\n' "$DUR_OUT" | grep -F "$wf|" | head -n1 || true)"
   if [ -z "$line" ]; then
-    fail "no v1_task rows for canonical workflow $wf (latest-version durability unproven)"
+    fail "no latest-version v1_task rows for canonical workflow $wf (AT-18 durability unproven)"
   fi
   all_durable="$(printf '%s\n' "$line" | awk -F'|' '{print $2}')"
   n="$(printf '%s\n' "$line" | awk -F'|' '{print $3}')"
@@ -206,7 +212,7 @@ if [ "${audit_rows:-0}" -le 0 ]; then
 fi
 
 # ============================================================================
-# Check 6: identity agreement — worker == workflow == submitted-task == selected
+# Check 5: identity agreement — worker == workflow == submitted-task == selected
 # ============================================================================
 worker_tenants="$(psql -tAc "SELECT DISTINCT \"tenantId\" FROM \"$WORKER\" WHERE \"status\" = 'ACTIVE'" | tr -d '[:space:]')"
 workflow_tenants="$(psql -tAc "SELECT DISTINCT \"tenantId\" FROM \"$WORKFLOW\" WHERE \"name\" LIKE 'umd-%'" | tr -d '[:space:]')"
@@ -241,4 +247,14 @@ fi
 } >> "$identity_file"
 
 echo "PASS" > engine-visible-proof.txt
+# machine-readable verdicts (P3-S3): every row must be present for the release
+# gate; a missing/absent verdict file is release-blocking in record-release-summary.
+{
+  echo "eligible-tenant=$selected_tenant"
+  echo "tenant-identity-agreement=OK"
+  echo "assignment-runtime=OK"
+  echo "latest-version-durable=OK"
+  echo "callback-owned-rows=OK"
+  echo "engine-visible-proof=PASS"
+} > engine-verdicts.txt
 echo "[engine-visible-proof] PASS: assignments, durable latest-version umd-<stage>, worker/runtime rows, callback-owned rows, and identity agreement all verified for tenant $selected_tenant"

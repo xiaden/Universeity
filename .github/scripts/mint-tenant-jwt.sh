@@ -43,6 +43,11 @@ if [ -z "$ok" ]; then
   exit 1
 fi
 
+# The engine bootstraps scheduler/worker partitions for tenants (hosted
+# evidence: Default tenant 707d0855 has non-null partition ids only once the
+# engine runs). Start it now so the eligibility poll can select it.
+docker compose -f "$compose_file" up -d hatchet-engine
+
 # --- partition-eligible tenant selection (bounded 30x2s poll, fail-closed) ----
 # goose creates MIXED-CASE quoted tables in the public schema (CREATE TABLE
 # public."Tenant") with a lowercase unquoted `id` and quoted camelCase partition
@@ -123,7 +128,7 @@ tok = sys.argv[1]
 payload = tok.split('.')[1]
 payload += '=' * (-len(payload) % 4)
 claims = json.loads(base64.urlsafe_b64decode(payload))
-print(claims.get('tenant_id') or claims.get('sub') or '')
+print(claims.get('sub') or claims.get('tenant_id') or '')
 PY
 )"
 jwt_tenant="$(printf '%s' "$jwt_tenant" | tr -d '[:space:]')"
@@ -151,7 +156,16 @@ fi
   echo "submitted_task_tenant: PENDING"
 } > tenant-identity.txt
 
-# --- export the token to subsequent steps ----
+# --- export the token AND the tenant-selection facts to subsequent steps ----
 echo "HATCHET_TENANT_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 echo "UMD_HATCHET_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+# P3-S2: export the selected tenant identity + both partition ids so later
+# diagnostics/steps can cross-check without re-deriving them (no hardcoded UUID).
+if [ -n "${GITHUB_ENV:-}" ]; then
+  echo "TENANT_ID=$selected_id" >> "$GITHUB_ENV"
+  echo "HATCHET_TENANT_SCHEMA=$S" >> "$GITHUB_ENV"
+  echo "HATCHET_TENANT_TABLE=$T" >> "$GITHUB_ENV"
+  echo "HATCHET_TENANT_SCHEDULER_PARTITION=$selected_sched" >> "$GITHUB_ENV"
+  echo "HATCHET_TENANT_WORKER_PARTITION=$selected_worker" >> "$GITHUB_ENV"
+fi
 echo "[mint-tenant-jwt] selected eligible tenant $selected_id (sched=$selected_sched worker=$selected_worker); JWT tenant claim $jwt_tenant; identity recorded to tenant-identity.txt"

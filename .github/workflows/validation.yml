@@ -78,8 +78,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Install dev dependencies
-        run: pip install --no-cache-dir -e ".[dev]"
+      - name: Install dev dependencies (dev + worker for typecheck against real hatchet_sdk)
+        run: pip install --no-cache-dir -e ".[dev,worker]"
       - name: "Mypy strict (pyproject: strict = true)"
         run: |
           set -o pipefail
@@ -459,6 +459,15 @@ jobs:
         run: |
           bash .github/scripts/engine-visible-proof.sh deploy/compose.yaml diag-final
 
+      # A3' (optional, diagnostic-only): ONE hosted client.workflows.list() probe with
+      # NO prefix filter; exact-match canonical umd-<stage> names client-side. Recorded
+      # as DIAGNOSTIC ONLY — a declaration/list probe alone can never be release proof
+      # (engine-visible-proof.txt is the authoritative gate). Never fails the job.
+      - name: "A3' engine-visible declaration probe (DIAGNOSTIC ONLY, non-authoritative)"
+        if: always()
+        run: |
+          bash .github/scripts/a3-declaration-probe.sh
+
       # P3-S3: the always-running aggregate live-worker release gate. Runs under
       # if: always() so a live-path failure OR a live-path skip fails the job
       # explicitly, even if a prior step already failed. Fails closed: no PASS
@@ -515,6 +524,8 @@ jobs:
             public-boundary-gate.txt
             public-boundary-after-restart-gate.txt
             engine-visible-proof.txt
+            engine-verdicts.txt
+            a3-declaration-probe.txt
             tenant-identity.txt
             image-digests.txt
           if-no-files-found: warn

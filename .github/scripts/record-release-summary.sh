@@ -35,6 +35,39 @@ live_gate="$(cat live-worker-gate.txt 2>/dev/null || echo FAIL)"
   echo "> live test was skipped). This is release-blocking, not a warning."
 } >> "$summary"
 
+# P3-S3: machine-readable hosted engine-visible verdicts. Every row below is a
+# release-blocking signal; a missing verdict (absent tenant-identity.txt or
+# engine-verdicts.txt, or an engine-visible-proof FAIL) fails the release gate.
+{
+  echo ""
+  echo "## UMD hosted engine-visible verdicts (P3-S3, machine-readable)"
+  echo ""
+  echo "| Verdict | Value |"
+  echo "| --- | --- |"
+  if [ -f tenant-identity.txt ]; then
+    echo "| eligible-tenant | $(sed -n 's/^tenant_id: /OK:/p' tenant-identity.txt | tr -d '[:space:]' | head -n1) |"
+    echo "| tenant-schema | $(sed -n 's/^schema: /OK:/p' tenant-identity.txt | tr -d '[:space:]' | head -n1) |"
+    echo "| tenant-table | $(sed -n 's/^table: /OK:/p' tenant-identity.txt | tr -d '[:space:]' | head -n1) |"
+    echo "| scheduler-partition | $(sed -n 's/^scheduler_partition_id: /OK:/p' tenant-identity.txt | tr -d '[:space:]' | head -n1) |"
+    echo "| worker-partition | $(sed -n 's/^worker_partition_id: /OK:/p' tenant-identity.txt | tr -d '[:space:]' | head -n1) |"
+  else
+    echo "| eligible-tenant | FAIL (missing tenant-identity.txt) |"
+  fi
+  if [ -f engine-verdicts.txt ]; then
+    while IFS='=' read -r k v; do
+      [ -z "$k" ] && continue
+      printf '| %s | %s |\n' "$k" "$v"
+    done < engine-verdicts.txt
+  else
+    echo "| engine-visible-proof | FAIL (missing engine-verdicts.txt) |"
+  fi
+  echo "| live-worker-gate | $live_gate |"
+  echo ""
+  echo "> tenant-identity + engine-verdicts rows are the hosted proof that the repaired"
+  echo "> durable direct-input worker was assigned, ran durably, wrote callback-owned rows,"
+  echo "> and all under one scheduler-eligible tenant. Missing verdict = release-blocking."
+} >> "$summary"
+
 {
   echo ""
   echo "## UMD Release evidence - image digests"
