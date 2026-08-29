@@ -40,7 +40,7 @@ EXPOSE 8080
 
 # Runtime role entrypoint: applies migrations (opt-in via
 # UMD_RUN_MIGRATIONS_ON_START=1) then execs the configured server/worker.
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["api"]
 
