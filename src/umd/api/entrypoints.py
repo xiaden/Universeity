@@ -17,8 +17,8 @@ from umd.storage.ocfl.store import SourceStore
 
 
 def build_source_store(settings: Settings) -> SourceStore:
-    """Construct the OCFL ``SourceStore`` from environment-driven settings."""
-    return SourceStore(root=settings.ocfl.root)
+    """Construct and, on first deployment, bootstrap the configured OCFL root."""
+    return SourceStore.create(root=settings.ocfl.root)
 
 
 def app_factory() -> Any:

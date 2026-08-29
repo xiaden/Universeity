@@ -801,7 +801,7 @@ def test_app_factory_builds_wired_app_over_real_postgres(
 
 
 def test_build_source_store_uses_configured_ocfl_root(tmp_path) -> None:
-    """build_source_store(settings) uses the configured OCFL root directly."""
+    """Production wiring bootstraps a fresh configured OCFL root."""
     from umd.api.entrypoints import build_source_store
     from umd.config import OcflSettings, Settings
 
@@ -809,6 +809,20 @@ def test_build_source_store_uses_configured_ocfl_root(tmp_path) -> None:
     settings = Settings(ocfl=OcflSettings(root=root))
     store = build_source_store(settings)
     assert store.root == root
+    assert (root / "0=ocfl_1.1").exists()
+
+
+def test_build_source_store_rejects_non_empty_non_ocfl_root(tmp_path) -> None:
+    """Production bootstrap remains fail-closed for an invalid volume."""
+    from umd.api.entrypoints import build_source_store
+    from umd.config import OcflSettings, Settings
+    from umd.storage.ocfl import StoreError
+
+    root = tmp_path / "ocfl"
+    root.mkdir()
+    (root / "unexpected.txt").write_text("not OCFL", encoding="utf-8")
+    with pytest.raises(StoreError):
+        build_source_store(Settings(ocfl=OcflSettings(root=root)))
 
 
 # ---------------------------------------------------------------------------

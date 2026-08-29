@@ -12,6 +12,7 @@ OCFL 1.1 conformance via ``ocfl-py`` 2.1.0.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import tempfile
 from dataclasses import dataclass, field
@@ -115,21 +116,30 @@ class SourceStore:
         """Bootstrap a brand-new OCFL storage root (idempotent).
 
         Tolerates a pre-existing but *empty* root directory. A non-empty
-        directory without an OCFL declaration is rejected.
+        directory without an OCFL declaration is rejected. A filesystem lock
+        serializes concurrent API/worker startup against the shared volume.
         """
-        store = cls(root=Path(root), **kwargs)
-        namaste = store.root / ("0=ocfl_" + store.spec_version)
-        if not namaste.exists():
-            store.root.parent.mkdir(parents=True, exist_ok=True)
-            if store.root.exists():
-                if any(store.root.iterdir()):
-                    raise StoreError(
-                        f"OCFL root {store.root} exists and is non-empty; refusing to bootstrap"
-                    )
-                # ocfl-py requires the root dir to be absent before initialize().
-                store.root.rmdir()
-            store._sr.initialize(spec_version=store.spec_version)
-        return store
+        root = Path(root)
+        store = cls(root=root, **kwargs)
+        store.root.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = store.root.parent / f".{store.root.name}.init.lock"
+        with lock_path.open("w") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                namaste = store.root / ("0=ocfl_" + store.spec_version)
+                if namaste.exists():
+                    return store
+                if store.root.exists():
+                    if any(store.root.iterdir()):
+                        raise StoreError(
+                            f"OCFL root {store.root} exists and is non-empty; refusing to bootstrap"
+                        )
+                    # ocfl-py requires the root dir to be absent before initialize().
+                    store.root.rmdir()
+                store._sr.initialize(spec_version=store.spec_version)
+                return store
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     # -- public API --------------------------------------------------------
 

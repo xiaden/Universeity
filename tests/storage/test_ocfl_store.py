@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import io
 import shutil
+import threading
 from pathlib import Path
 
 import ocfl
@@ -131,6 +132,29 @@ def test_two_stores_are_independent_filesystem_substrates(tmp_path: Path) -> Non
     mb = _put(store_b, data)
     assert ma.object_id == mb.object_id
     assert store_b.get_range(mb.object_id).data == data
+
+
+def test_concurrent_create_serializes_shared_root_initialization(tmp_path: Path) -> None:
+    """API and worker startup may bootstrap one fresh volume concurrently."""
+    root = tmp_path / "shared"
+    stores: list[SourceStore] = []
+    errors: list[BaseException] = []
+
+    def create() -> None:
+        try:
+            stores.append(SourceStore.create(root))
+        except BaseException as exc:  # pragma: no cover - assertion reports failures
+            errors.append(exc)
+
+    threads = [threading.Thread(target=create) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    assert len(stores) == 2
+    assert (root / "0=ocfl_1.1").exists()
 
 
 def test_ocfl_backup_restore_boundary(source_store: SourceStore, tmp_path: Path) -> None:
