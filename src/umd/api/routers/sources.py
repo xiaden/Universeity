@@ -192,6 +192,16 @@ def _submit_source(
         ),
     )
 
+    # An omitted work_id starts a new work, matching the application ingestion
+    # contract. Explicit IDs remain strict references to an existing work.
+    effective_work_id = work_id if work_id is not None else uuid.uuid4().hex
+    if work_id is None:
+        ctx.memberships.ensure_work(
+            work_id=effective_work_id,
+            title=original_name or f"{source_id}.txt",
+            work_type=media_kind,
+        )
+
     ctx.memberships.ensure_source(
         source_id=source_id,
         ocfl_ref=manifest.object_id,
@@ -199,7 +209,7 @@ def _submit_source(
         size_bytes=manifest.size_bytes,
         media_kind=media_kind,
         original_name=original_name,
-        work_id=work_id,
+        work_id=effective_work_id,
     )
     commit = ctx.commands.record_source_ingested(
         source_id=source_id,
@@ -207,7 +217,7 @@ def _submit_source(
         ocfl_ref=manifest.object_id,
         size_bytes=manifest.size_bytes,
         media_kind=media_kind,
-        work_id=work_id,
+        work_id=effective_work_id,
         original_name=original_name,
         # The ledger requires idempotency keys to be valid UUIDs; derive a stable
         # one from the source id so a retried ingest of the same source is idempotent.
@@ -221,7 +231,7 @@ def _submit_source(
 
     return SourceDescriptorResponse(
         source_id=source_id,
-        work_id=work_id,
+        work_id=effective_work_id,
         ocfl_ref=manifest.object_id,
         sha512=manifest.sha512,
         size_bytes=manifest.size_bytes,

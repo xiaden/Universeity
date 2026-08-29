@@ -96,7 +96,16 @@ def test_public_contract_smoke_flow(api_ctx) -> None:
     ingest = r.json()
     sid, sha512 = ingest["source_id"], ingest["sha512"]
     assert r.json()["ocfl_ref"] and ingest["size_bytes"] == len(content.encode())
+    assert isinstance(ingest["work_id"], str) and ingest["work_id"]
     assert ingest["consistency_token"] >= 1
+    with engine.connect() as conn:
+        assert (
+            conn.execute(
+                sa.text("SELECT 1 FROM work WHERE id = :work_id"),
+                {"work_id": ingest["work_id"]},
+            ).scalar()
+            == 1
+        )
 
     # -- polling: ingest submitted a decomposable job ------------------------
     rj = client.get(f"/v1/jobs/job-{sid[:12]}", headers=R)

@@ -51,7 +51,6 @@ import base64
 import hashlib
 import os
 import time
-import uuid
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any, cast
@@ -128,7 +127,7 @@ ApiCtx = SimpleNamespace
 
 
 def _ingest(
-    client: httpx.Client, *, kind: str, name: str, data: bytes, work_id: str
+    client: httpx.Client, *, kind: str, name: str, data: bytes, work_id: str | None
 ) -> dict[str, Any]:
     """Ingest one source through the versioned public boundary.
 
@@ -139,17 +138,22 @@ def _ingest(
     if kind in _TEXT_KINDS:
         payload = {
             "media_kind": kind,
-            "work_id": work_id,
             "original_name": name,
             "content_type": "text/plain",
             "content": data.decode("utf-8"),
         }
+        if work_id is not None:
+            payload["work_id"] = work_id
         r = client.post("/v1/sources", json=payload, headers=W)
     else:
         r = client.post(
             "/v1/sources",
             files={"file": (name, data, _CONTENT_TYPES.get(kind, "application/octet-stream"))},
-            data={"media_kind": kind, "work_id": work_id, "original_name": name},
+            data={
+                "media_kind": kind,
+                "original_name": name,
+                **({"work_id": work_id} if work_id else {}),
+            },
             headers=W,
         )
     assert r.status_code == 201, r.text
@@ -175,10 +179,13 @@ def _poll_to_terminal(client: httpx.Client, job_id: str, *, attempts: int = 90) 
 
 def _ingest_heterogeneous_sources(client: httpx.Client) -> SimpleNamespace:
     """Several related real-format sources under ONE work (P4-S2)."""
-    work_id = uuid.uuid4().hex
+    # Omitting work_id exercises the public contract that creates a new work.
+    # Reuse the returned canonical ID for the related source realizations.
     txt = _ingest(
-        client, kind="txt", name="translated.txt", data=translated_txt_bytes(), work_id=work_id
+        client, kind="txt", name="translated.txt", data=translated_txt_bytes(), work_id=None
     )
+    work_id = txt["work_id"]
+    assert isinstance(work_id, str) and work_id
     md = _ingest(
         client, kind="markdown", name="adapted.md", data=adapted_markdown_bytes(), work_id=work_id
     )
