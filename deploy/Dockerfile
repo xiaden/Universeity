@@ -19,7 +19,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 # Non-root runtime user: sandboxes the container process itself.
 RUN groupadd --system umd && useradd --system --gid umd --home /app umd \
-    && mkdir -p /app && chown -R umd:umd /app
+    && mkdir -p /app /data/ocfl \
+    && chown -R umd:umd /app /data
 
 WORKDIR /app
 

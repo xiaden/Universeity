@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import os
+import shutil
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -121,25 +123,35 @@ class SourceStore:
         """
         root = Path(root)
         store = cls(root=root, **kwargs)
-        store.root.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = store.root.parent / f".{store.root.name}.init.lock"
-        with lock_path.open("w") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            try:
-                namaste = store.root / ("0=ocfl_" + store.spec_version)
-                if namaste.exists():
-                    return store
-                if store.root.exists():
-                    if any(store.root.iterdir()):
-                        raise StoreError(
-                            f"OCFL root {store.root} exists and is non-empty; refusing to bootstrap"
-                        )
-                    # ocfl-py requires the root dir to be absent before initialize().
-                    store.root.rmdir()
-                store._sr.initialize(spec_version=store.spec_version)
+        store.root.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(store.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            namaste = store.root / ("0=ocfl_" + store.spec_version)
+            if namaste.exists():
                 return store
+            if any(store.root.iterdir()):
+                raise StoreError(
+                    f"OCFL root {store.root} exists and is non-empty; refusing to bootstrap"
+                )
+
+            # ocfl-py requires the path passed to initialize() to be absent. Build
+            # the root in a staging directory, then publish its completed entries
+            # while the API and worker are excluded by the directory lock.
+            staging = Path(tempfile.mkdtemp(prefix=".ocfl-init-", dir=store.root))
+            staging.rmdir()
+            try:
+                staged_store = cls(root=staging, **kwargs)
+                staged_store._sr.initialize(spec_version=staged_store.spec_version)
+                for entry in staging.iterdir():
+                    shutil.move(str(entry), str(store.root / entry.name))
             finally:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                if staging.exists():
+                    shutil.rmtree(staging, ignore_errors=True)
+            return store
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
     # -- public API --------------------------------------------------------
 
