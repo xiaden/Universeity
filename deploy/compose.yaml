@@ -62,6 +62,10 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      # The api role runs the lean `runtime` base stage (CMD api); the `worker`
+      # stage is the Dockerfile's LAST stage, so without an explicit target Docker
+      # would default to it and the api image would run the worker branch.
+      target: runtime
     environment:
       UMD_ROLE: api
       <<: *umd-api-env

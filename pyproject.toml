@@ -25,6 +25,9 @@ dependencies = [
     # (P3-S1); the schemas are the published, retained contracts and jsonschema is the
     # reference validator. Pinned to the 0.4.x spec line that supports draft 2020-12.
     "jsonschema>=4.21",
+    # Version comparison for projection/vector capability gating (umd/projections/vector.py);
+    # previously present only transitively via dev tooling, now a declared runtime dep.
+    "packaging==26.3",
     # Text-layer PDF detection (Phase B, P2-S1). pypdf is BSD-3-Clause (permissive,
     # pre-approved by DD/plan alongside pdfplumber), PEP 561-typed, pinned 6.16.x.
     # Used ONLY for text-layer detection; image-only pages route to raster/OCR.
