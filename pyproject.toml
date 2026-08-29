@@ -18,7 +18,7 @@ dependencies = [
     # ASGI server for the API container (deploy/docker-entrypoint.sh api branch);
     # pinned per deploy/pins/runtime.txt. Was missing from pyproject, so the
     # Dockerfile 'pip install .' image had no uvicorn and the api crashed on boot.
-    "uvicorn==0.30.7",
+    "uvicorn==0.30.6",
     "pydantic==2.13.*",
     "sqlalchemy==2.0.*",
     "ocfl-py==2.1.0",
