@@ -282,7 +282,7 @@ jobs:
               S="${TS%%|*}"
               T="${TS#*|}"
               TENANT_ID="$(docker compose -f deploy/compose.yaml exec -T db psql -U umd -d umd -tAc \
-                "SET search_path TO \"$S\"; SELECT id::text FROM \"$T\" ORDER BY \"createdAt\" LIMIT 1" | tr -d '[:space:]')"
+                "SELECT id::text FROM \"$S\".\"$T\" ORDER BY \"createdAt\" LIMIT 1" | tr -d '[:space:]')"
             fi
             if [ -n "$TENANT_ID" ]; then
               break
