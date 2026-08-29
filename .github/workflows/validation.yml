@@ -312,17 +312,20 @@ jobs:
       # depends on the `worker` service registering with the engine for real.
       - name: Start complete split topology (full stack, unconditional)
         run: |
-          # Bounded retry for a known TRANSIENT infra race on GitHub runners: the
-          # container network-namespace path is recycled between the daemon
-          # resolving it and binding it during concurrent container creation
-          # ("bind-mount /proc/<pid>/ns/net -> /var/run/docker/netns/...: no such
-          # file or directory"). Fail-closed is preserved: any non-transient
-          # failure aborts immediately, and exhaustion of attempts still fails.
+          # Fail-closed startup with netns-race tolerance and state reconciliation.
+          # 1) up -d --build with bounded retry on the known TRANSIENT Docker netns
+          #    race; 2) reconcile: every service must reach its required state
+          #    (running for long-lived services, exited for one-shot migrate/admin).
+          #    The race can abort starts while `up` exits 0, leaving services in
+          #    'created'; the reconcile loop re-runs up (no build) until states are
+          #    correct or attempts are exhausted, and FAILS otherwise (fail-closed).
           compose_attempts=0
           compose_up_ok=0
           while [ "$compose_attempts" -lt 3 ]; do
             compose_attempts=$((compose_attempts + 1))
-            if docker compose -f deploy/compose.yaml --profile sandbox up -d --build \
+            build_flag="--build"
+            [ "$compose_attempts" -gt 1 ] && build_flag="--no-build"
+            if docker compose -f deploy/compose.yaml --profile sandbox up -d $build_flag \
                 db api worker sandbox-runner \
                 hatchet-migrate hatchet-admin hatchet-engine hatchet-dashboard 2>&1 | tee /tmp/compose-up.log; then
               compose_up_ok=1
@@ -340,6 +343,45 @@ jobs:
             echo "compose up failed after $compose_attempts attempts; aborting" >&2
             exit 1
           fi
+          # Deterministic reconciliation (see comment above).
+          required_running="db api worker sandbox-runner hatchet-engine hatchet-dashboard"
+          required_exited="hatchet-migrate hatchet-admin"
+          reconcile_ok=0
+          for r_attempt in $(seq 1 5); do
+            missing=""
+            for svc in $required_running; do
+              cid="$(docker compose -f deploy/compose.yaml ps -q "$svc" 2>/dev/null)"
+              if [ -z "$cid" ]; then
+                missing="$missing $svc=absent"
+                continue
+              fi
+              state="$(docker inspect --format '{{.State.Status}}' "$cid" 2>/dev/null)"
+              [ "$state" = "running" ] || missing="$missing $svc=$state"
+            done
+            for svc in $required_exited; do
+              cid="$(docker compose -f deploy/compose.yaml ps -q "$svc" 2>/dev/null)"
+              if [ -z "$cid" ]; then
+                missing="$missing $svc=absent"
+                continue
+              fi
+              state="$(docker inspect --format '{{.State.Status}}' "$cid" 2>/dev/null)"
+              [ "$state" = "exited" ] || missing="$missing $svc=$state"
+            done
+            if [ -z "$missing" ]; then
+              reconcile_ok=1
+              break
+            fi
+            echo "reconcile attempt $r_attempt/5: services not ready:${missing}; re-running compose up (netns-tolerant)" >&2
+            docker compose -f deploy/compose.yaml --profile sandbox up -d --no-build \
+                db api worker sandbox-runner \
+                hatchet-migrate hatchet-admin hatchet-engine hatchet-dashboard >/tmp/compose-reconcile.log 2>&1 || true
+            sleep 5
+          done
+          if [ "$reconcile_ok" -ne 1 ]; then
+            echo "FAILED: split topology never reached required state after reconciliation:${missing}" >&2
+            exit 1
+          fi
+          echo "split topology up: $required_running running; one-shots $required_exited exited"
 
       - name: Wait for API readiness (/v1/ready)
         run: |
