@@ -373,6 +373,17 @@ jobs:
       # in the GATED `worker` extra (hatchet-sdk==1.38.1). The live suite needs it
       # in-process (UMD_HATCHET_* env is exported, so _require_live_hatchet passes
       # and _real_client() imports hatchet_sdk). Install it before pytest.
+      # P3-S3: record a post-marker window guard BEFORE live submission. The DB
+      # timestamp is captured now so engine-visible-proof.sh's Check 4 can reject
+      # every pre-existing callback-owned row (including the pre-existing/mock
+      # mock-job StageCompleted) and accept only rows created during this live run.
+      - name: Record submission marker (pre-live-suite window guard)
+        run: |
+          set -eux
+          docker compose -f deploy/compose.yaml exec -T db psql -U umd -d umd -tAc \
+            "SELECT to_char(now(), 'YYYY-MM-DD\"T\"HH24:MI:SS.US')" | tr -d '[:space:]' > submission-marker.txt
+          test -s submission-marker.txt
+          echo "submission-marker.txt: $(cat submission-marker.txt)"
       - name: Run live Hatchet suite (gate on real execution, fail on skip)
         run: |
           set -o pipefail
@@ -527,6 +538,7 @@ jobs:
             engine-verdicts.txt
             a3-declaration-probe.txt
             tenant-identity.txt
+            submission-marker.txt
             image-digests.txt
           if-no-files-found: warn
 

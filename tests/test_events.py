@@ -25,6 +25,7 @@ from umd.domain.events import (
     EventType,
     EventVersionError,
     SemanticEvent,
+    _schemas_root,
     latest_version,
     load_schema,
     retained_event_references,
@@ -180,3 +181,35 @@ def test_json_schemas_load_as_valid_due_to_load_schema() -> None:
 def test_unknown_version_raises() -> None:
     with pytest.raises(EventVersionError):
         load_schema("SemanticAsserted", 999)
+
+
+# ---------------------------------------------------------------------------
+# _schemas_root resolution (P3-S6): env override first (fail-closed when set
+# but not a directory), then ancestor walk / cwd fallback for non-image runs.
+# ---------------------------------------------------------------------------
+
+
+def test_schemas_root_uses_env_override_when_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    override = tmp_path / "schemas" / "events"
+    override.mkdir(parents=True)
+    monkeypatch.setenv("UMD_EVENT_SCHEMAS_ROOT", str(override))
+    assert _schemas_root() == override.resolve()
+
+
+def test_schemas_root_fails_closed_when_env_set_but_not_dir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UMD_EVENT_SCHEMAS_ROOT", "/definitely/not/a/schemas/events")
+    with pytest.raises(FileNotFoundError):
+        _schemas_root()
+
+
+def test_schemas_root_ancestor_walk_without_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Without the env override, the ancestor walk from the installed module must
+    # locate the repo's schemas/events (StageCompleted retained schema present).
+    monkeypatch.delenv("UMD_EVENT_SCHEMAS_ROOT", raising=False)
+    root = _schemas_root()
+    assert (root / "StageCompleted").is_dir()
+    assert root.is_dir()

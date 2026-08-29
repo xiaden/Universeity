@@ -201,8 +201,21 @@ class _RecordingClient:
 
         return decorator
 
-    def submit_workflow_run(self, workflow_name: str, input: dict[str, Any]) -> None:
-        self.submissions.append({"workflow_name": workflow_name, "input": input})
+    def submit_workflow_run(
+        self, workflow_name: str, input: dict[str, Any], parent_id: str | None = None
+    ) -> str:
+        # A deterministic per-stage run id lets a test assert the native parent
+        # barrier linkage (a dependent's parent_id == its upstream's run id).
+        run_id = f"run-{str(input.get('stage', 'stage')).lower()}"
+        self.submissions.append(
+            {
+                "workflow_name": workflow_name,
+                "input": input,
+                "parent_id": parent_id,
+                "run_id": run_id,
+            }
+        )
+        return run_id
 
     def start(self) -> None:
         self.started = True
@@ -1619,16 +1632,21 @@ def test_committed_evidence_refs_resolved_and_replay_dedups(umd_db: sa.Engine) -
     ingest = _make_manifest("INGEST", job_id="ev-job")
     rec = _invoke_callback(client, ingest)
     assert rec["state"] == "complete"
-    refs = store.committed_evidence_refs("ev-job", "FORMAT_ANALYSIS")
+    # P2-S9: the committed-upstream lookup is keyed by canonical lineage identity
+    # (source + dag universe + segment + dependency edge), NOT by job ownership.
+    universe = ingest.dag_universe
+    refs = store.canonical_evidence_refs(_SOURCE_ID, universe, None, "FORMAT_ANALYSIS")
     assert refs, "FORMAT_ANALYSIS has no committed upstream evidence refs"
     # (b) deterministic on repeat.
-    assert store.committed_evidence_refs("ev-job", "FORMAT_ANALYSIS") == refs
+    assert store.canonical_evidence_refs(_SOURCE_ID, universe, None, "FORMAT_ANALYSIS") == refs
 
     # (c) Run FORMAT_ANALYSIS through the callback (the store resolves the
     # committed refs before executor.run), then replay: dedup to one row per key.
     fa = _make_manifest("FORMAT_ANALYSIS", job_id="ev-job")
     resolved = StageManifest.from_dict(fa.to_dict())
-    resolved.evidence_refs = store.committed_evidence_refs("ev-job", "FORMAT_ANALYSIS")
+    resolved.evidence_refs = store.canonical_evidence_refs(
+        _SOURCE_ID, universe, None, "FORMAT_ANALYSIS"
+    )
     key = resolved.idempotency_key()
     assert _stage_run_rows(umd_db, key) == 0  # not yet run
 
@@ -1797,3 +1815,266 @@ def test_tenant_selection_fails_closed_on_deleted_tenant(umd_db: sa.Engine) -> N
             _hatchet_module().discover_runnable_tenant(umd_db, schema=_TENANT_SCHEMA)
     finally:
         _drop_tenant_table(umd_db)
+
+
+# ---------------------------------------------------------------------------
+# P2-S8/S9/S11/S12 (Plan K amendment 2): native parent barriers, canonical
+# lineage selection, submission stability, and cross-job replay attribution.
+# ---------------------------------------------------------------------------
+
+
+def _feed_all_stages(
+    client: _RecordingClient,
+    *,
+    job_id: str,
+    universe: str,
+) -> None:
+    """Submit the full canonical graph through the runner, then feed every stage's
+    callback in STAGE_ORDER so the canonical graph commits through the real
+    executor. Used to model the native-barrier delivery ordering hermetically."""
+    from umd.jobs.runner import submit_workflow_runs
+
+    submit_workflow_runs(
+        client,
+        job_id=job_id,
+        source_id=_SOURCE_ID,
+        dag_universe=universe,
+        stages=list(STAGE_ORDER),
+    )
+    for stage in STAGE_ORDER:
+        manifest = _make_manifest(stage, job_id=job_id, dag_universe=universe)
+        rec = _invoke_callback(client, manifest)
+        assert rec["state"] == "complete", f"{stage} did not complete"
+
+
+def test_native_parent_barrier_submission_shape() -> None:
+    """P2-S8: ``submit_workflow_runs`` threads NATIVE parent-task relationships
+    derived EXCLUSIVELY from ``STAGE_DEPENDENCIES``. The root (INGEST) has no
+    parent; every dependent carries the run id of its most-descendant direct
+    dependency (whose transitive barrier covers all other direct deps). No
+    dependent is submitted with ``parents: {}`` and no polling/chaining schedules
+    work."""
+    from umd.jobs.hatchet import HatchetRunner
+
+    client = _RecordingClient()
+    runner = HatchetRunner(client=client)
+    runner.run_graph(
+        job_id="barrier-job",
+        source_id=_SOURCE_ID,
+        dag_universe="v1-dag:base",
+        work_registry={},
+        stages=list(STAGE_ORDER),
+    )
+    by_stage = {s["input"]["stage"]: s for s in client.submissions}
+    assert set(by_stage) == set(STAGE_ORDER), "one submission per canonical stage"
+    for stage in STAGE_ORDER:
+        sub = by_stage[stage]
+        deps = [d for d, _c in STAGE_DEPENDENCIES.get(stage, ())]
+        if deps:
+            parent_stage = max(deps, key=STAGE_ORDER.index)
+            assert sub["parent_id"] == by_stage[parent_stage]["run_id"], (
+                f"{stage} native parent must be its most-descendant direct dependency "
+                f"(got {sub['parent_id']!r}, expected {by_stage[parent_stage]['run_id']!r})"
+            )
+        else:
+            assert sub["parent_id"] is None, f"{stage} (root) must have no parent"
+
+
+def test_delayed_parent_barrier_no_dependent_before_upstream_commits(umd_db: sa.Engine) -> None:
+    """P2-S12(a): with an upstream held uncommitted, a dependent callback must NOT
+    begin any stage work or side effect — canonical evidence resolution FAILS
+    CLOSED (no stage_run row is created). Committing the upstream unblocks the
+    dependent. This is the local, honest model of the native parent barrier: the
+    real Hatchet scheduler holds the dependent until the parent run commits."""
+    from umd.jobs.hatchet import HatchetWorkerFactory
+    from umd.jobs.production import StageWorkRegistryFactory
+    from umd.storage.postgres.job_repository import (
+        MissingRequiredEvidenceError,
+        PostgresJobRepository,
+    )
+
+    _ensure_source(umd_db)
+    store = PostgresJobRepository(umd_db)
+    store.create(job_id="barrier-job", source_id=_SOURCE_ID, dag_universe="v1-dag:base")
+    registry = StageWorkRegistryFactory.build({"engine": umd_db})
+    executor, _ledger = _build_executor(umd_db)
+    client = _RecordingClient()
+    HatchetWorkerFactory.start(
+        runtime={"engine": umd_db},
+        work_registry=registry,
+        executor=executor,
+        client=client,
+        store=store,
+    )
+    universe = "v1-dag:base"
+    # Upstream INGEST is NOT committed yet: a dependent callback must fail closed
+    # BEFORE any side effect (no stage_run row for the observing job).
+    fa = _make_manifest("FORMAT_ANALYSIS", job_id="barrier-job", dag_universe=universe)
+    before = _stage_run_count_for_job(umd_db, "barrier-job")
+    with pytest.raises(MissingRequiredEvidenceError):
+        _invoke_callback(client, fa)
+    assert _stage_run_count_for_job(umd_db, "barrier-job") == before, (
+        "dependent began a side effect before the upstream committed"
+    )
+    # Commit the upstream (INGEST) -> the dependent now resolves its evidence and runs.
+    rec = _invoke_callback(
+        client, _make_manifest("INGEST", job_id="barrier-job", dag_universe=universe)
+    )
+    assert rec["state"] == "complete"
+    rec2 = _invoke_callback(
+        client, _make_manifest("FORMAT_ANALYSIS", job_id="barrier-job", dag_universe=universe)
+    )
+    assert rec2["state"] == "complete", "dependent did not unblock after upstream commit"
+
+
+def test_submission_stability_single_vs_immediate_duplicate(umd_db: sa.Engine) -> None:
+    """P2-S8/P2-S12(b): one submission and an immediate duplicate submission both
+    yield exactly one stable canonical manifest input per STAGE_ORDER stage and
+    exactly ``len(STAGE_ORDER)`` distinct idempotency keys total — the duplicate
+    dedups against the committed canonical keys (job-independent deduplication)."""
+    from umd.jobs.hatchet import HatchetWorkerFactory
+    from umd.jobs.production import StageWorkRegistryFactory
+    from umd.storage.postgres.job_repository import PostgresJobRepository
+
+    _ensure_source(umd_db)
+    store = PostgresJobRepository(umd_db)
+    store.create(job_id="stab-job", source_id=_SOURCE_ID, dag_universe="v1-dag:base")
+    registry = StageWorkRegistryFactory.build({"engine": umd_db})
+    executor, _ledger = _build_executor(umd_db)
+    client = _RecordingClient()
+    HatchetWorkerFactory.start(
+        runtime={"engine": umd_db},
+        work_registry=registry,
+        executor=executor,
+        client=client,
+        store=store,
+    )
+    universe = "v1-dag:base"
+    # Single submission commits the canonical graph: exactly one key per stage.
+    _feed_all_stages(client, job_id="stab-job", universe=universe)
+    assert _distinct_idempotency_keys(umd_db, "stab-job") == len(STAGE_ORDER)
+    assert _stage_run_count_for_job(umd_db, "stab-job") == len(STAGE_ORDER)
+    # Immediate duplicate submission: same stable canonical keys, no extra rows.
+    _feed_all_stages(client, job_id="stab-job", universe=universe)
+    assert _distinct_idempotency_keys(umd_db, "stab-job") == len(STAGE_ORDER)
+    assert _stage_run_count_for_job(umd_db, "stab-job") == len(STAGE_ORDER)
+
+
+def test_cross_job_replay_emits_replay_marked_observations(umd_db: sa.Engine) -> None:
+    """P2-S11/P2-S12(c): a second OBSERVING job replaying committed canonical work
+    produces exactly one deterministic replay-marked StageCompleted observation per
+    canonical stage (nine total), ZERO stage side effects after replay, no extra
+    canonical stage_run keys, callback-owned durable rows, and deterministic
+    attribution (re-delivery is a no-op)."""
+    from umd.jobs.hatchet import HatchetWorkerFactory
+    from umd.jobs.production import StageWorkRegistryFactory
+    from umd.storage.postgres.job_repository import PostgresJobRepository
+
+    _ensure_source(umd_db)
+    store = PostgresJobRepository(umd_db)
+    store.create(job_id="canon-job", source_id=_SOURCE_ID, dag_universe="v1-dag:base")
+    registry = StageWorkRegistryFactory.build({"engine": umd_db})
+    executor, _ledger = _build_executor(umd_db)
+    client = _RecordingClient()
+    HatchetWorkerFactory.start(
+        runtime={"engine": umd_db},
+        work_registry=registry,
+        executor=executor,
+        client=client,
+        store=store,
+    )
+    universe = "v1-dag:base"
+    # Canonical job commits the full graph -> nine canonical keys, nine canonical
+    # StageCompleted events.
+    _feed_all_stages(client, job_id="canon-job", universe=universe)
+    assert _distinct_idempotency_keys(umd_db, "canon-job") == len(STAGE_ORDER)
+    assert _stage_completed_for_job(umd_db, "canon-job") == len(STAGE_ORDER)
+
+    # Observing job (same canonical lineage, different job ownership) replays the
+    # committed work: no stage_run rows owned by it, no extra canonical keys.
+    _feed_all_stages(client, job_id="observe-job", universe=universe)
+    assert _stage_run_count_for_job(umd_db, "observe-job") == 0, (
+        "observing job created stage_run rows (stage side effects after replay)"
+    )
+    assert _stage_run_count_for_job(umd_db, "canon-job") == len(STAGE_ORDER)
+    # Exactly one replay-marked StageCompleted observation per canonical stage,
+    # attributed to the observing job, and none for the canonical job's replay.
+    assert _stage_completed_for_job(umd_db, "observe-job") == len(STAGE_ORDER)
+    assert _stage_completed_for_job(umd_db, "canon-job") == len(STAGE_ORDER)
+    with umd_db.connect() as conn:
+        replay_marked = int(
+            conn.execute(
+                sa.text(
+                    "SELECT count(*) FROM semantic_event WHERE event_type='StageCompleted' "
+                    "AND payload->>'job_id'=:j AND payload->'generated_by'->>'replayed'='true'"
+                ),
+                {"j": "observe-job"},
+            ).scalar()
+            or 0
+        )
+    assert replay_marked == len(STAGE_ORDER), "replay observations not replay-marked"
+    # Deterministic attribution: re-delivering the observing job adds nothing.
+    _feed_all_stages(client, job_id="observe-job", universe=universe)
+    assert _stage_completed_for_job(umd_db, "observe-job") == len(STAGE_ORDER)
+    assert _stage_run_count_for_job(umd_db, "observe-job") == 0
+
+
+def test_canonical_evidence_selection_deterministic_and_fail_closed(umd_db: sa.Engine) -> None:
+    """P2-S9 (focused): ``canonical_evidence_refs`` selects exactly ONE COMPLETE
+    upstream record per dependency edge by deterministic current-lineage ordering
+    (created_at DESC, idempotency-key tie-break), is independent of job ownership,
+    returns sorted refs, and FAILS CLOSED on missing or ambiguous required
+    evidence. Seeded directly at the seam so the selection query is proven in
+    isolation."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    from umd.storage.postgres.job_repository import (
+        AmbiguousRequiredEvidenceError,
+        MissingRequiredEvidenceError,
+        PostgresJobRepository,
+    )
+    from umd.storage.postgres.tables import metadata as _meta
+
+    _ensure_source(umd_db)
+    store = PostgresJobRepository(umd_db)
+    run_t = _meta.tables["stage_run"]
+    src = uuid.UUID(_SOURCE_ID)
+
+    def _seed_complete(*, evidence: list[str], created: str, job: str = "sel-job") -> None:
+        with umd_db.begin() as conn:
+            conn.execute(
+                pg_insert(run_t).values(
+                    id=uuid.uuid4().hex,
+                    idempotency_key=uuid.uuid4().hex,
+                    job_id=job,
+                    stage_name="INGEST",
+                    source_id=src,
+                    status="complete",
+                    input_manifest={"dag_universe": "v1-dag:base"},
+                    evidence_refs=evidence,
+                    created_at=created,
+                )
+            )
+
+    # (a) Two COMPLETE INGEST rows, different keys (a rerun), distinct created_at
+    # -> exactly ONE selected deterministically (the newest current-lineage row).
+    _seed_complete(evidence=["ref:old"], created="2026-01-01T00:00:00+00:00")
+    _seed_complete(evidence=["ref:new"], created="2026-06-01T00:00:00+00:00")
+    refs = store.canonical_evidence_refs(_SOURCE_ID, "v1-dag:base", None, "FORMAT_ANALYSIS")
+    assert refs == ["ref:new"], f"selection must pick the newest lineage row, got {refs}"
+    # Deterministic on repeat, and independent of which job owns the rows.
+    assert store.canonical_evidence_refs(_SOURCE_ID, "v1-dag:base", None, "FORMAT_ANALYSIS") == refs
+
+    # (b) INGEST (root) has no upstream -> [] (the explicit null/root case).
+    assert store.canonical_evidence_refs(_SOURCE_ID, "v1-dag:base", None, "INGEST") == []
+
+    # (c) A different dag universe has no COMPLETE INGEST -> fail closed (missing).
+    with pytest.raises(MissingRequiredEvidenceError):
+        store.canonical_evidence_refs(_SOURCE_ID, "v1-dag:other", None, "FORMAT_ANALYSIS")
+
+    # (d) Two COMPLETE rows tied at the same created_at (newest) -> ambiguous,
+    # fail closed rather than pick arbitrarily.
+    _seed_complete(evidence=["ref:a"], created="2026-06-02T00:00:00+00:00", job="amb-job")
+    _seed_complete(evidence=["ref:b"], created="2026-06-02T00:00:00+00:00", job="amb-job")
+    with pytest.raises(AmbiguousRequiredEvidenceError):
+        store.canonical_evidence_refs(_SOURCE_ID, "v1-dag:base", None, "FORMAT_ANALYSIS")

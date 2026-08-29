@@ -102,6 +102,12 @@ require_column v1_tasks_olap readable_status
 require_column v1_tasks_olap latest_worker_id
 require_column v1_tasks_olap tenant_id
 require_column Worker tenantId
+# P3-S3: v0.105.2 Worker has NO "status" column — isActive (and isPaused when
+# used) is the real schema. Requiring isActive is a FAIL-CLOSED schema check:
+# a missing isActive column must never silently pass (or silently use a
+# nonexistent "status"), it must fail naming the missing object.
+require_column Worker isActive
+require_column Worker isPaused
 require_column Workflow name
 require_column Workflow tenantId
 require_column WorkflowVersion workflowId
@@ -154,10 +160,18 @@ fi
 # Check 2: latest-version v1_task.is_durable=true for every canonical umd-<stage>
 #   AT-18 is a LATEST-VERSION check: per workflow name, the max-version row(s)
 #   must have is_durable=true. Stale historical versions can never satisfy it, so
-#   we keep only the max-version v1_task rows (MAX("WorkflowVersion"."version")
+#   we keep only the max-version v1_task rows (MAX of the version-ordering column
 #   per "Workflow"."name") and require bool_and(is_durable)=t with count>0 there.
+#
+#   NOTE (fix for run 33237228740): In Hatchet v0.105.2 the goose DDL stores the
+#   per-workflow version ordering in the "order" column (quoted); the "version"
+#   column is always NULL on durable registrations. Using wv."version" made
+#   MAX(...)=NULL and ver=maxver evaluate to NULL=NULL (never true), so the
+#   subquery returned zero rows and the gate false-failed. "order" is the correct
+#   discriminator: it is unique per workflow, so its max row is exactly the latest
+#   version, preserving AT-18's latest-version semantics.
 # ============================================================================
-DUR_OUT="$(psql -tAc "SELECT wf, bool_and(is_durable), count(*) FROM (SELECT w.\"name\" AS wf, wv.\"version\" AS ver, t.is_durable, MAX(wv.\"version\") OVER (PARTITION BY w.\"name\") AS maxver FROM v1_task t JOIN \"WorkflowVersion\" wv ON wv.\"id\" = t.workflow_version_id JOIN \"Workflow\" w ON w.\"id\" = wv.\"workflowId\" WHERE t.tenant_id = '$selected_tenant' AND w.\"name\" LIKE 'umd-%') sub WHERE sub.ver = sub.maxver GROUP BY sub.wf ORDER BY sub.wf")"
+DUR_OUT="$(psql -tAc "SELECT wf, bool_and(is_durable), count(*) FROM (SELECT w.\"name\" AS wf, wv.\"order\" AS ver, t.is_durable, MAX(wv.\"order\") OVER (PARTITION BY w.\"name\") AS maxver FROM v1_task t JOIN \"WorkflowVersion\" wv ON wv.\"id\" = t.workflow_version_id JOIN \"Workflow\" w ON w.\"id\" = wv.\"workflowId\" WHERE t.tenant_id = '$selected_tenant' AND w.\"name\" LIKE 'umd-%') sub WHERE sub.ver = sub.maxver GROUP BY sub.wf ORDER BY sub.wf")"
 printf '%s\n' "$DUR_OUT" > "$diag_dir/engine-visible-durability.txt"
 for stage in $UMD_STAGES; do
   wf="umd-$stage"
@@ -180,7 +194,8 @@ worker_count="$(psql -tAc "SELECT count(*) FROM \"$WORKER\" WHERE \"tenantId\" =
 runtime_rows="$(psql -tAc "SELECT count(*) FROM v1_task_runtime WHERE tenant_id = '$selected_tenant'" | tr -d '[:space:]')"
 {
   echo "registered Worker rows (tenant $selected_tenant): ${worker_count:-0}"
-  psql -tAc "SELECT \"id\", \"name\", \"tenantId\", \"status\" FROM \"$WORKER\" WHERE \"tenantId\" = '$selected_tenant'"
+  # P3-S3: v0.105.2 uses "isActive"/"isPaused" booleans, never "status".
+  psql -tAc "SELECT \"id\", \"name\", \"tenantId\", \"isActive\", \"isPaused\" FROM \"$WORKER\" WHERE \"tenantId\" = '$selected_tenant'"
   echo "v1_task_runtime rows (tenant $selected_tenant): ${runtime_rows:-0}"
 } > "$diag_dir/worker-assignment-runtime.txt"
 if [ "${worker_count:-0}" -le 0 ]; then
@@ -191,38 +206,67 @@ if [ "${runtime_rows:-0}" -le 0 ]; then
 fi
 
 # ============================================================================
-# Check 4: real callback-owned rows (created by the actual callback execution,
-#   never by seeding): stage_run rows, semantic_event event_type='StageCompleted',
-#   and job_run_audit operational-audit rows.
+# Check 4: REAL callback-owned rows scoped to the SELECTED TENANT's live
+#   submission set. NEVER global totals. The live job-ID set is derived from
+#   the engine-visible v1_task rows for the selected tenant (v1_task.input
+#   carries the UMD job_id), and every stage_run / job_run_audit /
+#   semantic_event must correlate through that set via its own job_id column /
+#   payload. A post-marker window guard (submission-marker.txt recorded by the
+#   workflow BEFORE the live suite) rejects any pre-existing row, and the
+#   pre-existing/mock `mock-job` StageCompleted (job_id not in the live set) is
+#   explicitly rejected. A global table total, a readiness line, a declaration
+#   probe, or an accepted submission alone is NEVER release proof.
 # ============================================================================
-stage_run_rows="$(psql -tAc "SELECT count(*) FROM stage_run" | tr -d '[:space:]')"
-completed_events="$(psql -tAc "SELECT count(*) FROM semantic_event WHERE event_type = 'StageCompleted'" | tr -d '[:space:]')"
-audit_rows="$(psql -tAc "SELECT count(*) FROM job_run_audit" | tr -d '[:space:]')"
+# Live job-ID set for the selected tenant = distinct UMD job_id carried in the
+# engine-visible v1_task.input submissions of THIS tenant (never a global scan).
+live_job_ids="$(psql -tAc "SELECT string_agg(DISTINCT quote_literal(input->>'job_id'), ',') FROM v1_task WHERE tenant_id = '$selected_tenant' AND input->>'job_id' IS NOT NULL" | tr -d '[:space:]')"
+if [ -z "$live_job_ids" ]; then
+  fail "no live UMD job_id found in the selected tenant's v1_task.input submissions; cannot scope callback-owned rows to the live submission set"
+fi
+# Post-marker window guard: the workflow records the DB timestamp BEFORE the
+# live suite runs; rows created before that marker are pre-existing and cannot
+# satisfy the gate.
+submission_marker="$(cat submission-marker.txt 2>/dev/null | tr -d '[:space:]' || true)"
+if [ -z "$submission_marker" ]; then
+  fail "submission-marker.txt missing (workflow must record the pre-live-suite DB timestamp before submission); cannot apply the post-marker window guard"
+fi
+# Scope every callback-owned class through the live job-ID set AND the window.
+stage_run_rows="$(psql -tAc "SELECT count(*) FROM stage_run WHERE job_id IN ($live_job_ids) AND created_at >= to_timestamp('$submission_marker', 'YYYY-MM-DD\"T\"HH24:MI:SS.US')" | tr -d '[:space:]')"
+completed_events="$(psql -tAc "SELECT count(*) FROM semantic_event WHERE event_type = 'StageCompleted' AND payload->>'job_id' IN ($live_job_ids) AND tx_time >= to_timestamp('$submission_marker', 'YYYY-MM-DD\"T\"HH24:MI:SS.US')" | tr -d '[:space:]')"
+audit_rows="$(psql -tAc "SELECT count(*) FROM job_run_audit WHERE job_id IN ($live_job_ids) AND created_at >= to_timestamp('$submission_marker', 'YYYY-MM-DD\"T\"HH24:MI:SS.US')" | tr -d '[:space:]')"
+# Explicitly reject the pre-existing/mock StageCompleted and any global-count
+# false positive: count how many StageCompleted rows fall OUTSIDE the live
+# tenant-scoped set (e.g. the mock `mock-job`) and confirm they are NOT what
+# satisfies the gate.
+mock_or_outside="$(psql -tAc "SELECT count(*) FROM semantic_event WHERE event_type = 'StageCompleted' AND NOT (payload->>'job_id' = ANY (SELECT input->>'job_id' FROM v1_task WHERE tenant_id = '$selected_tenant'))" | tr -d '[:space:]')"
 {
-  echo "stage_run rows: ${stage_run_rows:-0}"
-  echo "semantic_event event_type=StageCompleted: ${completed_events:-0}"
-  echo "job_run_audit rows: ${audit_rows:-0}"
-  echo "semantic_event event_type distribution:"
-  psql -tAc "SELECT event_type, count(*) FROM semantic_event GROUP BY event_type ORDER BY 1"
+  echo "submission_marker: $submission_marker"
+  echo "live_job_ids (scoped predicate): $live_job_ids"
+  echo "scoped stage_run rows (job_id IN live set, created_at >= marker): ${stage_run_rows:-0}"
+  echo "scoped semantic_event event_type=StageCompleted (payload job_id IN live set, tx_time >= marker): ${completed_events:-0}"
+  echo "scoped job_run_audit rows (job_id IN live set, created_at >= marker): ${audit_rows:-0}"
+  echo "StageCompleted rows OUTSIDE the live job-ID set (rejected, e.g. mock-job): ${mock_or_outside:-0}"
+  echo "semantic_event event_type distribution (scoped to live job set):"
+  psql -tAc "SELECT event_type, count(*) FROM semantic_event WHERE payload->>'job_id' IN ($live_job_ids) GROUP BY event_type ORDER BY 1"
 } > "$diag_dir/callback-owned-rows.txt"
 if [ "${stage_run_rows:-0}" -le 0 ]; then
-  fail "no stage_run rows; the durable callback never created stage-run evidence"
+  fail "no stage_run rows in the selected tenant's live submission set (job_id IN live set, post-marker); the durable callback never created stage-run evidence"
 fi
 if [ "${completed_events:-0}" -le 0 ]; then
-  fail "no semantic_event event_type='StageCompleted' rows; the durable callback never emitted StageCompleted"
+  fail "no semantic_event event_type='StageCompleted' rows in the selected tenant's live submission set (payload job_id IN live set, post-marker); the durable callback never emitted StageCompleted — a pre-existing/mock StageCompleted cannot satisfy this gate"
 fi
 if [ "${audit_rows:-0}" -le 0 ]; then
-  fail "no job_run_audit rows; the durable callback never wrote operational audit evidence"
+  fail "no job_run_audit rows in the selected tenant's live submission set (job_id IN live set, post-marker); the durable callback never wrote operational audit evidence"
 fi
 
 # ============================================================================
 # Check 5: identity agreement — worker == workflow == submitted-task == selected
 # ============================================================================
-worker_tenants="$(psql -tAc "SELECT DISTINCT \"tenantId\" FROM \"$WORKER\" WHERE \"status\" = 'ACTIVE'" | tr -d '[:space:]')"
+worker_tenants="$(psql -tAc "SELECT DISTINCT \"tenantId\" FROM \"$WORKER\" WHERE \"isActive\" = true AND \"isPaused\" = false" | tr -d '[:space:]')"
 workflow_tenants="$(psql -tAc "SELECT DISTINCT \"tenantId\" FROM \"$WORKFLOW\" WHERE \"name\" LIKE 'umd-%'" | tr -d '[:space:]')"
 task_tenants="$(psql -tAc "SELECT DISTINCT t.tenant_id FROM v1_task t JOIN \"WorkflowVersion\" wv ON wv.\"id\" = t.workflow_version_id JOIN \"Workflow\" w ON w.\"id\" = wv.\"workflowId\" WHERE t.tenant_id = '$selected_tenant' AND w.\"name\" LIKE 'umd-%'" | tr -d '[:space:]')"
 agree=1
-[ -z "$worker_tenants" ] && { echo "no ACTIVE worker tenant"; agree=0; }
+[ -z "$worker_tenants" ] && { echo "no isActive worker tenant"; agree=0; }
 [ -z "$workflow_tenants" ] && { echo "no umd-% workflow tenant"; agree=0; }
 [ -z "$task_tenants" ] && { echo "no submitted-task tenant"; agree=0; }
 # every distinct tenant must be the selected one (and non-empty)

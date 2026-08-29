@@ -8,6 +8,7 @@ stages and error live in the ``job`` table; per-stage observability derives from
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 import sqlalchemy as sa
@@ -23,6 +24,19 @@ _audit_t = db_meta.tables["job_run_audit"]
 
 #: PostgreSQL-dialect insert so ``on_conflict_do_nothing`` type-checks cleanly.
 pg_insert = sa.dialects.postgresql.insert
+
+
+class CanonicalEvidenceError(Exception):
+    """Base for deterministic canonical-evidence selection failures (P2-S9)."""
+
+
+class MissingRequiredEvidenceError(CanonicalEvidenceError):
+    """A required upstream stage has no COMPLETE record in the current lineage."""
+
+
+class AmbiguousRequiredEvidenceError(CanonicalEvidenceError):
+    """The current-lineage upstream record is not uniquely determinable."""
+
 
 #: Precedence for folding multiple ``stage_run`` rows of the same stage into ONE
 #: effective status. A superseded failed row (a stale failed attempt left behind
@@ -164,33 +178,92 @@ class PostgresJobRepository:
             for r in rows
         ]
 
-    def committed_evidence_refs(self, job_id: str, stage_name: str) -> list[str]:
-        """Union of ``evidence_refs`` from COMPLETE ``stage_run`` rows of the stage's
-        upstream dependency stages (``STAGE_DEPENDENCIES``); ``[]`` when there are
-        none or the stage has no upstream (e.g. ``INGEST``).
+    def canonical_evidence_refs(
+        self,
+        source_id: str | None,
+        dag_universe: str | None,
+        segment_id: str | None,
+        stage_name: str,
+    ) -> list[str]:
+        """Deterministically select ONE COMPLETE upstream record per dependency edge.
 
-        P3-S1 (Decision C): the worker callback resolves a stage's committed
-        upstream evidence refs from this so idempotency keys stay stable across
-        retries (same committed upstream -> same refs -> same key -> dedup on
-        replay). The ``evidence_refs`` column is a JSONB array; results are returned
-        in stable, deterministic order.
+        P2-S9: replaces the former job-scoped ``committed_evidence_refs`` timing-
+        dependent UNION (which raced when a dependent claimed before its upstream
+        committed, yielding multiple keys for one stage). The lookup is keyed
+        EXCLUSIVELY by the manifest's durable lineage identity — canonical source +
+        DAG universe + segment (explicit null/root case) + dependency edge — and is
+        therefore independent of ``job_id`` and of job ownership entirely.
+
+        For each upstream stage in ``STAGE_DEPENDENCIES`` exactly ONE COMPLETE
+        ``stage_run`` row is selected by deterministic current-lineage ordering
+        (``created_at`` DESC, idempotency-key tie-break), and its ``evidence_refs``
+        are returned sorted. ``[]`` is returned ONLY when the stage has no upstream
+        dependencies (e.g. ``INGEST`` — the null/root case).
+
+        FAILS CLOSED (never silently degrades to ``[]``):
+
+        * :class:`MissingRequiredEvidenceError` when a required upstream stage has
+          no COMPLETE record in this lineage — a structural violation (the native
+          parent barrier must have held the upstream committed before the dependent
+          resolves evidence).
+        * :class:`AmbiguousRequiredEvidenceError` when two COMPLETE records for the
+          same edge share the maximum ``created_at`` (a genuine same-timestamp race
+          residue the current-lineage ordering cannot disambiguate).
+
+        Selecting exactly one canonical upstream preserves evidence-sensitive
+        rekeying after InvalidationPlanner descendant reruns and DAG-universe
+        changes: a rerun descendant carries its lineage identity, selects the
+        current upstream row, and derives a fresh key deterministically.
         """
         upstream = [dep for dep, _cls in STAGE_DEPENDENCIES.get(stage_name, ())]
         if not upstream:
             return []
+        src = uuid.UUID(source_id) if source_id is not None else None
+        seg = uuid.UUID(segment_id) if segment_id is not None else None
+        # ``dag_universe`` may be null in the manifest (explicit null/root case):
+        # ``_to_run_manifest`` stores it verbatim into
+        # ``input_manifest['dag_universe']``, so a null universe is a JSON null and
+        # must be matched with ``IS NULL``, not ``== None``. A real lineage always
+        # carries a non-null universe (equality).
+        dag_universe_col = _run_t.c.input_manifest["dag_universe"].astext
+        dag_filter = (
+            dag_universe_col.is_(None) if dag_universe is None else dag_universe_col == dag_universe
+        )
+        merged: list[str] = []
         with self._engine.connect() as conn:
-            rows = conn.execute(
-                sa.select(_run_t.c.evidence_refs).where(
-                    (_run_t.c.job_id == job_id)
-                    & (_run_t.c.stage_name.in_(upstream))
-                    & (_run_t.c.status == "complete")
-                )
-            ).fetchall()
-        refs: set[str] = set()
-        for row in rows:
-            for ref in row.evidence_refs or []:
-                refs.add(str(ref))
-        return sorted(refs)
+            for dep in upstream:
+                rows = conn.execute(
+                    sa.select(_run_t.c.evidence_refs, _run_t.c.created_at)
+                    .where(
+                        sa.and_(
+                            _run_t.c.source_id.is_(None)
+                            if src is None
+                            else _run_t.c.source_id == src,
+                            dag_filter,
+                            _run_t.c.segment_id.is_(None)
+                            if seg is None
+                            else _run_t.c.segment_id == seg,
+                            _run_t.c.stage_name == dep,
+                            _run_t.c.status == "complete",
+                        )
+                    )
+                    .order_by(_run_t.c.created_at.desc(), _run_t.c.idempotency_key.desc())
+                    .limit(2)
+                ).fetchall()
+                if not rows:
+                    raise MissingRequiredEvidenceError(
+                        f"stage {stage_name} requires upstream {dep} but no COMPLETE "
+                        "record exists for the current lineage"
+                    )
+                if len(rows) == 2 and rows[0].created_at == rows[1].created_at:
+                    raise AmbiguousRequiredEvidenceError(
+                        f"stage {stage_name} upstream {dep} has two COMPLETE records "
+                        "tied at the current-lineage timestamp; cannot select uniquely"
+                    )
+                for ref in rows[0].evidence_refs or []:
+                    if ref and str(ref) not in merged:
+                        merged.append(str(ref))
+        return sorted(merged)
 
     def record_stage(self, _job_id: str, _state: StageState) -> None:
         # stage status is authoritative in the ``stage_run`` table written by the

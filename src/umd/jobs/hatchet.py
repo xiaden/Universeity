@@ -209,7 +209,9 @@ class HatchetWorkflowSpec:
         }
 
 
-def _real_submit_workflow_run(client: Any, workflow_name: str, input: dict[str, Any]) -> None:
+def _real_submit_workflow_run(
+    client: Any, workflow_name: str, input: dict[str, Any], parent_id: str | None = None
+) -> str | None:
     """Submit one one-shot workflow run through the real hatchet_sdk (1.38.1).
 
     The real SDK has no ``client.submit_workflow_run`` attribute (that is a shape
@@ -220,6 +222,14 @@ def _real_submit_workflow_run(client: Any, workflow_name: str, input: dict[str, 
     → ``RunsClient.admin_client()`` (public accessor, runs.py:150). ``input`` is
     carried verbatim by ``TriggerWorkflowRequest`` as a JSON-serialized string, so
     the run context dict is JSON-encoded here.
+
+    P2-S8: ``parent_id`` expresses the NATIVE parent-task relationship — mapped to
+    ``TriggerWorkflowOptions.parent_id`` (types/trigger.py) → ``TriggerWorkflowRequest.parent_id``,
+    which is what the server persists as ``parent_task_id``/``parent_task_external_id``
+    in ``v1_task``. A non-null ``parent_id`` queues this dependent until its parent
+    run COMMITS, which is the barrier that eliminates the ``parents: {}`` race. The
+    workflow run id returned by ``run_workflow`` (``WorkflowRunRef.workflow_run_id``)
+    is what the runner threads as the next stage's ``parent_id``.
     """
     runs = getattr(client, "runs", None)
     admin = getattr(runs, "admin_client", None) if runs is not None else None
@@ -228,7 +238,31 @@ def _real_submit_workflow_run(client: Any, workflow_name: str, input: dict[str, 
         raise HatchetNotConfiguredError(
             "real hatchet_sdk client has no runs.admin_client().run_workflow submission surface"
         )
-    run_workflow(workflow_name, json.dumps(input))
+    # Fail closed on the native barrier (P2-S8): the pinned SDK (1.38.1) MUST be
+    # able to express parent-task/DAG semantics via
+    # ``TriggerWorkflowOptions.parent_id`` -> ``TriggerWorkflowRequest`` (persisted
+    # as ``v1_task.parent_task_external_id``). If the type cannot be imported or has
+    # no ``parent_id`` field, we STOP as a blocker and raise rather than silently
+    # degrade to an independent task (which would reintroduce the ``parents: {}``
+    # race). The plan mandates: never silently submit without the barrier.
+    try:
+        from hatchet_sdk.types.trigger import TriggerWorkflowOptions as _TWOpt
+    except ImportError as exc:  # pragma: no cover - guard against a broken pin
+        raise HatchetNotConfiguredError(
+            "pinned hatchet_sdk cannot import TriggerWorkflowOptions — cannot express "
+            "the native parent graph; refusing to submit without the barrier (P2-S8)"
+        ) from exc
+    if "parent_id" not in getattr(_TWOpt, "model_fields", {}):
+        raise HatchetNotConfiguredError(
+            "pinned hatchet_sdk TriggerWorkflowOptions lacks parent_id — cannot "
+            "express the native parent graph; refusing to submit without the barrier (P2-S8)"
+        )
+    options = _TWOpt(parent_id=parent_id)
+    ref = run_workflow(workflow_name, json.dumps(input), options=options)
+    if ref is None:
+        return None
+    run_id = getattr(ref, "workflow_run_id", None)
+    return run_id if isinstance(run_id, str) else None
 
 
 class _SDKSubmissionShim:
@@ -244,8 +278,10 @@ class _SDKSubmissionShim:
     def __init__(self, client: Any) -> None:
         self._client = client
 
-    def submit_workflow_run(self, workflow_name: str, input: dict[str, Any]) -> None:
-        _real_submit_workflow_run(self._client, workflow_name, input)
+    def submit_workflow_run(
+        self, workflow_name: str, input: dict[str, Any], parent_id: str | None = None
+    ) -> str | None:
+        return _real_submit_workflow_run(self._client, workflow_name, input, parent_id)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._client, name)
@@ -337,14 +373,22 @@ def _make_handler(
                 return _flat_ack(manifest, state=STATUS_CANCELLED, replayed=True)
         if store is not None:
             # Deterministic resolution of committed upstream evidence refs before
-            # executor.run keeps idempotency keys stable across retries: the same
-            # committed upstream stages -> the same evidence_refs -> the same key
-            # -> dedup on replay (P3-S1, Manager Decision C). Skipped entirely when
-            # no store is bound (evidence_refs stay as submitted). A cancelled job
+            # executor.run keeps idempotency keys stable across retries and across
+            # jobs (P2-S9, Manager Decision C). The lookup is keyed EXCLUSIVELY by
+            # the manifest's durable lineage identity (canonical source + DAG
+            # universe + segment + dependency edge) — NOT by job ownership — and
+            # selects exactly one COMPLETE upstream record per edge, failing closed
+            # on missing/ambiguous required evidence. Skipped entirely when no
+            # store is bound (evidence_refs stay as submitted). A cancelled job
             # already returned early above with no work/row, so this only runs for
-            # stages that will actually execute.
-            manifest.evidence_refs = store.committed_evidence_refs(
-                manifest.job_id, manifest.stage_name
+            # stages that will actually execute. The selected lineage is present
+            # BEFORE ``DurableStageExecutor.run`` claims the key (executor remains
+            # claim-before-side-effect and the only stage completion authority).
+            manifest.evidence_refs = store.canonical_evidence_refs(
+                manifest.source_id,
+                manifest.dag_universe,
+                manifest.segment_id,
+                manifest.stage_name,
             )
         work = work_registry.get(manifest.stage_name)
         if work is None:
@@ -567,7 +611,10 @@ class _UnconfiguredClient:
     def __init__(self, reason: str) -> None:
         self._reason = reason
 
-    def submit_workflow_run(self, workflow_name: str, input: dict[str, Any]) -> None:
+    def submit_workflow_run(
+        self, workflow_name: str, input: dict[str, Any], parent_id: str | None = None
+    ) -> None:
+        del parent_id  # refused regardless of parent barrier
         raise HatchetNotConfiguredError(f"cannot submit {workflow_name!r}: {self._reason}")
 
 

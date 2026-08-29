@@ -81,7 +81,13 @@ class JobStore(Protocol):
 
     def record_stage(self, job_id: str, state: StageState) -> None: ...
 
-    def committed_evidence_refs(self, job_id: str, stage_name: str) -> list[str]: ...
+    def canonical_evidence_refs(
+        self,
+        source_id: str | None,
+        dag_universe: str | None,
+        segment_id: str | None,
+        stage_name: str,
+    ) -> list[str]: ...
 
 
 class InMemoryJobStore:
@@ -153,11 +159,17 @@ class InMemoryJobStore:
         self._stages[job_id] = [s for s in self._stages[job_id] if s.stage_name != state.stage_name]
         self._stages[job_id].append(state)
 
-    def committed_evidence_refs(self, job_id: str, stage_name: str) -> list[str]:
+    def canonical_evidence_refs(
+        self,
+        source_id: str | None,
+        dag_universe: str | None,
+        segment_id: str | None,
+        stage_name: str,
+    ) -> list[str]:
         """Documented no-op: the in-memory store keeps no durable ``stage_run`` rows
         with evidence_refs, so committed-upstream evidence resolution is impossible
-        here. Durable seam tests use the Postgres backend (P3-S1, Decision C)."""
-        del job_id, stage_name  # no-op: nothing to resolve without stage_run rows
+        here. Durable seam tests use the Postgres backend (P2-S9)."""
+        del source_id, dag_universe, segment_id, stage_name  # no-op: no stage_run rows
         return []
 
     def record_audit(self, job_id: str, record: Any) -> None:

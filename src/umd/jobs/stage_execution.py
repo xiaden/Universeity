@@ -226,7 +226,7 @@ class DurableStageExecutor:
             # never ran while the key was unclaimed, so this is safe.
             existing = self._existing_run(key)
             if existing == STATUS_COMPLETE:
-                return self._replayed_complete(claim)
+                return self._replayed_complete(claim, manifest)
             if existing in (STATUS_CANCELLED, STATUS_QUARANTINED):
                 return StageRunRecord(claim=claim, state=existing, replayed=True)
             # in-flight or failed -> resume below (re-claim is a no-op on the key).
@@ -396,13 +396,23 @@ class DurableStageExecutor:
                 sa.select(_run_t.c.status).where(_run_t.c.idempotency_key == key)
             ).scalar()
 
-    def _replayed_complete(self, claim: StageRunClaim) -> StageRunRecord:
+    def _replayed_complete(self, claim: StageRunClaim, manifest: StageManifest) -> StageRunRecord:
         """Return a replay of an already-complete run, carrying its committed refs.
 
         Read back the committed ``artifact_refs``/``evidence_refs`` from the
         complete ``stage_run`` row so the returned record's outcome retains the
         committed support chain (downstream threading / any consumer of
         ``record.outcome`` keeps it), instead of treating replayed output as empty.
+
+        P2-S11: when the complete canonical run was OWNED by a different job
+        (``claim.job_id != manifest.job_id`` — a cross-job replay of committed
+        work), a deterministic append-only replay-marked ``StageCompleted``
+        observation is emitted for ``(canonical stage-run key, observing job_id)``.
+        It references the canonical completion and persisted refs but NEVER updates
+        ``stage_run``, writes projections/artifacts/evidence, executes stage work,
+        or creates a second completion authority — it is attribution only. A
+        same-job duplicate (``claim.job_id == manifest.job_id``) emits NO observation
+        so the canonical single-completion invariant is preserved.
         """
         with self._engine.connect() as conn:
             row = conn.execute(
@@ -412,12 +422,58 @@ class DurableStageExecutor:
             ).first()
         artifact_refs = list(row.artifact_refs or []) if row is not None else []
         evidence_refs = list(row.evidence_refs or []) if row is not None else []
+        if claim.job_id != manifest.job_id:
+            self._emit_replay_observation(claim, manifest, artifact_refs, evidence_refs)
         return StageRunRecord(
             claim=claim,
             outcome=StageOutcome(artifact_refs=artifact_refs, evidence_refs=evidence_refs),
             state=STATUS_COMPLETE,
             replayed=True,
         )
+
+    def _emit_replay_observation(
+        self,
+        claim: StageRunClaim,
+        manifest: StageManifest,
+        artifact_refs: list[str],
+        evidence_refs: list[str],
+    ) -> None:
+        """Append one deterministic replay-marked completion observation (P2-S11).
+
+        Keyed by a deterministic attribution idempotency key derived from
+        ``(canonical stage-run key, observing job_id)``, so duplicate delivery is a
+        no-op (ledger idempotency dedup yields the existing seq). Appends through the
+        ledger path WITHOUT ``side_effects`` — it never updates ``stage_run`` and the
+        Tier-0 fold of ``StageCompleted`` writes no projection rows. The ``replayed``
+        marker and attribution identity live in ``generated_by`` (the StageCompleted
+        v1 schema allows an unrestricted object there; top-level keys are closed).
+        """
+        attribution_key = deterministic_uuid(
+            f"replay-obs:{claim.idempotency_key}:{manifest.job_id}"
+        )
+        marker = {
+            **manifest.tool_versions,
+            "idempotency_key": claim.idempotency_key,
+            "dag_universe": manifest.dag_universe,
+            "replayed": True,
+            "attribution_key": attribution_key,
+            "canonical_job_id": claim.job_id,
+            "observing_job_id": manifest.job_id,
+        }
+        event = SemanticEvent(
+            event_type="StageCompleted",
+            payload={
+                "source_id": manifest.source_id,
+                "stage": manifest.stage_name,
+                "status": STATUS_COMPLETE,
+                "artifact_refs": artifact_refs,
+                "evidence_refs": evidence_refs,
+                "generated_by": marker,
+                "job_id": manifest.job_id,
+            },
+            generated_by=marker,
+        )
+        self._ledger.append(events=[event], idempotency_key=attribution_key)
 
     def committed_prior_refs(self, job_id: str, up_to_stage: str | None = None) -> list[str]:
         """Committed artifact refs from COMPLETE ``stage_run`` rows for a job.

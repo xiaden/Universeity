@@ -20,7 +20,7 @@ from typing import Any, Protocol
 
 from umd.observability.metrics import METRICS
 
-from .dag import STAGE_DEPENDENTS, STAGE_ORDER
+from .dag import STAGE_DEPENDENCIES, STAGE_DEPENDENTS, STAGE_ORDER
 from .job import JobStatus, JobStore, StageState
 from .manifest import StageManifest
 from .stage_execution import (
@@ -217,6 +217,16 @@ def submit_workflow_runs(
     :class:`ProductionDAGRunner` (CONTRACTS.md:61).
     """
     events: list[StageRunEvent] = []
+    # Native parent-task barriers (P2-S8). Each stage's submission carries the run id
+    # of its LATEST direct dependency in the STAGE_DEPENDENCIES DAG as ``parent_id``,
+    # threading a topologically-ordered chain. Because the graph is transitively
+    # closed (STAGE_DEPENDENTS), the most-descendant direct dependency itself waits on
+    # every other direct dependency, so a single native parent edge gives a FULL
+    # barrier for multi-parent stages (e.g. ENTITY_RESOLUTION's two upstreams are
+    # transitively ordered). INGEST is the root (no deps) and is submitted with no
+    # parent. No dependent is ever submitted with ``parents: {}`` and no polling /
+    # chaining loop schedules work — this is a pure native Hatchet relationship.
+    run_ids: dict[str, str] = {}
     for stage in stages:
         workflow_name = f"umd-{stage.lower()}"
         # The serialized StageManifest is the durable correlation unit the worker
@@ -242,7 +252,12 @@ def submit_workflow_runs(
             # so the audit/stage_run records which invalidation drove this submit
             # (P3-S3).
             run_input["causation_id"] = rerun_causation
-        client.submit_workflow_run(workflow_name, input=run_input)
+        deps = [dep for dep, _cls in STAGE_DEPENDENCIES.get(stage, ())]
+        parent_stage = max(deps, key=STAGE_ORDER.index) if deps else None
+        parent_id = run_ids.get(parent_stage) if parent_stage is not None else None
+        run_id = client.submit_workflow_run(workflow_name, input=run_input, parent_id=parent_id)
+        if isinstance(run_id, str) and run_id:
+            run_ids[stage] = run_id
         events.append(StageRunEvent(stage, "queued"))
     # Passive observability (P3-S4): a queued submission per stage + the queue
     # depth for this job. No second scheduler/process loop — just honest gauges.
