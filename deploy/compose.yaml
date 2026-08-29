@@ -236,7 +236,7 @@ services:
     read_only: true
     security_opt:
       - no-new-privileges:true
-      - seccomp=deploy/security/sandbox-seccomp.json
+      - seccomp=security/sandbox-seccomp.json
     tmpfs:
       - /scratch
     cap_drop:
