@@ -262,11 +262,18 @@ jobs:
             exit 1
           fi
           # Tenant discovery: quickstart writes config BEFORE creating the tenant row, so
-          # poll for the row itself (bounded). psql errors are intentionally NOT silenced.
+          # poll for the row itself (bounded). The `tenants` table lives in a discovered,
+          # non-public schema (the default search_path "$user",public does not contain it),
+          # so resolve the schema via information_schema first, then read the id through it.
+          # psql errors are intentionally NOT silenced.
           TENANT_ID=""
           for i in $(seq 1 30); do
-            TENANT_ID="$(docker compose -f deploy/compose.yaml exec -T db psql -U umd -d umd -tAc \
-              'SELECT id::text FROM tenants ORDER BY created_at LIMIT 1' | tr -d '[:space:]')"
+            TS="$(docker compose -f deploy/compose.yaml exec -T db psql -U umd -d umd -tAc \
+              "SELECT table_schema FROM information_schema.tables WHERE table_name='tenants' ORDER BY 1 LIMIT 1" | tr -d '[:space:]')"
+            if [ -n "$TS" ]; then
+              TENANT_ID="$(docker compose -f deploy/compose.yaml exec -T db psql -U umd -d umd -tAc \
+                "SET search_path TO \"$TS\"; SELECT id::text FROM tenants ORDER BY created_at LIMIT 1" | tr -d '[:space:]')"
+            fi
             if [ -n "$TENANT_ID" ]; then
               break
             fi
