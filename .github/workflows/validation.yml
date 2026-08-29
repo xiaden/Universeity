@@ -312,9 +312,34 @@ jobs:
       # depends on the `worker` service registering with the engine for real.
       - name: Start complete split topology (full stack, unconditional)
         run: |
-          docker compose -f deploy/compose.yaml --profile sandbox up -d --build \
-            db api worker sandbox-runner \
-            hatchet-migrate hatchet-admin hatchet-engine hatchet-dashboard
+          # Bounded retry for a known TRANSIENT infra race on GitHub runners: the
+          # container network-namespace path is recycled between the daemon
+          # resolving it and binding it during concurrent container creation
+          # ("bind-mount /proc/<pid>/ns/net -> /var/run/docker/netns/...: no such
+          # file or directory"). Fail-closed is preserved: any non-transient
+          # failure aborts immediately, and exhaustion of attempts still fails.
+          compose_attempts=0
+          compose_up_ok=0
+          while [ "$compose_attempts" -lt 3 ]; do
+            compose_attempts=$((compose_attempts + 1))
+            if docker compose -f deploy/compose.yaml --profile sandbox up -d --build \
+                db api worker sandbox-runner \
+                hatchet-migrate hatchet-admin hatchet-engine hatchet-dashboard 2>&1 | tee /tmp/compose-up.log; then
+              compose_up_ok=1
+              break
+            fi
+            if grep -q "bind-mount /proc/" /tmp/compose-up.log; then
+              echo "transient Docker netns race detected (attempt $compose_attempts/3); retrying compose up" >&2
+              sleep 5
+            else
+              echo "compose up failed with a non-transient error; aborting" >&2
+              exit 1
+            fi
+          done
+          if [ "$compose_up_ok" -ne 1 ]; then
+            echo "compose up failed after $compose_attempts attempts; aborting" >&2
+            exit 1
+          fi
 
       - name: Wait for API readiness (/v1/ready)
         run: |
