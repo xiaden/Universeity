@@ -38,9 +38,18 @@ class StartupError(RuntimeError):
 
 
 def default_alembic_ini() -> Path:
-    """Repo-relative ``alembic.ini`` (override with ``UMD_ALEMBIC_INI``)."""
+    """Resolve ``alembic.ini``: ``UMD_ALEMBIC_INI`` env, then CWD, then
+    package-relative (override with ``UMD_ALEMBIC_INI``)."""
     env = os.environ.get("UMD_ALEMBIC_INI")
-    return Path(env) if env else Path(__file__).resolve().parents[2] / "alembic.ini"
+    if env:
+        return Path(env)
+    for candidate in (
+        Path.cwd() / "alembic.ini",
+        Path(__file__).resolve().parents[2] / "alembic.ini",
+    ):
+        if candidate.is_file():
+            return candidate
+    return Path(__file__).resolve().parents[2] / "alembic.ini"
 
 
 def run_migrations(dsn: str, alembic_ini: str | Path | None = None) -> str:
