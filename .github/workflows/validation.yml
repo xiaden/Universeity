@@ -350,7 +350,7 @@ jobs:
           for r_attempt in $(seq 1 5); do
             missing=""
             for svc in $required_running; do
-              cid="$(docker compose -f deploy/compose.yaml ps -q "$svc" 2>/dev/null)"
+              cid="$(docker compose -f deploy/compose.yaml ps -a -q "$svc" 2>/dev/null)"
               if [ -z "$cid" ]; then
                 missing="$missing $svc=absent"
                 continue
@@ -359,7 +359,7 @@ jobs:
               [ "$state" = "running" ] || missing="$missing $svc=$state"
             done
             for svc in $required_exited; do
-              cid="$(docker compose -f deploy/compose.yaml ps -q "$svc" 2>/dev/null)"
+              cid="$(docker compose -f deploy/compose.yaml ps -a -q "$svc" 2>/dev/null)"
               if [ -z "$cid" ]; then
                 missing="$missing $svc=absent"
                 continue
