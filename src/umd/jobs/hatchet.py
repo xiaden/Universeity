@@ -24,7 +24,6 @@ differ numerically.
 
 from __future__ import annotations
 
-import contextlib
 import importlib.util
 import json
 import os
@@ -33,8 +32,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic import BaseModel
+
 from umd.observability.metrics import METRICS
-from umd.storage.postgres.stage_repository import StageRunClaim
 
 from .dag import STAGE_DEPENDENCIES, STAGE_ORDER
 from .job import JobStatus, JobStore
@@ -85,6 +85,95 @@ class ConfigurationError(ValueError):
     An absent stage in the production registry is a configuration failure, never a
     silent (or fake) successful completion.
     """
+
+
+class TenantSelectionError(RuntimeError):
+    """No unique scheduler-eligible Hatchet tenant could be selected.
+
+    Raised before any JWT is minted or any live submission is made: the release
+    gate requires exactly ONE non-deleted tenant with non-null
+    ``schedulerPartitionId`` AND ``workerPartitionId``. Zero, multiple, deleted,
+    or null-partition candidates all fail closed (never silently pick a tenant).
+    """
+
+
+def discover_runnable_tenant(
+    engine: Any, *, schema: str = "public", table: str = "Tenant"
+) -> dict[str, Any]:
+    """Discover exactly ONE non-deleted, scheduler-eligible Hatchet tenant.
+
+    Product-side selection (the CI-side SQL probe remains owned by P3-S3): query
+    the Hatchet ``Tenant`` table with quoted identifiers and fail closed unless
+    exactly one candidate is non-deleted AND has non-null
+    ``schedulerPartitionId`` AND ``workerPartitionId``. The caller must record the
+    selected tenant id + both partition ids and assert identity agreement
+    (JWT == worker == workflow == submitted-task == assignment tenant) before
+    executing any live work.
+    """
+    import sqlalchemy as sa
+
+    # Schema-qualified identifier-quoted table (sidesteps any ``search_path``
+    # shadowing; schema/table are internal constants). Using ``sa.table`` avoids
+    # raw SQL string interpolation entirely.
+    t = sa.table(
+        table,
+        sa.column("id"),
+        sa.column("slug"),
+        sa.column("schedulerPartitionId"),
+        sa.column("workerPartitionId"),
+        sa.column("deletedAt"),
+        schema=schema,
+    )
+    stmt = sa.select(
+        t.c.id, t.c.slug, t.c.schedulerPartitionId, t.c.workerPartitionId, t.c.deletedAt
+    )
+    # Bound the connection to a ``with`` block so it is deterministically closed /
+    # rolled back after the read. A leaked open connection leaves an ACCESS SHARE
+    # lock on the ``Tenant`` table, which blocks the test teardown's
+    # ``DROP TABLE IF EXISTS`` (needs ACCESS EXCLUSIVE) forever in the psycopg
+    # wait state (hosted hang root cause).
+    with engine.connect() as conn:
+        rows = conn.execute(stmt).fetchall()
+    eligible = [
+        r
+        for r in rows
+        if r.deletedAt is None
+        and r.schedulerPartitionId is not None
+        and r.workerPartitionId is not None
+    ]
+    if len(eligible) != 1:
+        raise TenantSelectionError(
+            f"expected exactly one non-deleted scheduler-eligible Hatchet tenant "
+            f"(non-null schedulerPartitionId AND workerPartitionId); found "
+            f"{len(eligible)} eligible of {len(rows)} total"
+        )
+    row = eligible[0]
+    return {
+        "id": str(row.id),
+        "slug": row.slug,
+        "scheduler_partition_id": row.schedulerPartitionId,
+        "worker_partition_id": row.workerPartitionId,
+    }
+
+
+class UmdStageInput(BaseModel):
+    """Direct v1 callback input boundary (amendment A2').
+
+    The pinned ``hatchet_sdk==1.38.1`` invokes task callbacks as
+    ``fn(workflow_input, ctx)`` where ``workflow_input`` is the value validated by
+    the registered ``input_validator``. The submission shape is a direct dict with
+    a top-level ``manifest`` (no v0 ``{"input": ...}`` wrapper), so this typed
+    model is registered as the validator and the callback reads ``input.manifest``.
+    ``source_id``/``causation_id`` are optional because one-shot submissions may
+    omit them (rerun causation is carried only for selective reruns).
+    """
+
+    job_id: str
+    source_id: str | None = None
+    dag_universe: str | None = None
+    stage: str
+    manifest: dict[str, Any]
+    causation_id: str | None = None
 
 
 #: The stable (non-pinned) description of the runner contract Hatchet must satisfy.
@@ -226,8 +315,14 @@ def _make_handler(
     and failure metrics with correlation/job/source/stage labels (P3-S4).
     """
 
-    def handler(payload: Any) -> Any:
-        manifest = StageManifest.from_dict(payload["input"]["manifest"])
+    def handler(input: Any, ctx: Any) -> dict[str, Any]:
+        # The callback receives the validated direct v1 input (A2'): a
+        # ``UmdStageInput`` whose ``manifest`` is the serialized StageManifest.
+        # ``ctx`` is the scheduler context; stage work is owned entirely by the
+        # executor, so the callback does not need it beyond arity (SDK 1.38.1
+        # always passes both arguments).
+        del ctx
+        manifest = StageManifest.from_dict(input.manifest)
         if store is not None:
             job = store.get(manifest.job_id)
             if job is not None and (
@@ -239,11 +334,7 @@ def _make_handler(
                     description="stage callbacks skipped because the job was cancelled",
                     labels=_stage_labels(manifest),
                 ).inc()
-                return StageRunRecord(
-                    claim=_noop_claim(manifest),
-                    state=STATUS_CANCELLED,
-                    replayed=True,
-                )
+                return _flat_ack(manifest, state=STATUS_CANCELLED, replayed=True)
         if store is not None:
             # Deterministic resolution of committed upstream evidence refs before
             # executor.run keeps idempotency keys stable across retries: the same
@@ -282,19 +373,42 @@ def _make_handler(
                 description="failed/quarantined stage executions",
                 labels=_stage_labels(manifest),
             ).inc()
-        return record
+        # Return only a flat JSON-safe acknowledgement — never the StageRunRecord
+        # and never a fabricated completion. The authoritative ``stage_run``,
+        # ``StageCompleted``, and audit rows live in the durable store; the
+        # acknowledgement lets Hatchet record that the callback handled the run.
+        return _flat_ack(manifest, record=record)
 
     return handler
 
 
-def _noop_claim(manifest: StageManifest) -> StageRunClaim:
-    """A losing claim for a cancelled-before-execution callback (no row written)."""
-    return StageRunClaim(
-        status="already_exists",
-        idempotency_key=manifest.idempotency_key(),
-        stage_name=manifest.stage_name,
-        job_id=manifest.job_id,
-    )
+def _flat_ack(
+    manifest: StageManifest,
+    *,
+    state: str | None = None,
+    replayed: bool = False,
+    record: StageRunRecord | None = None,
+) -> dict[str, Any]:
+    """A flat JSON-safe callback acknowledgement derived from the executor result.
+
+    Only scalar, JSON-serializable fields are returned. ``record`` is preferred
+    when present; otherwise ``state``/``replayed`` are taken from the arguments
+    (used for the cancellation-before-work path, which has no executor record).
+    """
+    if record is not None:
+        state = record.state
+        replayed = record.replayed
+    return {
+        "ack": "umd-stage-executed",
+        "state": state,
+        "replayed": replayed,
+        "attempts": record.attempts if record is not None else 0,
+        "completion_seq": record.completion_seq if record is not None else None,
+        "stage": manifest.stage_name,
+        "job_id": manifest.job_id,
+        "source_id": str(manifest.source_id or ""),
+        "dag_universe": manifest.dag_universe,
+    }
 
 
 def _stage_labels(manifest: StageManifest) -> dict[str, str]:
@@ -389,61 +503,52 @@ class HatchetWorkerFactory:
     ) -> WorkerHandle:
         del runtime  # consumed by the production registry via work_registry (Plan G)
         callbacks_bound = bool(work_registry) and executor is not None
-        dict_client = isinstance(getattr(client, "workflows", None), dict)
-        #: SDK workflow/task objects returned by the real-client decorator surface,
+        # Durable-only registration (AT-18): every canonical stage registers
+        # EXCLUSIVELY through ``client.durable_task``. A missing surface is a hard
+        # ConfigurationError — there is NO ``task``/``workflow`` fallback, retry
+        # loop, or ``contextlib.suppress(Exception)`` around registration.
+        durable_task = getattr(client, "durable_task", None)
+        if not callable(durable_task):
+            raise ConfigurationError(
+                "client has no 'durable_task' registration surface; every canonical "
+                "umd-<stage> must register exclusively via client.durable_task(...) "
+                "(no task/workflow fallback)"
+            )
+        #: SDK Standalone/workflow objects returned by the durable_task decorator,
         #: collected so ``cli.worker()`` can pass them to ``client.worker(workflows=...)``.
         registered_workflows: list[Any] = []
         for spec in build_hatchet_workflows():
             wf_name = f"umd-{spec.stage.lower()}"
-            if dict_client:
-                # Recording/double client: register the workflow spec directly.
-                client.workflows[wf_name] = {
-                    "name": wf_name,
-                    "depends_on": list(spec.depends_on),
-                }
-                if callbacks_bound:
-                    handler = _make_handler(work_registry, executor, store=store)
-                    client.callbacks[wf_name] = handler
-                    # Same handle shape as the real-SDK branch: expose the binding.
-                    registered_workflows.append(handler)
-                continue
-            # Real SDK client: register through the decorator surface. Registration
-            # is DEFERRED (it takes effect when a worker loop starts, owned by
-            # cli.worker(), not here), so it must never raise merely because the
-            # decorator did not take effect yet — the caller's readiness gate
-            # (is_ready) already reflects whether real callbacks are actually bound.
-            if not callbacks_bound:
-                continue
-            decorator = getattr(client, "task", None) or getattr(client, "workflow", None)
-            if decorator is not None:
-                # SDK 1.38.1: ``name`` is KEYWORD-ONLY (``def task(self, *, name=...)`` /
-                # ``def workflow(self, *, name: str, ...)``), so pass it by keyword.
-                # The decorator RETURNS the ``Standalone``/``Workflow`` object — that
-                # is what a Worker registers, so capture it instead of discarding it.
-                # Swallow deferred-registration failures so registering never raises
-                # merely because the registration will take effect when a worker loop
-                # starts (owned by cli.worker(), not here).
-                with contextlib.suppress(Exception):
-                    workflow_obj = decorator(name=wf_name)(
-                        _make_handler(work_registry, executor, store=store)
-                    )
-                    if workflow_obj is not None:
-                        registered_workflows.append(workflow_obj)
+            handler = _make_handler(work_registry, executor, store=store)
+            # SDK 1.38.1: ``name``/``input_validator`` are KEYWORD-ONLY. A decorator
+            # failure must SURFACE (it aborts startup) — never suppressed or retried.
+            workflow_obj = durable_task(
+                name=wf_name,
+                input_validator=UmdStageInput,
+                eviction_policy=None,
+            )(handler)
+            if workflow_obj is not None:
+                registered_workflows.append(workflow_obj)
 
         # The CALLER owns the single worker-loop start (P2-S3): start() registers
         # the workflows/tasks and returns a handle; cli.worker() starts the SDK
         # worker loop itself. HatchetWorkerFactory.start must NOT call client.start()
-        # so the not-ready path (zero bound executors) never starts a worker loop.
+        # so the not-ready path never starts a worker loop.
         #
         # Submission duck-typing: the recording double exposes submit_workflow_run,
         # so it is used as-is (byte-identical). A real SDK client does not have it;
         # wrap it so the shared submit_workflow_runs path maps to the SDK's
         # admin.run_workflow one-shot API.
+        dict_client = isinstance(getattr(client, "workflows", None), dict)
         submission_client = client if dict_client else _SDKSubmissionShim(client)
+        # Readiness is truthful: true ONLY after complete non-empty actual
+        # registration of every canonical stage AND a real executor is bound.
+        # Zero or partial registration can never make is_ready() true.
+        ready = callbacks_bound and len(registered_workflows) == len(STAGE_ORDER)
         return WorkerHandle(
             _client=submission_client,
             _stages=list(STAGE_ORDER),
-            _ready=callbacks_bound,
+            _ready=ready,
             registered_workflows=registered_workflows,
         )
 
@@ -479,7 +584,7 @@ def build_hatchet_client(settings: Any = None) -> Any:
     del settings  # client config is env-driven today (UMD_HATCHET_*); kept for parity
     if importlib.util.find_spec("hatchet_sdk") is None:
         return _UnconfiguredClient("hatchet_sdk not installed")
-    import hatchet_sdk as sdk  # type: ignore[import-not-found]
+    import hatchet_sdk as sdk
 
     server_url = os.environ.get("UMD_HATCHET_SERVER_URL")
     token = os.environ.get("UMD_HATCHET_TOKEN")
@@ -544,6 +649,9 @@ __all__ = [
     "HatchetWorkerFactory",
     "WorkerHandle",
     "ConfigurationError",
+    "TenantSelectionError",
+    "discover_runnable_tenant",
+    "UmdStageInput",
     "build_hatchet_workflows",
     "worker_ready_line",
     "HATCHET_RUNNER_CONTRACT",

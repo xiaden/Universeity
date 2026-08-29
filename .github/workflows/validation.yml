@@ -245,62 +245,19 @@ jobs:
       # containers are created (they read UMD_HATCHET_TOKEN at container creation
       # time). The umd-ci-token placeholder is never used — it is not a JWT and can
       # never register a worker.
-      - name: Start config generation (db migrate admin) and mint real tenant JWT
+      # P3-S2: bring up the config-generation half first (db + migrate + admin) so
+      # hatchet-admin's quickstart populates the shared /hatchet/config, then select
+      # EXACTLY ONE non-deleted scheduler-eligible tenant (non-null
+      # "schedulerPartitionId" AND "workerPartitionId") and mint a REAL tenant JWT from
+      # the generated config BEFORE the worker/api containers are created (they read
+      # UMD_HATCHET_TOKEN at container creation time). mint-tenant-jwt.sh fails closed on
+      # zero / multiple / deleted / null-partition candidates (never the null-partition
+      # internal tenant), asserts the JWT tenant claim equals the selected tenant, records
+      # the identity agreement to tenant-identity.txt, and exports the token to GITHUB_ENV.
+      - name: Start config generation (db migrate admin) and mint real tenant JWT (partition-eligible selection)
         run: |
           set -eux
-          docker compose -f deploy/compose.yaml up -d db hatchet-migrate hatchet-admin
-          ok=""
-          for i in $(seq 1 60); do
-            if docker compose -f deploy/compose.yaml run --rm --no-deps hatchet-admin \
-                sh -c 'test -n "$(ls -A /hatchet/config 2>/dev/null)"' 2>/dev/null; then
-              ok=1; break
-            fi
-            sleep 5
-          done
-          if [ -z "$ok" ]; then
-            echo "hatchet-admin did not generate /hatchet/config within timeout" >&2
-            exit 1
-          fi
-          # Tenant discovery: quickstart writes config BEFORE creating the tenant row, so
-          # poll for the row itself (bounded 30x2s). The Hatchet goose migrations create
-          # MIXED-CASE quoted tables in the public schema (CREATE TABLE public."Tenant")
-          # with a lowercase, unquoted `id` uuid and a quoted camelCase "createdAt"
-          # timestamp. We therefore:
-          #   * discover the table case-insensitively via lower(table_name) = 'tenant'
-          #     (never the literal `tenants` or a case-sensitive `Tenant`), resolving BOTH
-          #     schema and table (split on '|'), then
-          #   * read the id through the discovered schema + the EXACT-CASED quoted table,
-          #     ordering by the quoted "createdAt" column.
-          # Maintenance: the mixed-case goose schema must not regress to `tenants`/
-          # `created_at`. Facts: schema = public / table = "Tenant" / timestamp = "createdAt".
-          # psql errors are intentionally NOT silenced (no 2>/dev/null on either call).
-          TENANT_ID=""
-          for i in $(seq 1 30); do
-            TS="$(docker compose -f deploy/compose.yaml exec -T db psql -U umd -d umd -tAc \
-              "SELECT table_schema, table_name FROM information_schema.tables WHERE lower(table_name) = 'tenant' ORDER BY 1 LIMIT 1" | tr -d '[:space:]')"
-            if [ -n "$TS" ]; then
-              S="${TS%%|*}"
-              T="${TS#*|}"
-              TENANT_ID="$(docker compose -f deploy/compose.yaml exec -T db psql -U umd -d umd -tAc \
-                "SELECT id::text FROM \"$S\".\"$T\" ORDER BY \"createdAt\" LIMIT 1" | tr -d '[:space:]')"
-            fi
-            if [ -n "$TENANT_ID" ]; then
-              break
-            fi
-            sleep 2
-          done
-          if [ -z "$TENANT_ID" ]; then
-            echo "could not discover a Hatchet tenant id after polling; cannot mint a real JWT" >&2
-            exit 1
-          fi
-          TOKEN="$(docker compose -f deploy/compose.yaml run --rm --no-deps hatchet-admin \
-            /hatchet/hatchet-admin token create --config /hatchet/config --tenant-id "$TENANT_ID")"
-          if [ -z "$TOKEN" ]; then
-            echo "token minting produced no JWT" >&2
-            exit 1
-          fi
-          echo "HATCHET_TENANT_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-          echo "UMD_HATCHET_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          bash .github/scripts/mint-tenant-jwt.sh deploy/compose.yaml
           # Host-facing surfaces for the host-run live suite: gRPC routes to the
           # engine (published 7070); server URL = published dashboard (8081).
           echo "UMD_HATCHET_SERVER_URL=http://127.0.0.1:${HATCHET_DASHBOARD_PORT:-8081}" >> "$GITHUB_ENV"
@@ -490,10 +447,23 @@ jobs:
           echo "PASS" > public-boundary-after-restart-gate.txt
           echo "public-boundary-after-restart-gate: PASS"
 
+      # P3-S3: engine-visible, assignment/runtime, and callback-owned diagnostics.
+      # Runs AFTER all live + boundary submissions against the shared `umd` Postgres.
+      # if: always() so the evidence is captured even when the live suite partially
+      # fails, while engine-visible-proof.sh still FAILS CLOSED on the underlying
+      # failure (writes engine-visible-proof.txt FAIL and exits non-zero) — a
+      # readiness line / accepted submission / local registration alone is NEVER
+      # release proof. Captured rows go into diag-final/ before teardown.
+      - name: Engine-visible assignment/runtime/callback proof (always, fail-closed)
+        if: always()
+        run: |
+          bash .github/scripts/engine-visible-proof.sh deploy/compose.yaml diag-final
+
       # P3-S3: the always-running aggregate live-worker release gate. Runs under
       # if: always() so a live-path failure OR a live-path skip fails the job
       # explicitly, even if a prior step already failed. Fails closed: no PASS
-      # verdict recorded = FAIL.
+      # verdict recorded = FAIL. Includes the engine-visible proof verdict and the
+      # tenant identity agreement record.
       - name: Aggregate live-worker release gate (always, fail-closed)
         if: always()
         run: |
@@ -503,8 +473,17 @@ jobs:
           echo "public-boundary-gate: $bstatus"
           rstatus="$(cat public-boundary-after-restart-gate.txt 2>/dev/null || echo FAIL)"
           echo "public-boundary-after-restart-gate: $rstatus"
-          if [ "$status" != "PASS" ] || [ "$bstatus" != "PASS" ] || [ "$rstatus" != "PASS" ]; then
-            echo "aggregate gate: live-worker or public-boundary validation did not PASS (live=$status boundary=$bstatus after-restart=$rstatus)" >&2
+          estatus="$(cat engine-visible-proof.txt 2>/dev/null || echo FAIL)"
+          echo "engine-visible-proof: $estatus"
+          itenant="$(sed -n 's/^tenant_id: //p' tenant-identity.txt 2>/dev/null | tr -d '[:space:]')"
+          if [ -z "$itenant" ]; then
+            echo "tenant-identity: FAIL (no tenant_id recorded)"
+            itenant="FAIL"
+          else
+            echo "tenant-identity: OK ($itenant)"
+          fi
+          if [ "$status" != "PASS" ] || [ "$bstatus" != "PASS" ] || [ "$rstatus" != "PASS" ] || [ "$estatus" != "PASS" ] || [ "$itenant" = "FAIL" ]; then
+            echo "aggregate gate: live-worker, public-boundary, engine-visible, or tenant-identity validation did not PASS (live=$status boundary=$bstatus after-restart=$rstatus engine=$estatus tenant=$itenant)" >&2
             exit 1
           fi
 
@@ -535,6 +514,8 @@ jobs:
             live-worker-gate.txt
             public-boundary-gate.txt
             public-boundary-after-restart-gate.txt
+            engine-visible-proof.txt
+            tenant-identity.txt
             image-digests.txt
           if-no-files-found: warn
 

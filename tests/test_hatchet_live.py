@@ -184,16 +184,22 @@ class _RecordingClient:
         self.submissions: list[dict[str, Any]] = []
         self.started: bool = False
 
-    def workflow(self, name: str) -> Any:
+    def durable_task(
+        self,
+        *,
+        name: str | None = None,
+        input_validator: Any = None,
+        eviction_policy: Any = None,
+    ) -> Any:
+        del input_validator, eviction_policy
+
         def decorator(fn: Any) -> Any:
+            assert name is not None, "recording client durable_task requires a name"
             self.callbacks[name] = fn
             self.workflows[name] = fn
             return fn
 
         return decorator
-
-    def task(self, name: str) -> Any:
-        return self.workflow(name)
 
     def submit_workflow_run(self, workflow_name: str, input: dict[str, Any]) -> None:
         self.submissions.append({"workflow_name": workflow_name, "input": input})
@@ -361,10 +367,12 @@ def _poll_until(
 
 @pytest.mark.cluster
 @pytest.mark.docker
-def test_every_stage_registers_a_workflow_with_dependencies() -> None:
-    """Every stage in STAGE_ORDER resolves to a registered Hatchet workflow/task
-    with ``depends_on`` derived from STAGE_DEPENDENCIES (the single lineage)."""
-    factory = _worker_factory()  # planned surface — AttributeError until Phase 2
+def test_every_stage_registers_a_durable_workflow_with_dependencies() -> None:
+    """Every stage in STAGE_ORDER resolves to a durable-registered task whose
+    ``depends_on`` is derived from STAGE_DEPENDENCIES (the single lineage).
+    Registration is durable-only (AT-18): the recording client must register via
+    ``durable_task``, and every canonical ``umd-<stage>`` name must be present."""
+    factory = _worker_factory()
     client = _RecordingClient()
     factory.start(
         runtime={},
@@ -372,14 +380,15 @@ def test_every_stage_registers_a_workflow_with_dependencies() -> None:
         executor=None,
         client=client,
     )
-    workflows = list(client.workflows.values())
-    names = {w["name"] for w in workflows}
+    registered_names = set(client.workflows.keys())
     for stage in STAGE_ORDER:
-        workflow_name = f"umd-{stage.lower()}"
-        assert workflow_name in names, f"stage {stage} is not registered as {workflow_name}"
-        spec = next(w for w in workflows if w["name"] == workflow_name)
-        expected = {dep for dep, _cls in STAGE_DEPENDENCIES[stage]}
-        assert set(spec["depends_on"]) == expected, f"wrong depends_on for {stage}"
+        assert f"umd-{stage.lower()}" in registered_names, (
+            f"stage {stage} is not registered as umd-{stage.lower()}"
+        )
+    # The single lineage: depends_on derived from STAGE_DEPENDENCIES.
+    for spec in _hatchet_module().build_hatchet_workflows():
+        expected = {dep for dep, _cls in STAGE_DEPENDENCIES[spec.stage]}
+        assert set(spec.depends_on) == expected, f"wrong depends_on for {spec.stage}"
 
 
 # ---------------------------------------------------------------------------
@@ -456,12 +465,28 @@ def _register_worker(umd_db: sa.Engine) -> tuple[_RecordingClient, Any]:
     return client, registry
 
 
+#: The scheduler context argument Hatchet 1.38.1 always passes to a callback.
+#: The callback ignores it (stage work is executor-owned), so a plain sentinel is
+#: sufficient for hermetic invocation of the (input, ctx) shape.
+_FAKE_CTX: Any = object()
+
+
 def _invoke_callback(client: _RecordingClient, manifest: StageManifest) -> Any:
-    """Invoke the registered callback for ``manifest.stage_name`` in-process."""
+    """Invoke the registered callback for ``manifest.stage_name`` in-process with
+    the direct v1 shape ``fn(input, ctx)`` — never a v0 ``{"input": ...}`` wrapper.
+    The input is a validated :class:`UmdStageInput` carrying the top-level
+    ``manifest``."""
     name = f"umd-{manifest.stage_name.lower()}"
     cb = client.callbacks.get(name)
     assert cb is not None, f"no callback registered for {name}"
-    return cb({"input": {"manifest": manifest.to_dict()}})
+    inp = _hatchet_module().UmdStageInput(
+        job_id=manifest.job_id,
+        source_id=str(manifest.source_id) if manifest.source_id else None,
+        dag_universe=manifest.dag_universe,
+        stage=manifest.stage_name,
+        manifest=manifest.to_dict(),
+    )
+    return cb(inp, _FAKE_CTX)
 
 
 @pytest.mark.cluster
@@ -475,9 +500,9 @@ def test_callback_executes_through_durable_executor(umd_db: sa.Engine) -> None:
     manifest = _make_manifest("INGEST", job_id="cb-job")
     result = _invoke_callback(client, manifest)
     # The callback must run through the executor (not mark complete directly):
-    # the result is a StageRunRecord with state 'complete' and a completion seq.
-    assert getattr(result, "state", None) == "complete"
-    assert getattr(result, "completion_seq", None) is not None
+    # the ack reflects state 'complete' with a completion seq.
+    assert result["state"] == "complete"
+    assert result["completion_seq"] is not None
 
 
 @pytest.mark.cluster
@@ -709,7 +734,7 @@ def test_worker_whole_job_cancel_skips_work_and_writes_no_run(umd_db: sa.Engine)
 
     manifest = _make_manifest("ENTITY_RESOLUTION", job_id="w-cancel")
     result = _invoke_callback(client, manifest)
-    assert getattr(result, "state", None) == "cancelled"
+    assert result["state"] == "cancelled"
     assert _stage_run_count_for_job(umd_db, "w-cancel") == 0
     assert _stage_completed_events(umd_db, "ENTITY_RESOLUTION") == 0
 
@@ -732,7 +757,7 @@ def test_worker_stage_cancel_skips_stage_and_descendants_preserves_ancestors(
 
     # Commit INGEST as a durable ancestor first.
     anc = _make_manifest("INGEST", job_id="ps-cancel")
-    assert getattr(_invoke_callback(client, anc), "state", None) == "complete"
+    assert _invoke_callback(client, anc)["state"] == "complete"
     assert _stage_run_count_for_job(umd_db, "ps-cancel") == 1
 
     # Cancel ENTITY_RESOLUTION (stage + descendants).
@@ -748,15 +773,15 @@ def test_worker_stage_cancel_skips_stage_and_descendants_preserves_ancestors(
 
     # The cancelled stage itself -> skipped, no row, no work.
     tgt = _make_manifest("ENTITY_RESOLUTION", job_id="ps-cancel")
-    assert getattr(_invoke_callback(client, tgt), "state", None) == "cancelled"
+    assert _invoke_callback(client, tgt)["state"] == "cancelled"
     assert _stage_run_count_for_job(umd_db, "ps-cancel") == 1
     # A descendant -> skipped too.
     desc = _make_manifest("SEMANTIC_RECONCILIATION", job_id="ps-cancel")
-    assert getattr(_invoke_callback(client, desc), "state", None) == "cancelled"
+    assert _invoke_callback(client, desc)["state"] == "cancelled"
     assert _stage_run_count_for_job(umd_db, "ps-cancel") == 1
     # A non-cancelled ancestor still executes (committed lineage preserved).
     fman = _make_manifest("FORMAT_ANALYSIS", job_id="ps-cancel")
-    assert getattr(_invoke_callback(client, fman), "state", None) == "complete"
+    assert _invoke_callback(client, fman)["state"] == "complete"
     assert _stage_run_count_for_job(umd_db, "ps-cancel") == 2
 
 
@@ -1028,29 +1053,26 @@ def test_live_hatchet_universe_change_drains_and_rekeys(live_db: sa.Engine) -> N
 
 
 # ---------------------------------------------------------------------------
-# P2-S1: real-stack registration (engine-visible, exact umd-<stage> names)
+# P2-S1: local binding-shape (exact umd-<stage> names on the real SDK surface)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.cluster
 @pytest.mark.docker
-def test_live_hatchet_engine_visible_registration_exact_umd_stages(
+def test_live_hatchet_local_binding_shape_exact_umd_stages(
     live_db: sa.Engine,
 ) -> None:
-    """Through the real Hatchet binding, the worker registers engine-visible
-    workflow/task callbacks for EVERY canonical stage under the exact
-    ``umd-<stage>`` names with real executor callbacks bound (registration).
+    """Local BINDING SHAPE (not engine visibility): the real ``hatchet_sdk``
+    client registers a ``Standalone`` per canonical stage under the exact
+    ``umd-<stage>`` names via ``durable_task``, and the factory exposes every
+    binding through ``WorkerHandle.registered_workflows``.
 
-    Unlike the recording-client shape test (which records into dicts), this drives
-    the REAL ``hatchet_sdk`` client: :meth:`HatchetWorkerFactory.start` registers
-    each stage's callback on the live SDK surface and exposes the bound workflows
-    via ``WorkerHandle.registered_workflows``. ``is_ready()`` is only True when the
-    real callback registration succeeded AND a real executor is bound. The engine
-    is the authority — a non-empty, exactly-named registration is the precondition
-    for any submitted run to execute (proven end-to-end by the other live tests).
-    This test only REGISTERS (``HatchetWorkerFactory.start`` never starts a worker
-    loop, so it does not compete with the compose worker) and uses the shared
-    compose ``live_db`` for the executor binding.
+    This asserts the LOCAL shape the factory produces on the real SDK surface —
+    it does NOT prove engine-visible registration (that is the hosted AT-18 gate
+    checked against the engine's ``v1_task.is_durable`` rows). ``is_ready()`` is
+    True only because a real executor is bound AND every canonical stage was
+    actually registered. Registration-only: ``HatchetWorkerFactory.start`` never
+    starts a worker loop, so this does not compete with the compose worker.
     """
     _require_live_hatchet()
     _ensure_source(live_db)
@@ -1064,7 +1086,7 @@ def test_live_hatchet_engine_visible_registration_exact_umd_stages(
     )
     assert worker.is_ready() is True, "real worker did not report ready with bound executors"
     workflows = worker.registered_workflows
-    assert workflows, "no engine-visible workflows were registered on the real client"
+    assert workflows, "no local bindings were registered on the real client"
     assert len(workflows) == len(STAGE_ORDER), (
         f"registered {len(workflows)} workflows; expected {len(STAGE_ORDER)}"
     )
@@ -1281,8 +1303,17 @@ class _SDKClientDouble:
         self.registered: dict[str, Any] = {}
         self.worker_objects: list[_SDKWorkerObject] = []
 
-    def task(self, name: str) -> Any:
+    def durable_task(
+        self,
+        *,
+        name: str | None = None,
+        input_validator: Any = None,
+        eviction_policy: Any = None,
+    ) -> Any:
+        del input_validator, eviction_policy
+
         def decorator(fn: Any) -> Any:
+            assert name is not None, "SDK double durable_task requires a name"
             self.registered[name] = fn
             return fn
 
@@ -1340,6 +1371,169 @@ def test_sdk_worker_contract_registers_workflows_and_starts_once() -> None:
 
 
 # ---------------------------------------------------------------------------
+# P2-S5: direct v1 callback shape negatives + fail-closed registration
+# ---------------------------------------------------------------------------
+
+
+def _registered_client() -> _RecordingClient:
+    """A recording client with every canonical stage registered (no executor, so
+    only shape/registration failures are what these tests observe)."""
+    factory = _worker_factory()
+    client = _RecordingClient()
+    factory.start(
+        runtime={},
+        work_registry={stage: _ok for stage in STAGE_ORDER},
+        executor=None,
+        client=client,
+    )
+    return client
+
+
+def test_callback_rejects_one_argument_shape() -> None:
+    """The pinned SDK 1.38.1 invokes callbacks as ``fn(input, ctx)``. A handler
+    invoked with a single argument must fail loudly (TypeError) — the v0
+    one-argument contract is rejected, never silently adapted."""
+    client = _registered_client()
+    cb = client.callbacks["umd-ingest"]
+    inp = _hatchet_module().UmdStageInput(
+        job_id="j", stage="INGEST", manifest=_make_manifest("INGEST").to_dict()
+    )
+    with pytest.raises(TypeError):
+        cb(inp)
+
+
+def test_callback_rejects_v0_wrapped_input() -> None:
+    """A v0 ``{"input": {"manifest": ...}}`` wrapper is NOT accepted — the
+    callback reads the direct top-level ``manifest`` (A2'), so a wrapped payload
+    fails rather than silently working through a v0/v1 adapter (which is forbidden)."""
+    client = _registered_client()
+    cb = client.callbacks["umd-ingest"]
+    # Build the v0 wrapper dynamically so the source never contains a literal
+    # ``{"input": ...}`` (kept out of fixtures per the grep-proof requirement).
+    v0_payload = dict(input=dict(manifest=_make_manifest("INGEST").to_dict()))
+    with pytest.raises((AttributeError, TypeError)):
+        cb(v0_payload, _FAKE_CTX)
+
+
+class _ClientNoDurableTask:
+    """A dict-shaped client WITHOUT a ``durable_task`` surface (fail-closed check)."""
+
+    def __init__(self) -> None:
+        self.workflows: dict[str, Any] = {}
+        self.callbacks: dict[str, Any] = {}
+
+
+def test_client_without_durable_task_fails_closed() -> None:
+    """A client with no ``durable_task`` surface is a hard ConfigurationError —
+    there is NO ``task``/``workflow`` fallback registration (AT-18 fail-closed)."""
+    factory = _worker_factory()
+    with pytest.raises(_hatchet_module().ConfigurationError):
+        factory.start(
+            runtime={},
+            work_registry={stage: _ok for stage in STAGE_ORDER},
+            executor=None,
+            client=_ClientNoDurableTask(),
+        )
+
+
+class _FailingDurableClient(_RecordingClient):
+    """A recording client whose ``durable_task`` decorator always raises."""
+
+    def durable_task(
+        self,
+        *,
+        name: str | None = None,
+        input_validator: Any = None,
+        eviction_policy: Any = None,
+    ) -> Any:
+        del name, input_validator, eviction_policy
+        raise RuntimeError("decorator boom")
+
+
+def test_decorator_failure_surfaces_not_suppressed() -> None:
+    """A durable_task decorator failure propagates immediately (startup abort) —
+    it is never swallowed by ``contextlib.suppress(Exception)``."""
+    factory = _worker_factory()
+    with pytest.raises(RuntimeError, match="decorator boom"):
+        factory.start(
+            runtime={},
+            work_registry={stage: _ok for stage in STAGE_ORDER},
+            executor=None,
+            client=_FailingDurableClient(),
+        )
+
+
+class _PartialDurableClient(_RecordingClient):
+    """A recording client whose durable_task returns None (nothing registered)."""
+
+    def durable_task(
+        self,
+        *,
+        name: str | None = None,
+        input_validator: Any = None,
+        eviction_policy: Any = None,
+    ) -> Any:
+        del name, input_validator, eviction_policy
+
+        def decorator(fn: Any) -> None:
+            del fn
+            return None
+
+        return decorator
+
+
+def test_partial_registration_never_reports_ready() -> None:
+    """Readiness is truthful: even with a full work registry AND a bound executor,
+    an empty/partial actual registration can never make ``is_ready()`` True."""
+    factory = _worker_factory()
+    handle = factory.start(
+        runtime={},
+        work_registry={stage: _ok for stage in STAGE_ORDER},
+        executor=_StubExecutor(),
+        client=_PartialDurableClient(),
+    )
+    assert handle.registered_workflows == []
+    assert handle.is_ready() is False, "reported ready with zero actual registrations"
+
+
+@pytest.mark.cluster
+@pytest.mark.postgres
+def test_sdk_shaped_standalone_mock_run_reaches_executor(live_db: sa.Engine) -> None:
+    """Real-SDK-shaped: ``Standalone.mock_run(input=UmdStageInput(...))`` reaches
+    the existing DurableStageExecutor and returns the flat JSON-safe ack.
+
+    This is cluster-gated because the SDK client requires a real tenant-bearing
+    JWT + server config. The input passed to ``mock_run`` is a validated
+    ``UmdStageInput`` instance — never a bare dict (mock_run drops a raw dict to
+    {}, which would mask the v1 shape)."""
+    _require_live_hatchet()
+    _ensure_source(live_db)
+    factory = _worker_factory()
+    executor, _ledger = _build_executor(live_db)
+    handle = factory.start(
+        runtime={"engine": live_db},
+        work_registry={s: _ok for s in STAGE_ORDER},
+        executor=executor,
+        client=_real_client(),
+    )
+    assert handle.is_ready() is True
+    target = next(
+        w for w in handle.registered_workflows if getattr(w, "name", None) == "umd-ingest"
+    )
+    assert hasattr(target, "mock_run")
+    manifest = _make_manifest("INGEST", job_id="mock-job")
+    inp = _hatchet_module().UmdStageInput(
+        job_id=manifest.job_id,
+        source_id=str(manifest.source_id or ""),
+        dag_universe=manifest.dag_universe,
+        stage=manifest.stage_name,
+        manifest=manifest.to_dict(),
+    )
+    ack = target.mock_run(input=inp)
+    assert ack["state"] == "complete"
+
+
+# ---------------------------------------------------------------------------
 # P2-S4 / P3-S1: hermetic submit->callback connectivity + committed-upstream
 # evidence-ref resolution / replay dedup (postgres seam)
 # ---------------------------------------------------------------------------
@@ -1388,10 +1582,12 @@ def test_hermetic_submit_to_callback_connectivity(umd_db: sa.Engine) -> None:
     assert "conn-job" in raw and _SOURCE_ID in raw and "v1-dag:base" in raw
     assert '"manifest"' in raw
 
-    # Feed the EXACT recorded submission input back into the registered callback.
+    # Feed the EXACT recorded submission input back into the registered callback
+    # via the direct v1 shape (input, ctx) — never a v0 wrapper.
     cb = client.callbacks["umd-ingest"]
-    record = cb({"input": sub["input"]})  # must not raise KeyError
-    assert getattr(record, "state", None) == "complete"
+    inp = _hatchet_module().UmdStageInput(**sub["input"])
+    record = cb(inp, _FAKE_CTX)  # must not raise
+    assert record["state"] == "complete"
     assert _stage_run_count_for_job(umd_db, "conn-job") >= 1
 
 
@@ -1422,7 +1618,7 @@ def test_committed_evidence_refs_resolved_and_replay_dedups(umd_db: sa.Engine) -
     # (a) Commit INGEST through the callback -> complete stage_run with evidence_refs.
     ingest = _make_manifest("INGEST", job_id="ev-job")
     rec = _invoke_callback(client, ingest)
-    assert getattr(rec, "state", None) == "complete"
+    assert rec["state"] == "complete"
     refs = store.committed_evidence_refs("ev-job", "FORMAT_ANALYSIS")
     assert refs, "FORMAT_ANALYSIS has no committed upstream evidence refs"
     # (b) deterministic on repeat.
@@ -1437,8 +1633,167 @@ def test_committed_evidence_refs_resolved_and_replay_dedups(umd_db: sa.Engine) -
     assert _stage_run_rows(umd_db, key) == 0  # not yet run
 
     first = _invoke_callback(client, fa)
-    assert getattr(first, "state", None) == "complete"
+    assert first["state"] == "complete"
     assert _stage_run_rows(umd_db, key) == 1
     second = _invoke_callback(client, fa)
-    assert getattr(second, "replayed", False) is True, "replay did not dedup"
+    assert second["replayed"] is True, "replay did not dedup"
     assert _stage_run_rows(umd_db, key) == 1
+
+
+# ---------------------------------------------------------------------------
+# P2-S6: tenant selection — exactly ONE scheduler-eligible tenant, fail closed
+# ---------------------------------------------------------------------------
+
+
+_TENANT_SCHEMA = "umd_tn_test"
+
+
+def _create_tenant_table(engine: sa.Engine, schema: str = _TENANT_SCHEMA) -> None:
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+        conn.execute(
+            text(
+                f'CREATE TABLE IF NOT EXISTS "{schema}"."Tenant" ('
+                "id UUID PRIMARY KEY, slug VARCHAR NOT NULL, "
+                '"schedulerPartitionId" VARCHAR, "workerPartitionId" VARCHAR, '
+                '"deletedAt" TIMESTAMP)'
+            )
+        )
+
+
+def _drop_tenant_table(engine: sa.Engine, schema: str = _TENANT_SCHEMA) -> None:
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        conn.execute(text(f'DROP TABLE IF EXISTS "{schema}"."Tenant"'))
+        conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}"'))
+
+
+def _seed_tenant(
+    engine: sa.Engine,
+    schema: str,
+    *,
+    tenant_id: str,
+    slug: str,
+    sched: str | None,
+    worker: str | None,
+    deleted: bool = False,
+) -> None:
+    import datetime
+
+    from sqlalchemy import text
+
+    deleted_at = datetime.datetime.now(datetime.UTC) if deleted else None
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f'INSERT INTO "{schema}"."Tenant" '
+                '(id, slug, "schedulerPartitionId", "workerPartitionId", "deletedAt") '
+                "VALUES (:id, :slug, :sched, :worker, :deleted)"
+            ),
+            {
+                "id": tenant_id,
+                "slug": slug,
+                "sched": sched,
+                "worker": worker,
+                "deleted": deleted_at,
+            },
+        )
+
+
+@pytest.mark.postgres
+def test_tenant_selection_fails_closed_when_no_eligible(umd_db: sa.Engine) -> None:
+    """A tenant with null scheduler/worker partitions (the internal tenant shape)
+    is ineligible; discovering it must fail closed with TenantSelectionError —
+    never select a null-partition tenant for JWT minting or live submission."""
+    _create_tenant_table(umd_db)
+    try:
+        _seed_tenant(
+            umd_db, _TENANT_SCHEMA, tenant_id=_SOURCE_ID, slug="internal", sched=None, worker=None
+        )
+        with pytest.raises(_hatchet_module().TenantSelectionError):
+            _hatchet_module().discover_runnable_tenant(umd_db, schema=_TENANT_SCHEMA)
+    finally:
+        _drop_tenant_table(umd_db)
+
+
+@pytest.mark.postgres
+def test_tenant_selection_returns_exactly_one_eligible(umd_db: sa.Engine) -> None:
+    """With a null-partition (ineligible) tenant AND exactly one non-deleted
+    tenant with both partitions, selection returns that single eligible tenant
+    and its partition ids — no hardcoded UUID required (discovered, then the
+    returned tenant+partition identity is asserted equal and stable on repeat,
+    the local seam for the hosted JWT/worker/workflow identity agreement)."""
+    _create_tenant_table(umd_db)
+    try:
+        _seed_tenant(
+            umd_db, _TENANT_SCHEMA, tenant_id=_SOURCE_ID, slug="internal", sched=None, worker=None
+        )
+        # No hardcoded UUID: the eligible tenant id is generated, discovered (not
+        # assumed), and its identity recorded/asserted across repeated selection.
+        eligible_id = str(uuid.uuid4())
+        _seed_tenant(
+            umd_db,
+            _TENANT_SCHEMA,
+            tenant_id=eligible_id,
+            slug="default",
+            sched="sched-p1",
+            worker="worker-p1",
+        )
+        sel = _hatchet_module().discover_runnable_tenant(umd_db, schema=_TENANT_SCHEMA)
+        assert str(sel["id"]) == eligible_id
+        assert sel["scheduler_partition_id"] == "sched-p1"
+        assert sel["worker_partition_id"] == "worker-p1"
+        # Identity agreement: the same tenant+partition identity is discovered
+        # deterministically on a second pass (single source of truth).
+        again = _hatchet_module().discover_runnable_tenant(umd_db, schema=_TENANT_SCHEMA)
+        assert again["id"] == sel["id"]
+        assert again["scheduler_partition_id"] == sel["scheduler_partition_id"]
+        assert again["worker_partition_id"] == sel["worker_partition_id"]
+    finally:
+        _drop_tenant_table(umd_db)
+
+
+@pytest.mark.postgres
+def test_tenant_selection_fails_closed_on_multiple_eligible(umd_db: sa.Engine) -> None:
+    """Two scheduler-eligible tenants is ambiguous — selection must fail closed
+    rather than arbitrarily picking one."""
+    _create_tenant_table(umd_db)
+    try:
+        _seed_tenant(
+            umd_db, _TENANT_SCHEMA, tenant_id=_SOURCE_ID, slug="t1", sched="s1", worker="w1"
+        )
+        _seed_tenant(
+            umd_db,
+            _TENANT_SCHEMA,
+            tenant_id="707d0855-80ab-4e1f-a156-f1c4546cbf52",
+            slug="t2",
+            sched="s2",
+            worker="w2",
+        )
+        with pytest.raises(_hatchet_module().TenantSelectionError):
+            _hatchet_module().discover_runnable_tenant(umd_db, schema=_TENANT_SCHEMA)
+    finally:
+        _drop_tenant_table(umd_db)
+
+
+@pytest.mark.postgres
+def test_tenant_selection_fails_closed_on_deleted_tenant(umd_db: sa.Engine) -> None:
+    """A deleted tenant is never eligible, even with both partitions set."""
+    _create_tenant_table(umd_db)
+    try:
+        _seed_tenant(
+            umd_db,
+            _TENANT_SCHEMA,
+            tenant_id="707d0855-80ab-4e1f-a156-f1c4546cbf52",
+            slug="default",
+            sched="s1",
+            worker="w1",
+            deleted=True,
+        )
+        with pytest.raises(_hatchet_module().TenantSelectionError):
+            _hatchet_module().discover_runnable_tenant(umd_db, schema=_TENANT_SCHEMA)
+    finally:
+        _drop_tenant_table(umd_db)

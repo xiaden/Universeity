@@ -66,6 +66,7 @@ def worker() -> int:
 
     from umd.api.app import build_context, engine_from_settings
     from umd.api.entrypoints import build_source_store
+    from umd.jobs.dag import STAGE_ORDER
     from umd.jobs.hatchet import HatchetWorkerFactory, worker_ready_line
 
     # The SAME shared runtime assembly the API release factory uses (Plan K P1-S3).
@@ -120,7 +121,17 @@ def worker() -> int:
     # loop start (fake readiness). ``worker.start()`` never returns until the loop
     # is interrupted.
     worker = client.worker("umd-worker", workflows=handle.registered_workflows)
-    n_workflows = len(handle.registered_workflows) or (len(work_registry) if work_registry else 0)
+    # Truthful readiness: count ONLY the actual registered workflows, never the
+    # size of the work registry. A partial registration is a hard failure that
+    # exits non-zero BEFORE the readiness line is ever printed.
+    n_workflows = len(handle.registered_workflows)
+    if n_workflows != len(STAGE_ORDER):
+        print(
+            f"worker unavailable: registered {n_workflows}/{len(STAGE_ORDER)} stage "
+            "workflows (registration incomplete); refusing to claim ready.",
+            file=sys.stderr,
+        )
+        return 2
     # The exact readiness line (P2-S3, Decision B / QA Round 2) Plan J's
     # wait-for-worker.sh greps for. Printed via the function so the bare ready
     # phrase stays OUT of this file (test_no_fake_gated_ready_claim scans cli.py
