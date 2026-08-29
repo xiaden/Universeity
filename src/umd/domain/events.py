@@ -23,6 +23,7 @@ Tier-0 replay — the concrete operational stream lives in ``job_run_audit``
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -106,13 +107,34 @@ type Upcaster = Callable[[dict[str, Any]], dict[str, Any]]
 
 
 def _schemas_root() -> Path:
-    """Locate ``schemas/events`` relative to the repository (not an installed path)."""
+    """Locate ``schemas/events`` for the installed package or repository checkout.
+
+    Resolution order (first hit wins, fail closed — never silently degrade):
+      1. ``UMD_EVENT_SCHEMAS_ROOT`` env override (the image sets this to the
+         baked-in ``/app/schemas/events``). If set but not a directory, raise.
+      2. ancestor walk from the installed module (repo checkout / editable).
+      3. ``Path.cwd() / "schemas" / "events"`` fallback for non-image runs
+         without the env var (e.g. tests run from the repo root).
+    """
+    override = os.environ.get("UMD_EVENT_SCHEMAS_ROOT")
+    if override:
+        override_path = Path(override)
+        if override_path.is_dir():
+            return override_path
+        raise FileNotFoundError(
+            f"UMD_EVENT_SCHEMAS_ROOT is set to {override!r} but is not a directory"
+        )
     here = Path(__file__).resolve()
     for parent in here.parents:
         candidate = parent / "schemas" / "events"
         if candidate.is_dir():
             return candidate
-    raise FileNotFoundError("schemas/events not found relative to the umd package")
+    cwd_candidate = Path.cwd() / "schemas" / "events"
+    if cwd_candidate.is_dir():
+        return cwd_candidate
+    raise FileNotFoundError(
+        "schemas/events not found (set UMD_EVENT_SCHEMAS_ROOT to the schemas/events directory)"
+    )
 
 
 @cache

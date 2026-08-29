@@ -29,6 +29,11 @@ COPY pyproject.toml ./
 COPY alembic.ini ./
 COPY migrations ./migrations
 COPY src ./src
+# Event payload schemas ship in the image so the installed worker/API package can
+# resolve schemas/events via UMD_EVENT_SCHEMAS_ROOT (the ancestor-walk fallback only
+# works for a repo checkout, not for the installed site-packages copy).
+COPY schemas ./schemas
+ENV UMD_EVENT_SCHEMAS_ROOT=/app/schemas/events
 RUN pip install --no-cache-dir .
 
 # Migrations ship in the image; they execute against the runtime DSN at startup

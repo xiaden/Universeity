@@ -84,7 +84,11 @@ JOB_RUN_AUDIT="$(require_table job_run_audit)"
 require_column() {
   tbl="$1"
   col="$2"
-  c="$(psql -tAc "SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name = lower('$tbl') AND lower(column_name) = lower('$col') LIMIT 1" | tr -d '[:space:]')"
+  # $tbl is the already-discovered real table name (see require_table); compare it
+  # case-sensitively, because goose mixed-case tables (public."Worker") are stored
+  # with their literal case in information_schema.columns. Only the column name is
+  # case-insensitively lowercased here.
+  c="$(psql -tAc "SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name = '$tbl' AND lower(column_name) = lower('$col') LIMIT 1" | tr -d '[:space:]')"
   if [ "$c" != "1" ]; then
     fail "required column \"$col\" missing on table public.\"$tbl\""
   fi
