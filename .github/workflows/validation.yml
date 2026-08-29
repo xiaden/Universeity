@@ -419,6 +419,7 @@ jobs:
           UMD_HATCHET_SERVER_URL="http://127.0.0.1:${HATCHET_DASHBOARD_PORT:-8081}" \
           UMD_HATCHET_TOKEN="$HATCHET_TENANT_TOKEN" \
           UMD_HATCHET_CLIENT_HOST_PORT="7070" \
+          HATCHET_CLIENT_TLS_STRATEGY=insecure \
           pytest -q tests/test_hatchet_live.py -m "cluster or docker" \
             --junitxml=live-junit.xml 2>&1 | tee live-tests.log
           skipped="$(python3 -c "import xml.etree.ElementTree as ET;r=ET.parse('live-junit.xml').getroot();print(r.get('skipped','0'))")"

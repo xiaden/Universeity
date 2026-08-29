@@ -23,6 +23,9 @@ x-umd-api-env: &umd-api-env
   UMD_POSTGRES__DSN: postgresql+psycopg://umd:${UMD_POSTGRES_PASSWORD:-umd}@db:5432/umd
   UMD_OCFL__ROOT: /data/ocfl
   UMD_RUN_MIGRATIONS_ON_START: "1"
+  # Engine serves plaintext gRPC (SERVER_GRPC_INSECURE=t); SDK must not default
+  # to the secure channel or registration handshakes fail (WRONG_VERSION_NUMBER).
+  HATCHET_CLIENT_TLS_STRATEGY: insecure
   # Gate posture: all authority/security/provider extensions stay GATED and are
   # enabled only through the .env surface (never compiled in, never a hard
   # dependency of the base image).

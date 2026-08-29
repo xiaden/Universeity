@@ -24,7 +24,11 @@
         "mknodat", "unlinkat", "renameat", "renameat2", "linkat",
         "symlinkat", "chmod", "fchmod", "fchmodat", "chown", "fchown",
         "fchownat", "access", "faccessat", "newfstatat", "setgroups",
-        "setresuid", "setresgid", "setuid", "setgid", "unshare"
+        "setresuid", "setresgid", "setuid", "setgid", "unshare",
+        "statx", "fsopen", "fsconfig", "fsmount", "fspick", "mount",
+        "umount2", "pivot_root", "open_tree", "move_mount",
+        "mount_setattr", "setns", "sethostname", "setdomainname",
+        "personality"
       ],
       "action": "SCMP_ACT_ALLOW"
     }
