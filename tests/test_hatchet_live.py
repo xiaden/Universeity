@@ -90,13 +90,23 @@ def _build_executor(engine: sa.Engine) -> Any:
 
 
 def _ensure_source(engine: sa.Engine, source_id: str = _SOURCE_ID) -> None:
-    """Insert a source row so stage_run FK + StageCompleted payload resolve."""
+    """Insert a source row so stage_run FK + StageCompleted payload resolve.
+
+    Idempotent: several live tests share the session-scoped ``live_db`` compose
+    database (single source of truth, compose worker sole executor), so a plain
+    insert of the fixed ``_SOURCE_ID`` would collide once the first test has
+    seeded the row. ``ON CONFLICT DO NOTHING`` keeps the seed idempotent without
+    weakening assertions.
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
     from umd.storage.postgres.tables import metadata as _meta
 
     src_t = _meta.tables["source"]
     with engine.begin() as conn:
         conn.execute(
-            src_t.insert().values(
+            pg_insert(src_t)
+            .values(
                 id=uuid.UUID(source_id),
                 ocfl_ref=f"urn:ocfl:{source_id}",
                 sha512="d" * 128,
@@ -104,6 +114,7 @@ def _ensure_source(engine: sa.Engine, source_id: str = _SOURCE_ID) -> None:
                 media_kind="text",
                 original_name="seed.txt",
             )
+            .on_conflict_do_nothing(index_elements=["id"])
         )
 
 

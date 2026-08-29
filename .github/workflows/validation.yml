@@ -412,9 +412,14 @@ jobs:
       # P3-S3: real live suite on the Compose network. FAILS if any cluster/docker
       # test SKIPS (a skipped mandatory live test is a failed release gate) or a
       # live job does not complete. Writes the live-worker-gate verdict.
+      # P3-S3/P4-S7: the host pytest env installs only `.[dev]`; hatchet_sdk lives
+      # in the GATED `worker` extra (hatchet-sdk==1.38.1). The live suite needs it
+      # in-process (UMD_HATCHET_* env is exported, so _require_live_hatchet passes
+      # and _real_client() imports hatchet_sdk). Install it before pytest.
       - name: Run live Hatchet suite (gate on real execution, fail on skip)
         run: |
           set -o pipefail
+          pip install --quiet --no-cache-dir -e ".[worker]" && \
           UMD_TEST_POSTGRES=true \
           UMD_HATCHET_SERVER_URL="http://127.0.0.1:${HATCHET_DASHBOARD_PORT:-8081}" \
           UMD_HATCHET_TOKEN="$HATCHET_TENANT_TOKEN" \
