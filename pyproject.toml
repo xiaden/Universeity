@@ -15,6 +15,10 @@ dependencies = [
     # SQLAlchemy 2.0.x, ocfl-py 2.1.0. Other runtime deps ride the latest line but must be
     # reviewed by build/license/CVE gates before release (see artifacts/designs).
     "fastapi==0.141.1",
+    # ASGI server for the API container (deploy/docker-entrypoint.sh api branch);
+    # pinned per deploy/pins/runtime.txt. Was missing from pyproject, so the
+    # Dockerfile 'pip install .' image had no uvicorn and the api crashed on boot.
+    "uvicorn==0.30.7",
     "pydantic==2.13.*",
     "sqlalchemy==2.0.*",
     "ocfl-py==2.1.0",
