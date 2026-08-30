@@ -24,6 +24,7 @@ canonical-state fold.
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -127,12 +128,24 @@ class ReplayDriver:
     skipped: int = 0
     pause_reason: str | None = None
     paused: bool = False
+    _run_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     @property
     def reducer(self) -> CurrentStateReducer:
         return _REDUCER
 
     def run(
+        self,
+        builder: ProjectionBuilder,
+        *,
+        wipe: bool = False,
+        force_resume: bool = False,
+    ) -> BuildReport:
+        """Run one projection rebuild at a time per process."""
+        with self._run_lock:
+            return self._run_locked(builder, wipe=wipe, force_resume=force_resume)
+
+    def _run_locked(
         self,
         builder: ProjectionBuilder,
         *,
@@ -171,6 +184,23 @@ class ReplayDriver:
         apply_from = 0 if (wipe or force_resume) else start_seq
 
         with self.engine.begin() as conn:
+            # Serialize shared projection rebuilds before reading the event tail;
+            # otherwise an older rebuild may finish later and regress the checkpoint.
+            if self.engine.dialect.name == "postgresql":
+                conn.execute(
+                    sa.select(
+                        sa.func.pg_advisory_xact_lock(sa.func.hashtext(builder.projection_name))
+                    )
+                )
+            # The lock is acquired in this transaction, so read the checkpoint from
+            # the same snapshot. This prevents a concurrent rebuild from causing a
+            # stale start sequence after the lock is released.
+            cp = self.store.get(builder.projection_name, conn=conn) or ProjectionCheckpoint(
+                builder.projection_name
+            )
+            start_seq = 0 if wipe else cp.applied_seq
+            if force_resume:
+                cp = cp.resumed()
             if wipe or force_resume:
                 builder.wipe(conn, self)
             builder.prepare(conn, self)

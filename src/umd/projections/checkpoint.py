@@ -68,11 +68,15 @@ class ProjectionCheckpointStore:
     def __init__(self, engine: sa.Engine) -> None:
         self._engine = engine
 
-    def get(self, projection_name: str) -> ProjectionCheckpoint | None:
-        with self._engine.connect() as conn:
-            row = conn.execute(
-                sa.select(_checkpoint_t).where(_checkpoint_t.c.projection_name == projection_name)
-            ).first()
+    def get(
+        self, projection_name: str, *, conn: sa.Connection | None = None
+    ) -> ProjectionCheckpoint | None:
+        if conn is None:
+            with self._engine.connect() as owned_conn:
+                return self.get(projection_name, conn=owned_conn)
+        row = conn.execute(
+            sa.select(_checkpoint_t).where(_checkpoint_t.c.projection_name == projection_name)
+        ).first()
         if row is None:
             return None
         payload = dict(row.checkpoint or {})
