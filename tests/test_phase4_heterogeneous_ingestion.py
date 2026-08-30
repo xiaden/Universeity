@@ -192,6 +192,11 @@ def test_audio_through_public_api_honest_evidence(app) -> None:
     assert _poll_terminal(app, sid) == "complete"
     an = app.get(f"/v1/sources/{sid}/analysis", headers=R)
     assert an.status_code == 200 and an.json()["status"] == "complete"
+    segs = _segments(app, sid)
+    assert len(segs) >= 1, "audio source produced no segment rows"
+    ev = _evidence_via_segments(app, segs)
+    assert ev, "audio source produced no segment-linked evidence"
+    assert ev.keys() & {"audio_interval", "music", "sound_event"}
 
 
 def test_subtitle_through_public_api(app) -> None:

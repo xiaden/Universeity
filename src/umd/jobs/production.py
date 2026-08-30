@@ -605,6 +605,42 @@ class _Composer:
         refs.extend(self._subtitle_tracks_branch(sandbox, raw, src, warnings))
         return refs
 
+    def _audio_branch(self, src: dict[str, Any], warnings: list[str]) -> list[str]:
+        """Run the sandboxed audio baseline for a standalone audio source."""
+        sandbox = self._runtime.sandbox
+        if sandbox is None or self._runtime.source_store is None:
+            return []
+        from umd.audio.config import audio_config_from_env, config_digest_of
+        from umd.audio.evidence import build_audio_evidence_plan
+        from umd.audio.runner import invoke_audio_baseline
+        from umd.segmentation.registry import SegmentRegistry
+
+        raw = self._raw_bytes(src)
+        if raw is None:
+            return []
+        try:
+            output = invoke_audio_baseline(
+                sandbox, raw, name=src.get("original_name") or "audio.wav"
+            )
+        except Exception as exc:  # noqa: BLE001 - quarantine containment
+            warnings.append(f"audio baseline failed (quarantine): {exc}")
+            return []
+        try:
+            plan = build_audio_evidence_plan(
+                output,
+                source_id=src["id"],
+                source_sha512=src["sha512"],
+                work_id=None,
+                config_digest=config_digest_of(audio_config_from_env()),
+            )
+            batch = SegmentRegistry(self._segments).register(plan.segment_inputs)
+            self._link_evidence(plan.evidence, src["id"], prefix="audio/")
+            self._evidence.record(EvidenceBatch(records=plan.evidence))
+            return self._plan_refs(batch, plan.evidence)
+        except Exception as exc:  # noqa: BLE001 - quarantine containment
+            warnings.append(f"audio evidence assembly failed: {exc}")
+            return []
+
     def _video_audio_asr_branch(
         self,
         sandbox: Any,
@@ -937,6 +973,10 @@ class _Composer:
             # REAL video branch: demux + scenes/shots/frames/observations +
             # independent embedded subtitles + audio-baseline composition (P3-S2).
             refs = self._video_branch(src, warnings)
+        elif src["media_kind"] == "audio":
+            # Standalone audio follows the same sandboxed baseline/evidence path
+            # as embedded video audio, while retaining its own source identity.
+            refs = self._audio_branch(src, warnings)
         elif src["media_kind"] == "subtitle":
             # Standalone subtitle source: parse to subtitle_event evidence +
             # segments (independent evidence stream, never flattened).
