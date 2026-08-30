@@ -173,11 +173,12 @@ def test_hatchet_token_is_real_jwt_not_placeholder() -> None:
 def test_dockerfile_worker_target_installs_worker_extra_and_smoke_tests_sdk() -> None:
     """P3-S2: the Dockerfile has a `worker` build stage that installs the pinned
     `.[worker]` extra and smoke-tests the SDK import WITHOUT promoting the pair.
-    The API stays on the lean base (`runtime`), so the worker-only SDK (a GATED
-    dependency) never leaks into the base image."""
+    The API and worker roles use this target because production dispatch and
+    media processing require the worker image dependencies."""
     df = (DEPLOY / "Dockerfile").read_text(encoding="utf-8")
     assert "FROM runtime AS worker" in df
     assert 'pip install --no-cache-dir ".[worker]"' in df
+    assert "apt-get install -y --no-install-recommends ffmpeg" in df
     assert "import hatchet_sdk" in df  # SDK import smoke test in the worker target
     assert 'CMD ["worker"]' in df
     # The base stage remains independently buildable; the worker target adds the
@@ -185,7 +186,7 @@ def test_dockerfile_worker_target_installs_worker_extra_and_smoke_tests_sdk() ->
     base_install = df.split("FROM runtime AS worker", 1)[0]
     assert "RUN pip install --no-cache-dir ." in base_install
     worker_stage = df.split("FROM runtime AS worker", 1)[1]
-    assert 'RUN pip install --no-cache-dir ".[worker]"' in worker_stage
+    assert 'pip install --no-cache-dir ".[worker]"' in worker_stage
 
 
 def test_compose_api_worker_and_sandbox_use_worker_build_target() -> None:

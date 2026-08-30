@@ -64,7 +64,10 @@ CMD ["api"]
 # ---------------------------------------------------------------------------
 FROM runtime AS worker
 USER root
-RUN pip install --no-cache-dir ".[worker]" \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir ".[worker]" \
     && python -c "import hatchet_sdk; print('hatchet_sdk import OK (CANDIDATE pair, pending live validation)')"
 USER umd
 CMD ["worker"]
