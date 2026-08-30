@@ -11,7 +11,9 @@ The Universal Media Decomposer runs nine decomposition stages over Hatchet as th
 ## Coverage
 **Documented:** Hosted evidence (run 33229130339, /tmp/r40528/diag-final dump + logs), SDK 1.38.1 registration/dispatch mechanics, why parent_id/parent_step_run_id are not barriers (now with engine source proof), option-by-option analysis (1/2/3/4), engine-verified intra-workflow DAG barrier, assignment/runtime proof surfaces for v0.105.2, latent proof defects, affected code surfaces.
 **Not yet documented:** whether v1_task_events_olap ASSIGNED/STARTED rows appear on the durable-DAG path (hosted probe), durable-task-in-DAG interplay with eviction/durable-run-entry wiring (durable + parents combo unprobed), which id to thread for any future cross-run parent (now moot for the barrier decision). **Closed 2026-08-29:** engine gating for multi-task DAGs (VERIFIED, finding 2), parent_step_run_id gating (DISPROVEN, finding 3), server DAG inference (VERIFIED: triggerWorkflowsCore `isDag = len(regularSteps) > 1`).
-**Last extended:** 2026-08-29
+**Last extended:** 2026-08-30
+
+**Current code state (2026-08-30):** the Option-1 single-workflow DAG is now IMPLEMENTED in source (`_build_native_workflow`, `src/umd/jobs/hatchet.py:363-380`; `submit_workflow_runs`, `src/umd/jobs/runner.py:202-257`). The per-stage `_real_submit_workflow_run`/`parent_id` family-A path and `client.durable_task(...)` standalone registrations described in findings 1/3/9 are GONE; the worker registers ONE `umd-decomposition` workflow whose 9 `durable_task(name=umd-<stage>, parents=...)` edges come from `STAGE_DEPENDENCIES`. `submit_workflow_runs` submits one `run_no_wait(input={job_id, source_id, dag_universe, stage=INGEST, manifest, manifests(9), selected_stages, causation_id})`; the handler uses `stage_override` to read `input.manifests[stage]` and only selected stages carry `rerun_causation` in their `input_manifest` (fresh idempotency key => re-execution). Unselected tasks replay through the executor (dedupe, `replayed=True`), so a selective rerun still re-dispatches all 9 callbacks (8 replay). engine-visible-proof.sh Check 2 now asserts the exact 9-task parent graph (lines 179-198).
 
 ## Key Findings
 
@@ -82,6 +84,14 @@ The Universal Media Decomposer runs nine decomposition stages over Hatchet as th
 - No stubs/skips/fake readiness/recording doubles as release evidence; readiness = real callback registration; C6 line is candidate readiness only.
 - AT-18: every canonical umd-<stage> durably registered, latest-version is_durable=true — interpretation of per-stage standalone workflows vs one 9-task workflow is the open reconciliation.
 - Hosted native Docker/Compose evidence required before docs/DoD closure; no weakened gates.
+
+## Sources (current-state verification 2026-08-30)
+- src/umd/jobs/{dag.py,runner.py,hatchet.py,stage_execution.py,manifest.py,invalidation.py,drain.py,job.py,production.py,capability.py}
+- src/umd/application/jobs.py, src/umd/api/{app.py,runner.py,routers/jobs.py}, src/umd/deploy/cli.py
+- src/umd/storage/postgres/{job_repository.py,stage_repository.py,ledger.py,tables.py}
+- deploy/{compose.yaml,validate_hatchet_live.sh}, .github/scripts/engine-visible-proof.sh
+- tests/test_hatchet_live.py (barrier + live shape tests, lines 979-1075, 1838-2112)
+- artifacts/designs/parts/universal-media-decomposer/CONTRACTS.md:58-64
 
 ## Sources
 - artifacts/designs/process/COMPLEXITY-universal-media-decomposer-plan-k-live-hatchet-lineage-barrier.md (2026-08-29, Option 1-4 verdict)
