@@ -626,7 +626,11 @@ def test_boundary_duplicate_retry_cancel_and_consistency(api_ctx: ApiCtx) -> Non
     # -- Cancellation through the public endpoint (P4-S5): a submitted job can be
     #    cancelled; the durable store reconciles to a terminal cancelled state.
     cj = _ingest(
-        client, kind="txt", name="cancel.txt", data=translated_txt_bytes(), work_id=s.work_id
+        client,
+        kind="txt",
+        name="cancel.txt",
+        data=b"This is a distinct cancellation submission.\n",
+        work_id=s.work_id,
     )
     cxl = client.post(f"/v1/jobs/{_job_id(cj['source_id'])}/cancel", headers=W)
     assert cxl.status_code == 200, cxl.text
