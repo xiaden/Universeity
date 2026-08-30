@@ -180,8 +180,8 @@ def test_dockerfile_worker_target_installs_worker_extra_and_smoke_tests_sdk() ->
     assert 'pip install --no-cache-dir ".[worker]"' in df
     assert "import hatchet_sdk" in df  # SDK import smoke test in the worker target
     assert 'CMD ["worker"]' in df
-    # The GATED SDK stays out of the lean base: the base stage installs only `.`
-    # and the `.[worker]` extra install lives exclusively in the worker stage.
+    # The base stage remains independently buildable; the worker target adds the
+    # GATED SDK for both API and worker production dispatch.
     base_install = df.split("FROM runtime AS worker", 1)[0]
     assert "RUN pip install --no-cache-dir ." in base_install
     worker_stage = df.split("FROM runtime AS worker", 1)[1]

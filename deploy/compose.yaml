@@ -68,6 +68,7 @@ services:
       # The API dispatches the production DAG through the Hatchet SDK, so it
       # requires the same worker build target as the worker role.
       target: worker
+    command: ["api"]
     environment:
       UMD_ROLE: api
       <<: *umd-api-env
