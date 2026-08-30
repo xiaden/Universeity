@@ -72,6 +72,7 @@ require_table() {
 }
 
 V1_TASK="$(require_table v1_task)"
+V1_PAYLOAD="$(require_table v1_payload)"
 V1_TASK_EVENTS_OLAP="$(require_table v1_task_events_olap)"
 V1_TASKS_OLAP="$(require_table v1_tasks_olap)"
 WORKER="$(require_table Worker)"
@@ -97,6 +98,10 @@ require_column() {
 require_column v1_task tenant_id
 require_column v1_task is_durable
 require_column v1_task workflow_version_id
+require_column v1_payload tenant_id
+require_column v1_payload type
+require_column v1_payload external_id
+require_column v1_payload inline_content
 require_column v1_task_events_olap worker_id
 require_column v1_task_events_olap tenant_id
 require_column v1_tasks_olap readable_status
@@ -221,21 +226,20 @@ fi
 #   explicitly rejected. A global table total, a readiness line, a declaration
 #   probe, or an accepted submission alone is NEVER release proof.
 # ============================================================================
-# Live job-ID set for the selected tenant = distinct UMD job_id carried in the
-# engine-visible task submissions of THIS tenant (never a global scan).
-# SDK 1.38.1 stores the workflow input in v1_task_event.data; v1_task.input is
-# empty for these rows. Retain direct/nested task-input forms and event data
-# for compatibility across server revisions.
-live_job_ids="$(psql -tAc "SELECT string_agg(DISTINCT quote_literal(COALESCE(t.input->>'job_id', t.input->'input'->>'job_id', e.data->>'job_id', e.data->'input'->>'job_id')), ',') FROM v1_task t JOIN v1_task_event e ON e.tenant_id = t.tenant_id AND e.task_id = t.id AND e.task_inserted_at = t.inserted_at WHERE t.tenant_id = '$selected_tenant' AND COALESCE(t.input->>'job_id', t.input->'input'->>'job_id', e.data->>'job_id', e.data->'input'->>'job_id') IS NOT NULL" | tr -d '[:space:]')"
-if [ -z "$live_job_ids" ]; then
-  fail "no live UMD job_id found in the selected tenant's persisted v1 task input/event submissions; cannot scope callback-owned rows to the live submission set"
-fi
 # Post-marker window guard: the workflow records the DB timestamp BEFORE the
 # live suite runs; rows created before that marker are pre-existing and cannot
 # satisfy the gate.
 submission_marker="$(cat submission-marker.txt 2>/dev/null | tr -d '[:space:]' || true)"
 if [ -z "$submission_marker" ]; then
   fail "submission-marker.txt missing (workflow must record the pre-live-suite DB timestamp before submission); cannot apply the post-marker window guard"
+fi
+# Live job-ID set for the selected tenant = distinct UMD job_id carried in
+# engine-visible TASK_INPUT payloads created after the marker (never a global
+# scan). SDK 1.38.1 stores the submitted workflow input in v1_payload.inline_content;
+# v1_task.input is {} and payload rows are the authoritative input surface.
+live_job_ids="$(psql -tAc "SELECT string_agg(DISTINCT quote_literal(COALESCE(p.inline_content->'input'->>'job_id', p.inline_content->>'job_id')), ',') FROM v1_payload p WHERE p.tenant_id = '$selected_tenant' AND p.type = 'TASK_INPUT' AND p.inserted_at >= to_timestamp('$submission_marker', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') AND COALESCE(p.inline_content->'input'->>'job_id', p.inline_content->>'job_id') IS NOT NULL" | tr -d '[:space:]')"
+if [ -z "$live_job_ids" ]; then
+  fail "no live UMD job_id found in the selected tenant's persisted TASK_INPUT payloads; cannot scope callback-owned rows to the live submission set"
 fi
 # Scope every callback-owned class through the live job-ID set AND the window.
 stage_run_rows="$(psql -tAc "SELECT count(*) FROM stage_run WHERE job_id IN ($live_job_ids) AND created_at >= to_timestamp('$submission_marker', 'YYYY-MM-DD\"T\"HH24:MI:SS.US')" | tr -d '[:space:]')"
@@ -245,7 +249,7 @@ audit_rows="$(psql -tAc "SELECT count(*) FROM job_run_audit WHERE job_id IN ($li
 # false positive: count how many StageCompleted rows fall OUTSIDE the live
 # tenant-scoped set (e.g. the mock `mock-job`) and confirm they are NOT what
 # satisfies the gate.
-mock_or_outside="$(psql -tAc "SELECT count(*) FROM semantic_event se WHERE se.event_type = 'StageCompleted' AND NOT EXISTS (SELECT 1 FROM v1_task t JOIN v1_task_event e ON e.tenant_id = t.tenant_id AND e.task_id = t.id AND e.task_inserted_at = t.inserted_at WHERE t.tenant_id = '$selected_tenant' AND COALESCE(t.input->>'job_id', t.input->'input'->>'job_id', e.data->>'job_id', e.data->'input'->>'job_id') = se.payload->>'job_id')" | tr -d '[:space:]')"
+mock_or_outside="$(psql -tAc "SELECT count(*) FROM semantic_event se WHERE se.event_type = 'StageCompleted' AND NOT EXISTS (SELECT 1 FROM v1_payload p WHERE p.tenant_id = '$selected_tenant' AND p.type = 'TASK_INPUT' AND COALESCE(p.inline_content->'input'->>'job_id', p.inline_content->>'job_id') = se.payload->>'job_id')" | tr -d '[:space:]')"
 {
   echo "submission_marker: $submission_marker"
   echo "live_job_ids (scoped v1 task input predicate): $live_job_ids"
