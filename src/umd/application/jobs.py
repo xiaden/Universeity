@@ -152,11 +152,6 @@ class JobService:
         if rec is None:
             raise KeyError(f"unknown job {job_id}")
         if stage is None:
-            # A completed job is terminal and cannot be cancelled. This matters for
-            # content-addressed duplicate uploads: they can resolve to the same
-            # canonical job after it has already completed.
-            if self.status(job_id) == JobStatus.COMPLETE:
-                return self._store.get(job_id) or rec
             self._store.update_status(job_id, JobStatus.CANCELLED, error=reason)
         else:
             cancelled = set(rec.cancelled_stages) | set(self._closure(stage))
