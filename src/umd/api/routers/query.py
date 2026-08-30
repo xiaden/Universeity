@@ -53,6 +53,9 @@ def _hit(h: QueryResultHit) -> dict[str, Any]:
         "confidence": h.confidence,
         "source_id": h.source_id,
         "segment_id": h.segment_id,
+        "provenance": h.provenance,
+        "generated_by": h.generated_by,
+        "capabilities": h.capabilities,
         "data": h.data,
     }
 

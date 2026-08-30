@@ -104,6 +104,9 @@ class EvidenceResponse(BaseModel):
     predicate: str | None = None
     object_ref: str | None = None
     confidence: float | None = None
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    generated_by: dict[str, Any] = Field(default_factory=dict)
+    capabilities: dict[str, Any] = Field(default_factory=dict)
     data: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -185,7 +188,7 @@ class ProvenanceResponse(BaseModel):
     current: dict[str, Any] | None = None
     prior: dict[str, Any] | None = None
     actor: str | None = None
-    change_cause: str | None = None
+    change_cause: dict[str, Any] | None = None
     history: list[dict[str, Any]] = Field(default_factory=list)
 
 

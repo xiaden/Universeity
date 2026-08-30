@@ -79,6 +79,9 @@ class QueryResultHit(BaseModel):
     confidence: float | None = None
     source_id: str | None = None
     segment_id: str | None = None
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    generated_by: dict[str, Any] = Field(default_factory=dict)
+    capabilities: dict[str, Any] = Field(default_factory=dict)
     data: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -297,6 +300,13 @@ class QueryService:
                 source_id=str(r.source_id) if r.source_id else None,
                 segment_id=str(r.segment_id) if r.segment_id else None,
                 confidence=r.confidence,
+                provenance={
+                    "source_id": str(r.source_id) if r.source_id else None,
+                    "segment_id": str(r.segment_id) if r.segment_id else None,
+                    "locator": r.locator,
+                },
+                generated_by={},
+                capabilities={"evidence_kind": r.evidence_kind},
             ),
         )
         page.result_kinds = [_SE]

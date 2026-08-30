@@ -394,6 +394,28 @@ def list_segment_evidence(
             predicate=e.evidence_kind,
             object_ref=e.locator,
             confidence=e.confidence,
+            provenance={
+                "source_id": str(e.source_id) if e.source_id else None,
+                "segment_id": str(e.segment_id) if e.segment_id else None,
+                "locator": e.locator,
+                "extraction_stage": e.extraction_stage,
+                "config_digest": e.config_digest,
+            },
+            generated_by={
+                "tool_versions": e.tool_versions,
+                "extraction_stage": e.extraction_stage,
+            },
+            capabilities={
+                "evidence_kind": e.evidence_kind,
+                "quality": e.quality,
+            },
+            data={
+                "language": e.language,
+                "track": e.track,
+                "raw_ref": e.raw_ref,
+                "normalized_ref": e.normalized_ref,
+                "artifact_ref": e.artifact_ref,
+            },
         )
         for e in all_ev[offset : offset + limit]
     ]

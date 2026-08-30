@@ -55,7 +55,7 @@ def split_segment(
         subject_ref=segment_id,
         object_ref=None,
         authority="operator",
-        created_by=getattr(_p, "key", "anon"),
+        actor=getattr(_p, "key", "anon"),
     )
     return _commit_to_action(segment_id, "split", commit)
 
@@ -71,7 +71,7 @@ def merge_segment(
         subject_ref=segment_id,
         object_ref=None,
         authority="operator",
-        created_by=getattr(_p, "key", "anon"),
+        actor=getattr(_p, "key", "anon"),
     )
     return _commit_to_action(segment_id, "merge", commit)
 

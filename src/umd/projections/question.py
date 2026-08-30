@@ -63,6 +63,9 @@ class AnswerItem(BaseModel):
     confidence: float | None = None
     locator: str | None = None
     source_id: str | None = None
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    generated_by: dict[str, Any] = Field(default_factory=dict)
+    capabilities: dict[str, Any] = Field(default_factory=dict)
     data: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -242,6 +245,14 @@ class QuestionService:
             confidence=h.confidence,
             locator=_locator_of(h),
             source_id=h.source_id,
+            provenance={
+                "ref": h.ref,
+                "source_id": h.source_id,
+                "segment_id": h.segment_id,
+                "locator": _locator_of(h),
+            },
+            generated_by=dict(h.data.get("generated_by", {})),
+            capabilities=dict(h.data.get("capabilities", {})),
             data=h.data,
         )
 

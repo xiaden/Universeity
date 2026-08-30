@@ -150,6 +150,9 @@ def test_public_contract_smoke_flow(api_ctx) -> None:
     assert rq.status_code == 200, rq.text
     qb = rq.json()
     assert any(res["value"] == "The game is afoot, Watson" for res in qb["results"])
+    for result in qb["results"]:
+        for key in ("provenance", "confidence", "generated_by", "capabilities"):
+            assert key in result
     assert qb["bound_report"]["bounded"] is True
     assert qb["freshness"]["status"] == "fresh"
     assert qb["freshness"]["applied_seq"] >= token_latest
@@ -161,7 +164,11 @@ def test_public_contract_smoke_flow(api_ctx) -> None:
     assert "UTTERANCE" in sab["compiled_ops"]
     # compiled from typed operations, never an unstructured-only answer path.
     assert "typed relational" in sab["provenance"]["authority"]
-    assert any(item["value"] == "The game is afoot, Watson" for item in sab["answer"])
+    answer_item = next(
+        item for item in sab["answer"] if item["value"] == "The game is afoot, Watson"
+    )
+    for key in ("provenance", "confidence", "generated_by", "capabilities"):
+        assert key in answer_item
 
     # -- exact search with result-kind labels --------------------------------
     rsearch = client.post("/v1/search", json={"query": "afoot", "mode": "exact"}, headers=R)
