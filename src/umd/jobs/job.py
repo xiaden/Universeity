@@ -81,6 +81,10 @@ class JobStore(Protocol):
 
     def record_stage(self, job_id: str, state: StageState) -> None: ...
 
+    def set_execution(
+        self, job_id: str, stages: set[str], causation: str | None = None
+    ) -> None: ...
+
     def canonical_evidence_refs(
         self,
         source_id: str | None,
@@ -158,6 +162,14 @@ class InMemoryJobStore:
         self._stages.setdefault(job_id, [])
         self._stages[job_id] = [s for s in self._stages[job_id] if s.stage_name != state.stage_name]
         self._stages[job_id].append(state)
+
+    def set_execution(self, job_id: str, stages: set[str], causation: str | None = None) -> None:
+        job = self._ensure_job(job_id)
+        job.request["expected_stages"] = sorted(stages)
+        if causation is None:
+            job.request.pop("execution_causation", None)
+        else:
+            job.request["execution_causation"] = causation
 
     def canonical_evidence_refs(
         self,

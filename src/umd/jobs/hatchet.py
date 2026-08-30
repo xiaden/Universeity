@@ -165,6 +165,7 @@ class UmdStageInput(BaseModel):
     stage: str
     manifest: dict[str, Any]
     manifests: dict[str, dict[str, Any]] | None = None
+    selected_stages: list[str] | None = None
     causation_id: str | None = None
 
 

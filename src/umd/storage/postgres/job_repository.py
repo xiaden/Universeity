@@ -103,6 +103,19 @@ class PostgresJobRepository:
             )
         return self.get(job_id) or JobRecord(job_id, None, "", JobStatus.CANCELLED)
 
+    def set_execution(self, job_id: str, stages: set[str], causation: str | None = None) -> None:
+        with self._engine.begin() as conn:
+            row = conn.execute(sa.select(_job_t.c.request).where(_job_t.c.id == job_id)).first()
+            if row is None:
+                raise KeyError(f"unknown job {job_id}")
+            request = dict(row.request or {})
+            request["expected_stages"] = sorted(stages)
+            if causation is None:
+                request.pop("execution_causation", None)
+            else:
+                request["execution_causation"] = causation
+            conn.execute(_job_t.update().where(_job_t.c.id == job_id).values(request=request))
+
     def get(self, job_id: str) -> JobRecord | None:
         with self._engine.connect() as conn:
             row = conn.execute(sa.select(_job_t).where(_job_t.c.id == job_id)).first()
@@ -122,14 +135,24 @@ class PostgresJobRepository:
         )
 
     def stage_states(self, job_id: str) -> list[StageState]:
+        rec = self.get(job_id)
+        expected = set((rec.request if rec else {}).get("expected_stages", []))
+        causation = (rec.request if rec else {}).get("execution_causation")
         with self._engine.connect() as conn:
-            run_rows = conn.execute(
-                sa.select(
-                    _run_t.c.stage_name,
-                    _run_t.c.status,
-                    _run_t.c.idempotency_key,
-                ).where(_run_t.c.job_id == job_id)
-            ).fetchall()
+            run_query = sa.select(
+                _run_t.c.stage_name,
+                _run_t.c.status,
+                _run_t.c.idempotency_key,
+                _run_t.c.input_manifest,
+            ).where(_run_t.c.job_id == job_id)
+            if expected and causation is not None:
+                run_query = run_query.where(
+                    sa.or_(
+                        ~_run_t.c.stage_name.in_(expected),
+                        _run_t.c.input_manifest["rerun_causation"].astext == causation,
+                    )
+                )
+            run_rows = conn.execute(run_query).fetchall()
             attempt_rows = conn.execute(
                 sa.select(_audit_t.c.stage_name, sa.func.count())
                 .where((_audit_t.c.job_id == job_id) & (_audit_t.c.action.in_(["start", "retry"])))

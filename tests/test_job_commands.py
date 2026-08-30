@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from job_helpers import FakeExecutor, ok
 from umd.application.jobs import JobService, projection_pause_reason
 from umd.jobs.dag import STAGE_ORDER
-from umd.jobs.job import InMemoryJobStore
+from umd.jobs.job import InMemoryJobStore, JobStatus, StageState
 from umd.jobs.runner import DurableDAGRunner
 
 ALL_WORK = {stage: ok for stage in STAGE_ORDER}
@@ -173,6 +173,8 @@ def test_rerun_stage_is_descendant_only() -> None:
         "CURRENT_SEARCH_PROJECTION",
     }
     assert rerun == planned
+    assert store.get("job-b1").request["expected_stages"] == sorted(planned)
+    assert store.get("job-b1").request["execution_causation"] == "user-correction"
 
 
 def test_invalidate_returns_targets_and_pause_reason() -> None:
@@ -273,3 +275,21 @@ def test_job_status_failed_when_a_stage_fails() -> None:
         work_registry=work,
     )
     assert svc.status("job-fail") == "failed"
+
+
+def test_incomplete_full_dag_never_reports_complete() -> None:
+    """A partial stage-run set cannot make a full execution terminal."""
+    fake = FakeExecutor()
+    store = InMemoryJobStore()
+    runner = DurableDAGRunner(executor=fake, store=store)  # type: ignore[arg-type]
+    svc = JobService(store=store, runner=runner)
+    job = store.create(
+        job_id="partial-dag",
+        source_id="s-b3f98f72",
+        dag_universe="v1-dag:base",
+    )
+    store.update_status(job.id, JobStatus.RUNNING)
+    store.set_execution(job.id, set(STAGE_ORDER))
+    store.record_stage(job.id, StageState("INGEST", "complete"))
+
+    assert svc.status(job.id) == JobStatus.RUNNING

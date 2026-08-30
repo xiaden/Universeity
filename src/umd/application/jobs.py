@@ -105,6 +105,7 @@ class JobService:
         )
         if job.status == JobStatus.PENDING:
             self._store.update_status(job.id, JobStatus.RUNNING)
+            self._store.set_execution(job.id, set(STAGE_ORDER))
             try:
                 events = self._runner.run_graph(
                     job_id=job.id,
@@ -221,6 +222,7 @@ class JobService:
         targets = self._planner.plan(causation, scope, stage, self._lineage)
         descendant_stages = [t.stage for t in targets.targets]
         if descendant_stages:
+            self._store.set_execution(job_id, set(descendant_stages), causation)
             events = self._runner.run_graph(
                 job_id=job_id,
                 source_id=source_id,
@@ -230,6 +232,7 @@ class JobService:
                 rerun_causation=causation,
             )
             self._persist_queued(job_id, events)
+        self._refresh_status(job_id)
         return targets
 
     def rerun_source(
@@ -250,6 +253,7 @@ class JobService:
         """
         via_ingest = self._planner.plan(causation, scope, None, self._lineage)
         descendant_stages = [s for s in STAGE_ORDER if s != "INGEST"]
+        self._store.set_execution(job_id, set(descendant_stages), causation)
         events = self._runner.run_graph(
             job_id=job_id,
             source_id=source_id,
@@ -301,6 +305,7 @@ class JobService:
                 correlation_id=job_id,
             )
         if descendant_stages:
+            self._store.set_execution(job_id, set(descendant_stages), f"invalidate:{cause}")
             events = self._runner.run_graph(
                 job_id=job_id,
                 source_id=source_id,
@@ -343,12 +348,18 @@ class JobService:
 def _derive_status(rec: JobRecord, states: list[Any]) -> str:
     if rec.status in (JobStatus.CANCELLED, JobStatus.PAUSED, JobStatus.FAILED):
         return rec.status
+    expected = set(rec.request.get("expected_stages", STAGE_ORDER))
+    if not expected:
+        return rec.status
     if not states:
         # No per-stage outcome yet: a job that was submitted (aggregate RUNNING) is
         # queued/in-flight, NOT pending. Returning the durable aggregate status here
         # prevents a RUNNING->PENDING regression for asynchronous submissions.
         return rec.status
-    statuses = {s.status for s in states}
+    by_stage = {s.stage_name: s.status for s in states}
+    if not expected.issubset(by_stage):
+        return JobStatus.RUNNING
+    statuses = {by_stage[stage] for stage in expected}
     if "quarantined" in statuses or "failed" in statuses:
         return JobStatus.FAILED
     if all(st == "complete" for st in statuses):

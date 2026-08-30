@@ -2082,3 +2082,31 @@ def test_canonical_evidence_selection_deterministic_and_fail_closed(umd_db: sa.E
     _seed_complete(evidence=["ref:b"], created="2026-06-02T00:00:00+00:00", job="amb-job")
     with pytest.raises(AmbiguousRequiredEvidenceError):
         store.canonical_evidence_refs(_SOURCE_ID, "v1-dag:base", None, "FORMAT_ANALYSIS")
+
+
+def test_native_submission_preserves_ancestors_and_marks_selected_descendants() -> None:
+    """A static native workflow receives all manifests but rerun causation only for targets."""
+    from umd.jobs.runner import ProductionDAGRunner
+
+    client = _RecordingClient()
+    runner = ProductionDAGRunner(client=client)
+    selected = ["CROSS_SOURCE_ALIGNMENT", "SEMANTIC_RECONCILIATION", "CURRENT_SEARCH_PROJECTION"]
+    runner.run_graph(
+        job_id="rerun-input",
+        source_id=_SOURCE_ID,
+        dag_universe="v1-dag:base",
+        work_registry={},
+        stages=selected,
+        rerun_causation="invalidate:claim-1",
+    )
+
+    assert len(client.submissions) == 1
+    payload = client.submissions[0]["input"]
+    assert payload["selected_stages"] == selected
+    assert set(payload["manifests"]) == set(STAGE_ORDER)
+    for stage, manifest in payload["manifests"].items():
+        causation = manifest["input_manifest"].get("rerun_causation")
+        if stage in selected:
+            assert causation == "invalidate:claim-1"
+        else:
+            assert causation is None

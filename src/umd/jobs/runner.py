@@ -214,19 +214,25 @@ def submit_workflow_runs(
     are declared when the worker registers the workflow; PostgreSQL remains the
     source of truth for evidence and stage idempotency.
     """
+    selected = set(stages)
     manifests = {
         stage: _manifest_for(
-            job_id, source_id, dag_universe, stage, rerun_causation=rerun_causation
+            job_id,
+            source_id,
+            dag_universe,
+            stage,
+            rerun_causation=rerun_causation if stage in selected else None,
         ).to_dict()
-        for stage in stages
+        for stage in STAGE_ORDER
     }
     run_input: dict[str, Any] = {
         "job_id": job_id,
         "source_id": source_id,
         "dag_universe": dag_universe,
-        "stage": stages[0] if stages else STAGE_ORDER[0],
-        "manifest": manifests[stages[0]] if stages else {},
+        "stage": STAGE_ORDER[0],
+        "manifest": manifests[STAGE_ORDER[0]],
         "manifests": manifests,
+        "selected_stages": list(stages),
     }
     if rerun_causation is not None:
         run_input["causation_id"] = rerun_causation
