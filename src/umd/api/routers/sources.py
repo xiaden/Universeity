@@ -192,25 +192,35 @@ def _submit_source(
         ),
     )
 
-    # An omitted work_id starts a new work, matching the application ingestion
-    # contract. Explicit IDs remain strict references to an existing work.
-    effective_work_id = work_id if work_id is not None else uuid.uuid4().hex
-    if work_id is None:
-        ctx.memberships.ensure_work(
-            work_id=effective_work_id,
-            title=original_name or f"{source_id}.txt",
-            work_type=media_kind,
-        )
+    # Reuse the content-addressed source when the bytes have already been
+    # ingested. The OCFL write is idempotent, but the relational source row is
+    # unique by sha512/ocfl_ref, so inserting it again would turn a retry or
+    # duplicate upload into a 500.
+    existing = ctx.memberships.find_source_by_sha512(manifest.sha512)
+    if existing is not None:
+        source_id, existing_work_id = existing
+        effective_work_id = work_id if work_id is not None else existing_work_id
+    else:
+        # An omitted work_id starts a new work, matching the application
+        # ingestion contract. Explicit IDs remain strict references to an
+        # existing work.
+        effective_work_id = work_id if work_id is not None else uuid.uuid4().hex
+        if work_id is None:
+            ctx.memberships.ensure_work(
+                work_id=effective_work_id,
+                title=original_name or f"{source_id}.txt",
+                work_type=media_kind,
+            )
 
-    ctx.memberships.ensure_source(
-        source_id=source_id,
-        ocfl_ref=manifest.object_id,
-        sha512=manifest.sha512,
-        size_bytes=manifest.size_bytes,
-        media_kind=media_kind,
-        original_name=original_name,
-        work_id=effective_work_id,
-    )
+        ctx.memberships.ensure_source(
+            source_id=source_id,
+            ocfl_ref=manifest.object_id,
+            sha512=manifest.sha512,
+            size_bytes=manifest.size_bytes,
+            media_kind=media_kind,
+            original_name=original_name,
+            work_id=effective_work_id,
+        )
     commit = ctx.commands.record_source_ingested(
         source_id=source_id,
         sha512=manifest.sha512,

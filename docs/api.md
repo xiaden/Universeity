@@ -36,9 +36,11 @@ stable, collection responses are **cursor/page paginated**, and failures use
 `original_name`, `source_id`, `content_type`, and `content` (inline text). When
 `work_id` is omitted, ingestion creates a new work and returns its canonical ID;
 when supplied, it must identify an existing work. The bytes are stored
-immutably to OCFL (sha512 content-addressed), a source membership row is
-created, a `SourceIngested` ledger event is appended, and a decomposable job is
-submitted. Returns `source_id`, `work_id`, `ocfl_ref`, `sha512`, `size_bytes`,
+immutably to OCFL (sha512 content-addressed). Duplicate bytes reuse the
+existing source and OCFL object rather than creating a second source row. A
+new source membership row is created, a `SourceIngested` ledger event is
+appended, and a decomposable job is submitted. Returns `source_id`, `work_id`,
+`ocfl_ref`, `sha512`, `size_bytes`,
 `media_kind`, `seq`, and `consistency_token`.
 
 **Source-native retrieval** (`LocatorRangeResponse`): `object_id`,

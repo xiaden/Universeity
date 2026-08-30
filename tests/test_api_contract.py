@@ -178,7 +178,6 @@ def test_public_contract_smoke_flow(api_ctx) -> None:
     decoded = base64.b64decode(rl.json()["data_b64"]).decode("utf-8")
     assert decoded == content
 
-    # -- untokened read exposes freshness metadata ----------------------------
     ru = client.post(
         "/v1/query/structured",
         json={"kind": "ENTITY", "filters": {"ref": "e:hero"}},
@@ -213,6 +212,34 @@ def test_public_contract_smoke_flow(api_ctx) -> None:
     assert rp2.status_code == 200, rp2.text
     assert rp2.json()["prev_cursor"] is not None
     assert rp2.json()["items"][0]["ref"] != p1["items"][0]["ref"]
+
+
+def test_public_ingest_reuses_content_addressed_source(api_ctx) -> None:
+    """Duplicate bytes reuse the canonical source instead of violating uniqueness."""
+    client, engine = api_ctx.client, api_ctx.engine
+    content = "content-addressed duplicate"
+
+    first = client.post(
+        "/v1/sources",
+        json={"media_kind": "txt", "original_name": "first.txt", "content": content},
+        headers=W,
+    )
+    assert first.status_code == 201, first.text
+    first_body = first.json()
+
+    duplicate = client.post(
+        "/v1/sources",
+        json={"media_kind": "txt", "original_name": "duplicate.txt", "content": content},
+        headers=W,
+    )
+    assert duplicate.status_code == 201, duplicate.text
+    duplicate_body = duplicate.json()
+
+    assert duplicate_body["source_id"] == first_body["source_id"]
+    assert duplicate_body["work_id"] == first_body["work_id"]
+    assert duplicate_body["ocfl_ref"] == first_body["ocfl_ref"]
+    with engine.connect() as conn:
+        assert conn.execute(sa.text("SELECT count(*) FROM source")).scalar() == 1
 
 
 # ---------------------------------------------------------------------------
