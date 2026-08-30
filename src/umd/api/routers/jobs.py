@@ -20,12 +20,12 @@ from umd.api.schemas import JobActionResponse, JobResponse
 router = APIRouter(prefix="/v1/jobs", tags=["jobs"], dependencies=[Depends(enforce_rate_limit)])
 
 
-def _job_response(rec: object, job_id: str) -> JobResponse:
+def _job_response(rec: object, job_id: str, *, status: str | None = None) -> JobResponse:
     return JobResponse(
         id=job_id,
         source_id=getattr(rec, "source_id", None),
         dag_universe=getattr(rec, "dag_universe", "base"),
-        status=getattr(rec, "status", "unknown"),
+        status=status or getattr(rec, "status", "unknown"),
         request=dict(getattr(rec, "request", {}) or {}),
         cancelled_stages=list(getattr(rec, "cancelled_stages", []) or []),
         error=getattr(rec, "error", None),
@@ -41,7 +41,10 @@ def get_job(
     rec = ctx.extra["job_store"].get(job_id)
     if rec is None:
         raise NotFoundError(f"unknown job {job_id}")
-    return _job_response(rec, job_id)
+    # Production callbacks commit stage_run rows asynchronously. Derive the
+    # externally visible aggregate status from those authoritative rows rather
+    # than returning the submission-time RUNNING snapshot from the job table.
+    return _job_response(rec, job_id, status=ctx.jobs.status(job_id))
 
 
 @router.get("/{job_id}/events")
