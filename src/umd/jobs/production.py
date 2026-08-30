@@ -783,27 +783,33 @@ class _Composer:
             man = store.put_immutable(
                 io.BytesIO(payload_bytes), SourceDescriptor(logical_name=name)
             )
-            # Deterministic (CONTRACTS stable-ID / rerunnable-DAG): a rerun of the
-            # same video source + track derives the SAME subtitle source id, so
-            # LOW_LEVEL_EXTRACTION is idempotent (no duplicated subtitle sources or
-            # evidence). Preserves Plan G rerun semantics (the subtitle branch is
-            # Plan H's addition only).
-            t_sid = str(
-                uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"{src['id']}:subtitle-track:{track.get('index', idx)}:"
-                    f"{track.get('language') or 'und'}",
+            # Content-addressed reuse (CONTRACTS stable-ID / rerunnable-DAG): the
+            # extracted track bytes may already be a committed source — a byte-
+            # identical standalone subtitle (re-ingest), or this branch re-running on
+            # a stage retry. Reusing the existing source id keeps the ``ocfl_ref``
+            # unique constraint intact and makes LOW_LEVEL_EXTRACTION idempotent
+            # (no duplicated subtitle source or evidence rows). A fresh track still
+            # derives the SAME deterministic uuid5 id across reruns.
+            existing = memberships.find_source_by_sha512(man.sha512)
+            if existing is not None:
+                t_sid, _existing_work = existing
+            else:
+                t_sid = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"{src['id']}:subtitle-track:{track.get('index', idx)}:"
+                        f"{track.get('language') or 'und'}",
+                    )
                 )
-            )
-            memberships.ensure_source(
-                source_id=t_sid,
-                ocfl_ref=man.object_id,
-                sha512=man.sha512,
-                size_bytes=man.size_bytes,
-                media_kind="subtitle",
-                original_name=name,
-                work_id=None,
-            )
+                memberships.ensure_source(
+                    source_id=t_sid,
+                    ocfl_ref=man.object_id,
+                    sha512=man.sha512,
+                    size_bytes=man.size_bytes,
+                    media_kind="subtitle",
+                    original_name=name,
+                    work_id=None,
+                )
             try:
                 out = invoke_subtitle_parse(sandbox, payload_bytes, name=name)
             except Exception as exc:  # noqa: BLE001 - quarantine containment

@@ -180,6 +180,66 @@ def test_production_registry_video_branch_commits_scenes_and_subtitles(umd_db, t
     assert "metadata" in kinds, f"expected stream/composition metadata, got {kinds}"
 
 
+@pytest.mark.skipif(
+    __import__("os").environ.get("UMD_TEST_POSTGRES") != "true",
+    reason="production registry composition requires live PostgreSQL",
+)
+def test_video_embedded_subtitle_track_reuses_committed_bytes(umd_db, tmp_path) -> None:
+    """A byte-identical embedded subtitle track (already committed as a standalone
+    subtitle source) is content-addressed reused, not re-inserted: LOW_LEVEL_EXTRACTION
+    must not violate the ``source_ocfl_ref_key`` unique constraint on re-ingest/retry.
+    """
+    from umd.jobs.stage_execution import StageOutcome
+    from umd.security.sandbox import SubprocessSandboxRunner
+    from umd.video.runner import extract_embedded_subtitles
+
+    mod = _production_module()
+    runtime = _runtime(umd_db, tmp_path, sandbox=SubprocessSandboxRunner())
+    registry = mod.StageWorkRegistryFactory.build(runtime)
+    stage = registry["LOW_LEVEL_EXTRACTION"]
+
+    video = dialogue_video_bytes()
+    extracted = extract_embedded_subtitles(SubprocessSandboxRunner(), video, name="dialogue.mkv")
+    assert extracted and extracted[0]["extractable"]
+    track_payload = bytes(extracted[0]["payload"])
+
+    # Standalone subtitle source committed FIRST, byte-identical to the embedded track.
+    _seed_source(
+        umd_db,
+        runtime["source_store"],
+        track_payload,
+        source_id="aaaaaaaa-0000-0000-0000-000000000001",
+        media_kind="subtitle",
+        name="dialog.srt",
+    )
+    assert _sources_count(umd_db, "subtitle") == 1
+
+    # Video source whose embedded track is byte-identical to the standalone subtitle.
+    _seed_source(
+        umd_db,
+        runtime["source_store"],
+        video,
+        source_id="bbbbbbbb-0000-0000-0000-000000000002",
+        media_kind="video",
+        name="dialogue.mkv",
+    )
+    manifest = mod.StageManifest(
+        job_id="media-video-subtitle-reuse",
+        stage_name="LOW_LEVEL_EXTRACTION",
+        source_id="bbbbbbbb-0000-0000-0000-000000000002",
+        dag_universe=None,
+        evidence_refs=[],
+        input_manifest={"source_id": "bbbbbbbb-0000-0000-0000-000000000002"},
+    )
+    outcome = stage(manifest)
+    assert isinstance(outcome, StageOutcome)
+    assert outcome.evidence_refs, "video branch must produce real evidence refs"
+    # Content-addressed reuse: the embedded track maps to the EXISTING standalone
+    # subtitle source — no duplicate source row (which previously violated
+    # source_ocfl_ref_key and failed/quarantined the stage).
+    assert _sources_count(umd_db, "subtitle") == 1
+
+
 # --- P3-S5: composed audio-ASR evidence through the video branch -----------------
 
 
