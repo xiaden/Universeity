@@ -72,7 +72,8 @@ services:
       UMD_ROLE: api
       <<: *umd-api-env
       # P3-S3: the API release factory dispatches through ProductionDAGRunner to the
-      # sole v1 scheduler using the SDK installed in the worker target, and consumes the SAME real-tenant-JWT Hatchet surface as
+      # sole v1 scheduler using the SDK installed in the worker target, and
+      # consumes the SAME real-tenant-JWT Hatchet surface as
       # the worker (build_hatchet_client reads these env vars). gRPC host_port routes
       # to the ENGINE (7070), never the dashboard.
       UMD_HATCHET_SERVER_URL: http://hatchet-dashboard:8080
@@ -103,7 +104,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
       # P3-S2: the worker role uses the `worker` build target (installs the pinned
-      # `.[worker]` extra + SDK import smoke test); the API stays on the lean base.
+      # `.[worker]` extra + SDK import smoke test), as does the API role above.
       target: worker
     command: ["worker"]
     environment:
