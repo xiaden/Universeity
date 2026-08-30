@@ -178,9 +178,9 @@ for task in ingest format_analysis basic_segmentation low_level_extraction struc
     basic_segmentation) expected_parents="umd-format_analysis" ;;
     low_level_extraction) expected_parents="umd-basic_segmentation" ;;
     structural_analysis) expected_parents="umd-low_level_extraction" ;;
-    entity_resolution) expected_parents="umd-structural_analysis,umd-low_level_extraction" ;;
+    entity_resolution) expected_parents="umd-low_level_extraction,umd-structural_analysis" ;;
     cross_source_alignment) expected_parents="umd-entity_resolution,umd-structural_analysis" ;;
-    semantic_reconciliation) expected_parents="umd-entity_resolution,umd-cross_source_alignment" ;;
+    semantic_reconciliation) expected_parents="umd-cross_source_alignment,umd-entity_resolution" ;;
     current_search_projection) expected_parents="umd-semantic_reconciliation" ;;
   esac
   task_row="$(psql -tAc "WITH latest AS (SELECT wv.\"createWorkflowVersionOpts\" AS opts FROM \"WorkflowVersion\" wv JOIN \"Workflow\" w ON w.\"id\" = wv.\"workflowId\" WHERE w.\"name\" = '$NATIVE_WORKFLOW' AND w.\"tenantId\" = '$selected_tenant' ORDER BY wv.\"order\" DESC LIMIT 1) SELECT task->>'ReadableId' || '|' || (task->>'isDurable') || '|' || COALESCE((SELECT string_agg(parent, ',' ORDER BY parent) FROM jsonb_array_elements_text(task->'Parents') AS parent), '') FROM latest, jsonb_array_elements(latest.opts->'Tasks') AS task WHERE task->>'ReadableId' = 'umd-$task'")"
