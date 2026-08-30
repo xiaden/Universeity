@@ -370,7 +370,9 @@ def test_boundary_ingest_decompose_retrieve_heterogeneous(api_ctx: ApiCtx) -> No
     # P4-S3: cross-source alignment (adaptation correspondence) many-to-many + adaptation-aware.
     left, right = next(iter(k_txt)), next(iter(k_md))
     al = client.post(
-        f"/v1/alignment?left_ref={left}&right_ref={right}&alignment_type=ADAPTATION", headers=W
+        "/v1/alignment",
+        params={"left_ref": left, "right_ref": right, "alignment_type": "ADAPTATION"},
+        headers=W,
     )
     assert al.status_code == 201, al.text
     assert al.json()["action"] == "ADAPTATION"
@@ -567,7 +569,7 @@ def test_boundary_correction_invalidation_selective_rerun(api_ctx: ApiCtx) -> No
     assert seg1 == seg0 and low1 == low0
     loc = client.get(f"/v1/locators/{s.audio['ocfl_ref']}?start=0&length=4096", headers=R)
     assert loc.status_code == 200, loc.text
-    assert base64.b64decode(loc.json()["data_b64"]) == ordinary_speech_wav_bytes()
+    assert base64.b64decode(loc.json()["data_b64"]) == ordinary_speech_wav_bytes()[:4096]
 
     # Corrected Tier-0 answer is reflected and the machine answer is gone.
     sem = client.post(
