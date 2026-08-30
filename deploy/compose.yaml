@@ -65,15 +65,14 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-      # The api role runs the lean `runtime` base stage (CMD api); the `worker`
-      # stage is the Dockerfile's LAST stage, so without an explicit target Docker
-      # would default to it and the api image would run the worker branch.
-      target: runtime
+      # The API dispatches the production DAG through the Hatchet SDK, so it
+      # requires the same worker build target as the worker role.
+      target: worker
     environment:
       UMD_ROLE: api
       <<: *umd-api-env
       # P3-S3: the API release factory dispatches through ProductionDAGRunner to the
-      # sole v1 scheduler, so it consumes the SAME real-tenant-JWT Hatchet surface as
+      # sole v1 scheduler using the SDK installed in the worker target, and consumes the SAME real-tenant-JWT Hatchet surface as
       # the worker (build_hatchet_client reads these env vars). gRPC host_port routes
       # to the ENGINE (7070), never the dashboard.
       UMD_HATCHET_SERVER_URL: http://hatchet-dashboard:8080

@@ -5,7 +5,8 @@
 # configuration is injected at runtime via environment / Docker secrets / a
 # mounted .env — the Dockerfile contains zero credential values or variables
 # carrying them. Build-time only installs the pinned test-verified dependency
-# set; no creation keys, no tokens.
+# set; no creation keys, no tokens. Both API and worker use the worker target
+# because production API dispatch requires the Hatchet SDK.
 #
 # Note: this image copies the source tree and installs the pyproject dependency
 # pins. Container builds are performed in CI/registry (not available in the
@@ -51,8 +52,8 @@ ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["api"]
 
 # ---------------------------------------------------------------------------
-# Worker image (P3-S2): the API role stays lean (base runtime deps only); the
-# worker role installs the pinned OPT-IN `.[worker]` extra (hatchet-sdk==1.38.1)
+# Worker image (P3-S2): the worker role installs the pinned OPT-IN `.[worker]`
+# extra (hatchet-sdk==1.38.1)
 # and smoke-tests the SDK import WITHOUT promoting the candidate pair. Hatchet
 # is a GATED dependency: the SDK<->server pair remains CANDIDATE/PENDING live
 # validation (deploy/pins/runtime.txt) — installing it here does not promote it.

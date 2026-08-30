@@ -188,16 +188,14 @@ def test_dockerfile_worker_target_installs_worker_extra_and_smoke_tests_sdk() ->
     assert 'RUN pip install --no-cache-dir ".[worker]"' in worker_stage
 
 
-def test_compose_worker_and_sandbox_use_worker_build_target() -> None:
-    """P3-S2: the worker and sandbox-runner services build the `worker` target;
-    the api service stays on the lean base (no explicit worker target)."""
+def test_compose_api_worker_and_sandbox_use_worker_build_target() -> None:
+    """The API, worker, and sandbox-runner build the target with Hatchet SDK."""
     compose = _compose()
-    # worker + sandbox-runner select the worker build target (SDK installed).
-    assert compose.count("target: worker") >= 2
+    # API + worker + sandbox-runner select the worker build target (SDK installed).
+    assert compose.count("target: worker") >= 3
     assert "dockerfile: deploy/Dockerfile" in compose
-    # The api service does NOT pin the worker target (lean base).
     api_block = compose.split("  api:", 1)[1].split("\n  worker:", 1)[0]
-    assert "target: worker" not in api_block
+    assert "target: worker" in api_block
 
 
 def test_compose_api_exports_hatchet_worker_env() -> None:
