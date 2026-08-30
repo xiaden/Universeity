@@ -153,35 +153,6 @@ class ReplayDriver:
         force_resume: bool = False,
     ) -> BuildReport:
         started = time.monotonic()
-        cp = self.store.get(builder.projection_name) or ProjectionCheckpoint(
-            builder.projection_name
-        )
-
-        # A paused projection stays paused until explicitly resumed.
-        if cp.pause_reason is not None and not force_resume:
-            self.paused = True
-            self.pause_reason = cp.pause_reason
-            self.applied_seq = cp.applied_seq
-            tail = self._ledger_tail()
-            report = self._report(builder.projection_name, tail, wipe=False, events_seen=0)
-            self._record_metrics(report, time.monotonic() - started)
-            return report
-
-        start_seq = 0 if wipe else cp.applied_seq
-        if force_resume:
-            cp = cp.resumed()
-
-        self.paused = False
-        self.pause_reason = None
-        self.events_seen = 0
-        self.skipped = 0
-        # Canonical fold always rebuilds from EMPTY so a Tier-1 projection derives the
-        # complete canonical state (cross-tier equivalence). ``wipe``/``force_resume``
-        # also rebuild the index from scratch (apply from seq 0); otherwise the index
-        # applies only not-yet-applied events while still folding everything.
-        self.state = CurrentReducedState()
-        fold_from = 0
-        apply_from = 0 if (wipe or force_resume) else start_seq
 
         with self.engine.begin() as conn:
             # Serialize shared projection rebuilds before reading the event tail;
@@ -198,9 +169,32 @@ class ReplayDriver:
             cp = self.store.get(builder.projection_name, conn=conn) or ProjectionCheckpoint(
                 builder.projection_name
             )
+            # A paused projection stays paused until explicitly resumed. This
+            # check must happen after acquiring the cross-process rebuild lock.
+            if cp.pause_reason is not None and not force_resume:
+                self.paused = True
+                self.pause_reason = cp.pause_reason
+                self.applied_seq = cp.applied_seq
+                tail = self._ledger_tail()
+                report = self._report(builder.projection_name, tail, wipe=False, events_seen=0)
+                self._record_metrics(report, time.monotonic() - started)
+                return report
+
             start_seq = 0 if wipe else cp.applied_seq
             if force_resume:
                 cp = cp.resumed()
+
+            self.paused = False
+            self.pause_reason = None
+            self.events_seen = 0
+            self.skipped = 0
+            # Canonical fold always rebuilds from EMPTY so a Tier-1 projection derives the
+            # complete canonical state (cross-tier equivalence). ``wipe``/``force_resume``
+            # also rebuild the index from scratch (apply from seq 0); otherwise the index
+            # applies only not-yet-applied events while still folding everything.
+            self.state = CurrentReducedState()
+            fold_from = 0
+            apply_from = 0 if (wipe or force_resume) else start_seq
             if wipe or force_resume:
                 builder.wipe(conn, self)
             builder.prepare(conn, self)
