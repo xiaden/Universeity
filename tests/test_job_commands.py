@@ -200,13 +200,15 @@ def test_invalidate_returns_targets_and_pause_reason() -> None:
     assert {t.stage for t in targets.targets} == set(fake.calls)
 
 
-def test_cancel_then_retry_does_not_repeat_successful_work() -> None:
+def test_completed_job_cancel_is_noop_and_retry_does_not_repeat_work() -> None:
     fake = FakeExecutor()
     svc, _, _ = _service(fake)
     _submit(svc, fake)
-    # Whole-job cancel stops further scheduling.
+    # A terminal canonical job cannot be cancelled. This is important when a
+    # content-addressed duplicate resolves to a job that a prior test already
+    # completed.
     svc.cancel(job_id="job-b1", reason="operator stop")
-    assert svc.status("job-b1") == "cancelled"
+    assert svc.status("job-b1") == "complete"
 
     # Retry: only NON-complete stages are scheduled. All stages succeeded, so
     # nothing is re-scheduled -> no repeated successful stage work.
@@ -214,6 +216,17 @@ def test_cancel_then_retry_does_not_repeat_successful_work() -> None:
     svc.retry(job_id="job-b1", work_registry=ALL_WORK, dag_universe="v1-dag:base")
     assert len(fake.calls) == calls_before
     assert svc.status("job-b1") == "complete"
+
+
+def test_in_flight_job_can_be_cancelled() -> None:
+    fake = FakeExecutor()
+    svc, store, _ = _service(fake)
+    job = store.create(job_id="in-flight", source_id="s-b3f98f72", dag_universe="v1-dag:base")
+    assert job.status == JobStatus.PENDING
+    store.update_status(job.id, JobStatus.RUNNING)
+
+    svc.cancel(job_id=job.id, reason="operator stop")
+    assert svc.status(job.id) == "cancelled"
 
 
 def test_single_stage_cancel_is_partial() -> None:
