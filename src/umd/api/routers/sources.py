@@ -459,7 +459,10 @@ def rerun_source(
     ctx.jobs.rerun_source(
         source_id=source_id,
         scope="SOURCE",
-        causation="api:rerun",
+        # Each rerun is a new execution generation.  Reusing one causation
+        # would reuse the same deterministic stage idempotency keys, causing a
+        # later correction to replay an earlier projection rebuild.
+        causation=f"api:rerun:{uuid.uuid4().hex}",
         dag_universe="base",
         work_registry=ctx.work_registry,
         job_id=job_id,
