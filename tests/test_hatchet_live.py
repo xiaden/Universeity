@@ -181,41 +181,50 @@ class _RecordingClient:
     def __init__(self) -> None:
         self.workflows: dict[str, Any] = {}
         self.callbacks: dict[str, Any] = {}
+        self.tasks: dict[str, Any] = {}
         self.submissions: list[dict[str, Any]] = []
         self.started: bool = False
 
-    def durable_task(
-        self,
-        *,
-        name: str | None = None,
-        input_validator: Any = None,
-        eviction_policy: Any = None,
-    ) -> Any:
-        del input_validator, eviction_policy
+    def workflow(self, *, name: str, input_validator: Any = None) -> Any:
+        del input_validator
+        client = self
 
-        def decorator(fn: Any) -> Any:
-            assert name is not None, "recording client durable_task requires a name"
-            self.callbacks[name] = fn
-            self.workflows[name] = fn
-            return fn
+        class Workflow:
+            def durable_task(
+                self, *, name: str, parents: list[Any], eviction_policy: Any = None
+            ) -> Any:
+                del eviction_policy
 
-        return decorator
+                class Task:
+                    def __init__(self) -> None:
+                        self.name = name
+                        self.parents = parents
+
+                    def __call__(self, fn: Any) -> Any:
+                        client.callbacks[name] = fn
+                        client.workflows[name] = fn
+                        return self
+
+                task = Task()
+                client.tasks[name] = task
+                return task
+
+            def run_no_wait(self, *, input: Any) -> str:
+                client.submissions.append({"workflow_name": name, "input": input})
+                return "run-umd-decomposition"
+
+        return Workflow()
+
+    def run_no_wait(self, *, input: Any) -> str:
+        self.submissions.append({"workflow_name": "umd-decomposition", "input": input})
+        return "run-umd-decomposition"
 
     def submit_workflow_run(
         self, workflow_name: str, input: dict[str, Any], parent_id: str | None = None
     ) -> str:
-        # A deterministic per-stage run id lets a test assert the native parent
-        # barrier linkage (a dependent's parent_id == its upstream's run id).
-        run_id = f"run-{str(input.get('stage', 'stage')).lower()}"
-        self.submissions.append(
-            {
-                "workflow_name": workflow_name,
-                "input": input,
-                "parent_id": parent_id,
-                "run_id": run_id,
-            }
-        )
-        return run_id
+        del parent_id
+        self.submissions.append({"workflow_name": workflow_name, "input": input})
+        return "run-umd-decomposition"
 
     def start(self) -> None:
         self.started = True
@@ -380,25 +389,25 @@ def _poll_until(
 
 @pytest.mark.cluster
 @pytest.mark.docker
-def test_every_stage_registers_a_durable_workflow_with_dependencies() -> None:
-    """Every stage in STAGE_ORDER resolves to a durable-registered task whose
-    ``depends_on`` is derived from STAGE_DEPENDENCIES (the single lineage).
-    Registration is durable-only (AT-18): the recording client must register via
-    ``durable_task``, and every canonical ``umd-<stage>`` name must be present."""
+def test_one_workflow_registers_all_durable_tasks_with_native_dependencies() -> None:
+    """One native workflow contains every durable task and exact parent graph."""
     factory = _worker_factory()
     client = _RecordingClient()
-    factory.start(
+    handle = factory.start(
         runtime={},
         work_registry={stage: _ok for stage in STAGE_ORDER},
         executor=None,
         client=client,
     )
-    registered_names = set(client.workflows.keys())
+    assert len(handle.registered_workflows) == 1
+    assert set(client.tasks) == {f"umd-{stage.lower()}" for stage in STAGE_ORDER}
     for stage in STAGE_ORDER:
-        assert f"umd-{stage.lower()}" in registered_names, (
-            f"stage {stage} is not registered as umd-{stage.lower()}"
-        )
-    # The single lineage: depends_on derived from STAGE_DEPENDENCIES.
+        actual = {
+            getattr(parent, "name", None) for parent in client.tasks[f"umd-{stage.lower()}"].parents
+        }
+        expected = {f"umd-{dep.lower()}" for dep, _ in STAGE_DEPENDENCIES.get(stage, ())}
+        assert actual == expected
+    # The same lineage remains exposed in the pure metadata mapping.
     for spec in _hatchet_module().build_hatchet_workflows():
         expected = {dep for dep, _cls in STAGE_DEPENDENCIES[spec.stage]}
         assert set(spec.depends_on) == expected, f"wrong depends_on for {spec.stage}"
@@ -419,7 +428,8 @@ def test_run_graph_submits_real_workflow_runs_with_context() -> None:
     from umd.jobs.hatchet import HatchetRunner
 
     client = _RecordingClient()
-    runner = HatchetRunner(client=client)
+    workflow = client.workflow(name="umd-decomposition")
+    runner = HatchetRunner(client=_hatchet_module()._NativeSubmissionClient(workflow))
     events = runner.run_graph(
         job_id="job-1",
         source_id="src-1",
@@ -1316,21 +1326,27 @@ class _SDKClientDouble:
         self.registered: dict[str, Any] = {}
         self.worker_objects: list[_SDKWorkerObject] = []
 
-    def durable_task(
-        self,
-        *,
-        name: str | None = None,
-        input_validator: Any = None,
-        eviction_policy: Any = None,
-    ) -> Any:
-        del input_validator, eviction_policy
+    def workflow(self, *, name: str, input_validator: Any = None) -> Any:
+        del input_validator
+        client = self
 
-        def decorator(fn: Any) -> Any:
-            assert name is not None, "SDK double durable_task requires a name"
-            self.registered[name] = fn
-            return fn
+        class Workflow:
+            def durable_task(
+                self, *, name: str, parents: list[Any], eviction_policy: Any = None
+            ) -> Any:
+                del parents, eviction_policy
 
-        return decorator
+                def decorator(fn: Any) -> Any:
+                    client.registered[name] = fn
+                    return fn
+
+                return decorator
+
+            def run_no_wait(self, *, input: Any) -> str:
+                client.submissions.append({"workflow_name": name, "input": input})
+                return "run-umd-decomposition"
+
+        return Workflow()
 
     def worker(self, name: str, workflows: Any = None) -> Any:
         worker_obj = _SDKWorkerObject(name, workflows)
@@ -1361,7 +1377,7 @@ def test_sdk_worker_contract_registers_workflows_and_starts_once() -> None:
     )
     # Real-SDK branch registered every workflow and exposed the bindings.
     assert handle.registered_workflows, "no registered workflows collected"
-    assert len(handle.registered_workflows) == len(STAGE_ORDER)
+    assert len(handle.registered_workflows) == 1
     # The factory itself never created the SDK Worker / never started a loop.
     assert client.worker_objects == [], "factory must not create the SDK Worker"
 
@@ -1450,17 +1466,19 @@ def test_client_without_durable_task_fails_closed() -> None:
 
 
 class _FailingDurableClient(_RecordingClient):
-    """A recording client whose ``durable_task`` decorator always raises."""
+    """A recording client whose native task decorator always raises."""
 
-    def durable_task(
-        self,
-        *,
-        name: str | None = None,
-        input_validator: Any = None,
-        eviction_policy: Any = None,
-    ) -> Any:
-        del name, input_validator, eviction_policy
-        raise RuntimeError("decorator boom")
+    def workflow(self, *, name: str, input_validator: Any = None) -> Any:
+        del name, input_validator
+
+        class Workflow:
+            def durable_task(
+                self, *, name: str, parents: list[Any], eviction_policy: Any = None
+            ) -> Any:
+                del name, parents, eviction_policy
+                raise RuntimeError("decorator boom")
+
+        return Workflow()
 
 
 def test_decorator_failure_surfaces_not_suppressed() -> None:
@@ -1477,22 +1495,24 @@ def test_decorator_failure_surfaces_not_suppressed() -> None:
 
 
 class _PartialDurableClient(_RecordingClient):
-    """A recording client whose durable_task returns None (nothing registered)."""
+    """A recording client whose native tasks are not registered."""
 
-    def durable_task(
-        self,
-        *,
-        name: str | None = None,
-        input_validator: Any = None,
-        eviction_policy: Any = None,
-    ) -> Any:
-        del name, input_validator, eviction_policy
+    def workflow(self, *, name: str, input_validator: Any = None) -> Any:
+        del name, input_validator
 
-        def decorator(fn: Any) -> None:
-            del fn
-            return None
+        class Workflow:
+            def durable_task(
+                self, *, name: str, parents: list[Any], eviction_policy: Any = None
+            ) -> Any:
+                del name, parents, eviction_policy
 
-        return decorator
+                def decorator(fn: Any) -> None:
+                    del fn
+                    return None
+
+                return decorator
+
+        return Workflow()
 
 
 def test_partial_registration_never_reports_ready() -> None:
@@ -1857,7 +1877,8 @@ def test_native_parent_barrier_submission_shape() -> None:
     from umd.jobs.hatchet import HatchetRunner
 
     client = _RecordingClient()
-    runner = HatchetRunner(client=client)
+    workflow = client.workflow(name="umd-decomposition")
+    runner = HatchetRunner(client=_hatchet_module()._NativeSubmissionClient(workflow))
     runner.run_graph(
         job_id="barrier-job",
         source_id=_SOURCE_ID,
@@ -1865,19 +1886,10 @@ def test_native_parent_barrier_submission_shape() -> None:
         work_registry={},
         stages=list(STAGE_ORDER),
     )
-    by_stage = {s["input"]["stage"]: s for s in client.submissions}
-    assert set(by_stage) == set(STAGE_ORDER), "one submission per canonical stage"
-    for stage in STAGE_ORDER:
-        sub = by_stage[stage]
-        deps = [d for d, _c in STAGE_DEPENDENCIES.get(stage, ())]
-        if deps:
-            parent_stage = max(deps, key=STAGE_ORDER.index)
-            assert sub["parent_id"] == by_stage[parent_stage]["run_id"], (
-                f"{stage} native parent must be its most-descendant direct dependency "
-                f"(got {sub['parent_id']!r}, expected {by_stage[parent_stage]['run_id']!r})"
-            )
-        else:
-            assert sub["parent_id"] is None, f"{stage} (root) must have no parent"
+    assert len(client.submissions) == 1
+    submitted = client.submissions[0]
+    assert submitted["workflow_name"] == "umd-decomposition"
+    assert set(submitted["input"]["manifests"]) == set(STAGE_ORDER)
 
 
 def test_delayed_parent_barrier_no_dependent_before_upstream_commits(umd_db: sa.Engine) -> None:

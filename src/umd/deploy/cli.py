@@ -66,7 +66,6 @@ def worker() -> int:
 
     from umd.api.app import build_context, engine_from_settings
     from umd.api.entrypoints import build_source_store
-    from umd.jobs.dag import STAGE_ORDER
     from umd.jobs.hatchet import HatchetWorkerFactory, worker_ready_line
 
     # The SAME shared runtime assembly the API release factory uses (Plan K P1-S3).
@@ -125,10 +124,10 @@ def worker() -> int:
     # size of the work registry. A partial registration is a hard failure that
     # exits non-zero BEFORE the readiness line is ever printed.
     n_workflows = len(handle.registered_workflows)
-    if n_workflows != len(STAGE_ORDER):
+    if n_workflows != 1:
         print(
-            f"worker unavailable: registered {n_workflows}/{len(STAGE_ORDER)} stage "
-            "workflows (registration incomplete); refusing to claim ready.",
+            f"worker unavailable: registered {n_workflows}/1 native workflow "
+            "(registration incomplete); refusing to claim ready.",
             file=sys.stderr,
         )
         return 2

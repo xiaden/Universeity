@@ -20,7 +20,7 @@ from typing import Any, Protocol
 
 from umd.observability.metrics import METRICS
 
-from .dag import STAGE_DEPENDENCIES, STAGE_DEPENDENTS, STAGE_ORDER
+from .dag import STAGE_DEPENDENTS, STAGE_ORDER
 from .job import JobStatus, JobStore, StageState
 from .manifest import StageManifest
 from .stage_execution import (
@@ -208,80 +208,56 @@ def submit_workflow_runs(
     stages: list[str],
     rerun_causation: str | None = None,
 ) -> list[StageRunEvent]:
-    """Submit one Hatchet workflow run per stage, carrying the durable context.
+    """Submit one native Hatchet workflow run for the complete stage DAG.
 
-    Submission is asynchronous: each stage executes later in the worker's callback
-    (through :class:`DurableStageExecutor`, see :mod:`umd.jobs.hatchet`). The
-    returned events are therefore ``queued`` — never a fabricated ``complete``.
-    This is the shared submission shape for both :class:`HatchetRunner` and
-    :class:`ProductionDAGRunner` (CONTRACTS.md:61).
+    Every task receives the same direct workflow input. Native parent relationships
+    are declared when the worker registers the workflow; PostgreSQL remains the
+    source of truth for evidence and stage idempotency.
     """
-    events: list[StageRunEvent] = []
-    # Native parent-task barriers (P2-S8). Each stage's submission carries the run id
-    # of its LATEST direct dependency in the STAGE_DEPENDENCIES DAG as ``parent_id``,
-    # threading a topologically-ordered chain. Because the graph is transitively
-    # closed (STAGE_DEPENDENTS), the most-descendant direct dependency itself waits on
-    # every other direct dependency, so a single native parent edge gives a FULL
-    # barrier for multi-parent stages (e.g. ENTITY_RESOLUTION's two upstreams are
-    # transitively ordered). INGEST is the root (no deps) and is submitted with no
-    # parent. No dependent is ever submitted with ``parents: {}`` and no polling /
-    # chaining loop schedules work — this is a pure native Hatchet relationship.
-    run_ids: dict[str, str] = {}
-    for stage in stages:
-        workflow_name = f"umd-{stage.lower()}"
-        # The serialized StageManifest is the durable correlation unit the worker
-        # callback consumes via StageManifest.from_dict (idempotency-key material).
-        # It starts with evidence_refs=[]; the callback resolves committed upstream
-        # refs from the bound JobStore before executor.run (P2-S4, Decision A) —
-        # never at submission time. Folding rerun_causation into input_manifest
-        # mirrors DurableDAGRunner._manifest_for so an invalidated descendant
-        # rekeys and actually re-executes (P3-S3).
-        manifest = _manifest_for(
+    manifests = {
+        stage: _manifest_for(
             job_id, source_id, dag_universe, stage, rerun_causation=rerun_causation
+        ).to_dict()
+        for stage in stages
+    }
+    run_input: dict[str, Any] = {
+        "job_id": job_id,
+        "source_id": source_id,
+        "dag_universe": dag_universe,
+        "stage": stages[0] if stages else STAGE_ORDER[0],
+        "manifest": manifests[stages[0]] if stages else {},
+        "manifests": manifests,
+    }
+    if rerun_causation is not None:
+        run_input["causation_id"] = rerun_causation
+    run_no_wait = getattr(client, "run_no_wait", None)
+    if not callable(run_no_wait):
+        raise RuntimeError(
+            "Hatchet client must expose workflow.run_no_wait for native DAG submission"
         )
-        run_input: dict[str, Any] = {
-            # Raw context fields are preserved for submission-context consumers.
-            "job_id": job_id,
-            "source_id": source_id,
-            "dag_universe": dag_universe,
-            "stage": stage,
-            "manifest": manifest.to_dict(),
-        }
-        if rerun_causation is not None:
-            # Explicit descendant-rerun causation carried to the worker callback
-            # so the audit/stage_run records which invalidation drove this submit
-            # (P3-S3).
-            run_input["causation_id"] = rerun_causation
-        deps = [dep for dep, _cls in STAGE_DEPENDENCIES.get(stage, ())]
-        parent_stage = max(deps, key=STAGE_ORDER.index) if deps else None
-        parent_id = run_ids.get(parent_stage) if parent_stage is not None else None
-        run_id = client.submit_workflow_run(workflow_name, input=run_input, parent_id=parent_id)
-        if isinstance(run_id, str) and run_id:
-            run_ids[stage] = run_id
-        events.append(StageRunEvent(stage, "queued"))
-    # Passive observability (P3-S4): a queued submission per stage + the queue
-    # depth for this job. No second scheduler/process loop — just honest gauges.
+    run_no_wait(input=run_input)
+
     labels = {"job_id": job_id, "source_id": str(source_id or "")}
     METRICS.counter(
         "umd_jobs_submitted",
-        description="stage workflow runs submitted to the scheduler",
+        description="native DAG workflow runs submitted to the scheduler",
         labels=labels,
-    ).inc(len(stages))
+    ).inc()
     METRICS.gauge(
         "umd_scheduler_queue_depth",
-        description="stage workflow runs queued for the job",
+        description="native DAG workflow runs queued for the job",
         labels=labels,
-    ).set(float(len(stages)))
-    return events
+    ).set(1.0)
+    return [StageRunEvent(stage, "queued") for stage in stages]
 
 
 class ProductionDAGRunner:
     """Production :class:`DAGRunner` over the sole Hatchet scheduler.
 
     CONTRACTS.md:61 — the production implementation of the runner seam. It
-    dispatches each stage to a real Hatchet workflow run (the worker's callback
-    executes through :class:`DurableStageExecutor`) and reports the durable
-    ``queued`` state. It never fabricates completion. Test-only synchronous doubles
+    dispatches one native Hatchet workflow run containing the complete stage DAG
+    (the worker's callbacks execute through :class:`DurableStageExecutor`) and reports
+    the durable ``queued`` state. It never fabricates completion. Test-only synchronous doubles
     are excluded from production factories.
     """
 

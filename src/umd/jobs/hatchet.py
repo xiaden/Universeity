@@ -25,7 +25,6 @@ differ numerically.
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
 import time
 from collections.abc import Mapping
@@ -42,8 +41,9 @@ from .manifest import StageManifest
 from .runner import (
     StageRunEvent,
     StageWorkRegistry,
-    submit_workflow_runs,
+    _manifest_for,
 )
+from .runner import submit_workflow_runs as submit_native_workflow
 from .stage_execution import (
     STATUS_CANCELLED,
     STATUS_FAILED,
@@ -157,22 +157,14 @@ def discover_runnable_tenant(
 
 
 class UmdStageInput(BaseModel):
-    """Direct v1 callback input boundary (amendment A2').
-
-    The pinned ``hatchet_sdk==1.38.1`` invokes task callbacks as
-    ``fn(workflow_input, ctx)`` where ``workflow_input`` is the value validated by
-    the registered ``input_validator``. The submission shape is a direct dict with
-    a top-level ``manifest`` (no v0 ``{"input": ...}`` wrapper), so this typed
-    model is registered as the validator and the callback reads ``input.manifest``.
-    ``source_id``/``causation_id`` are optional because one-shot submissions may
-    omit them (rerun causation is carried only for selective reruns).
-    """
+    """Direct v1 input shared by every task in the native UMD workflow."""
 
     job_id: str
     source_id: str | None = None
     dag_universe: str | None = None
     stage: str
     manifest: dict[str, Any]
+    manifests: dict[str, dict[str, Any]] | None = None
     causation_id: str | None = None
 
 
@@ -195,7 +187,7 @@ class HatchetWorkflowSpec:
 
     #: the canonical in-repository stage name.
     stage: str
-    #: upstream stages this workflow depends on (Hatchet ``depends_on``).
+    #: upstream stages this task depends on (metadata mirror of native parents).
     depends_on: list[str] = field(default_factory=list)
     #: evidence classes consumed (the DAG edge metadata).
     consumes: list[str] = field(default_factory=list)
@@ -209,82 +201,14 @@ class HatchetWorkflowSpec:
         }
 
 
-def _real_submit_workflow_run(
-    client: Any, workflow_name: str, input: dict[str, Any], parent_id: str | None = None
-) -> str | None:
-    """Submit one one-shot workflow run through the real hatchet_sdk (1.38.1).
+class _NativeSubmissionClient:
+    """Submission adapter for the single native workflow."""
 
-    The real SDK has no ``client.submit_workflow_run`` attribute (that is a shape
-    only the recording double implements). The one-shot submission surface is
-    ``AdminClient.run_workflow(workflow_name, input, options)`` (admin.py:414).
-    ``Hatchet`` exposes no ``.admin`` attribute, so the AdminClient is reached
-    through public surfaces only: ``Hatchet.runs`` (public property, features/runs.py)
-    → ``RunsClient.admin_client()`` (public accessor, runs.py:150). ``input`` is
-    carried verbatim by ``TriggerWorkflowRequest`` as a JSON-serialized string, so
-    the run context dict is JSON-encoded here.
+    def __init__(self, workflow: Any) -> None:
+        self._workflow = workflow
 
-    P2-S8: ``parent_id`` expresses the NATIVE parent-task relationship — mapped to
-    ``TriggerWorkflowOptions.parent_id`` (types/trigger.py) → ``TriggerWorkflowRequest.parent_id``,
-    which is what the server persists as ``parent_task_id``/``parent_task_external_id``
-    in ``v1_task``. A non-null ``parent_id`` queues this dependent until its parent
-    run COMMITS, which is the barrier that eliminates the ``parents: {}`` race. The
-    workflow run id returned by ``run_workflow`` (``WorkflowRunRef.workflow_run_id``)
-    is what the runner threads as the next stage's ``parent_id``.
-    """
-    runs = getattr(client, "runs", None)
-    admin = getattr(runs, "admin_client", None) if runs is not None else None
-    run_workflow = getattr(admin, "run_workflow", None) if admin is not None else None
-    if not callable(run_workflow):
-        raise HatchetNotConfiguredError(
-            "real hatchet_sdk client has no runs.admin_client().run_workflow submission surface"
-        )
-    # Fail closed on the native barrier (P2-S8): the pinned SDK (1.38.1) MUST be
-    # able to express parent-task/DAG semantics via
-    # ``TriggerWorkflowOptions.parent_id`` -> ``TriggerWorkflowRequest`` (persisted
-    # as ``v1_task.parent_task_external_id``). If the type cannot be imported or has
-    # no ``parent_id`` field, we STOP as a blocker and raise rather than silently
-    # degrade to an independent task (which would reintroduce the ``parents: {}``
-    # race). The plan mandates: never silently submit without the barrier.
-    try:
-        from hatchet_sdk.types.trigger import TriggerWorkflowOptions as _TWOpt
-    except ImportError as exc:  # pragma: no cover - guard against a broken pin
-        raise HatchetNotConfiguredError(
-            "pinned hatchet_sdk cannot import TriggerWorkflowOptions — cannot express "
-            "the native parent graph; refusing to submit without the barrier (P2-S8)"
-        ) from exc
-    if "parent_id" not in getattr(_TWOpt, "model_fields", {}):
-        raise HatchetNotConfiguredError(
-            "pinned hatchet_sdk TriggerWorkflowOptions lacks parent_id — cannot "
-            "express the native parent graph; refusing to submit without the barrier (P2-S8)"
-        )
-    options = _TWOpt(parent_id=parent_id)
-    ref = run_workflow(workflow_name, json.dumps(input), options=options)
-    if ref is None:
-        return None
-    run_id = getattr(ref, "workflow_run_id", None)
-    return run_id if isinstance(run_id, str) else None
-
-
-class _SDKSubmissionShim:
-    """Duck-type bridge so a real hatchet_sdk client satisfies the shared
-    ``submit_workflow_runs`` path (which calls ``client.submit_workflow_run``).
-
-    Only the ``submit_workflow_run`` name is intercepted; every other attribute
-    falls through to the real SDK client. The recording/double client has its own
-    ``submit_workflow_run`` and is never wrapped, so the local recording path stays
-    byte-identical.
-    """
-
-    def __init__(self, client: Any) -> None:
-        self._client = client
-
-    def submit_workflow_run(
-        self, workflow_name: str, input: dict[str, Any], parent_id: str | None = None
-    ) -> str | None:
-        return _real_submit_workflow_run(self._client, workflow_name, input, parent_id)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._client, name)
+    def run_no_wait(self, *, input: dict[str, Any]) -> Any:
+        return self._workflow.run_no_wait(input=input)
 
 
 def worker_ready_line(count: int) -> str:
@@ -296,7 +220,7 @@ def worker_ready_line(count: int) -> str:
     the event loop forever and never returns, so printing after it would never emit),
     so the literal bare ``worker ready`` claim stays OUT of ``cli.py`` source
     (``test_no_fake_gated_ready_claim`` scans ``cli.py`` for the bare string). The count
-    is the number of registered Hatchet workflows (one per canonical stage). This is the
+    is the number of registered Hatchet workflows (one complete native DAG). This is the
     REAL readiness signal (handoff §3): ``wait-for-worker.sh`` greps ``worker ready:
     registered``.
     """
@@ -309,13 +233,13 @@ def worker_ready_line(count: int) -> str:
 def build_hatchet_workflows(
     dependency_table: Mapping[str, tuple[tuple[str, str], ...]] | None = None,
 ) -> list[HatchetWorkflowSpec]:
-    """Build one Hatchet workflow per in-repo stage (pure, topologically ordered).
+    """Build pure stage metadata in canonical topological order.
 
     ``dependency_table`` defaults to the canonical ``STAGE_DEPENDENCIES``. Each
     workflow carries the upstream-stage dependencies and the evidence classes
     found in :mod:`umd.jobs.dag` — the same lineage the runner and the selective
-    invalidator consume. This is the documented mapping used to *submit* to
-    Hatchet.
+    invalidator consume. This is the documented stage metadata mapping used by
+    the native workflow.
     """
     table = dependency_table or STAGE_DEPENDENCIES
     specs: list[HatchetWorkflowSpec] = []
@@ -332,7 +256,11 @@ def build_hatchet_workflows(
 
 
 def _make_handler(
-    work_registry: StageWorkRegistry, executor: Any, store: JobStore | None = None
+    work_registry: StageWorkRegistry,
+    executor: Any,
+    store: JobStore | None = None,
+    *,
+    stage_override: str | None = None,
 ) -> Any:
     """Build the callback Hatchet invokes for one stage workflow/task.
 
@@ -358,7 +286,12 @@ def _make_handler(
         # executor, so the callback does not need it beyond arity (SDK 1.38.1
         # always passes both arguments).
         del ctx
-        manifest = StageManifest.from_dict(input.manifest)
+        manifest_data = input.manifest
+        if stage_override is not None and input.manifests is not None:
+            manifest_data = input.manifests[stage_override]
+        elif stage_override is not None:
+            manifest_data = {**manifest_data, "stage_name": stage_override}
+        manifest = StageManifest.from_dict(manifest_data)
         if store is not None:
             job = store.get(manifest.job_id)
             if job is not None and (
@@ -426,6 +359,26 @@ def _make_handler(
     return handler
 
 
+def _build_native_workflow(
+    client: Any,
+    work_registry: StageWorkRegistry,
+    executor: Any,
+    store: JobStore | None,
+) -> tuple[Any, dict[str, Any]]:
+    """Build one native Hatchet workflow with the canonical parent graph."""
+    workflow_factory = getattr(client, "workflow", None)
+    if not callable(workflow_factory):
+        raise ConfigurationError("client has no workflow(name=...) registration surface")
+    workflow = workflow_factory(name="umd-decomposition", input_validator=UmdStageInput)
+    tasks: dict[str, Any] = {}
+    for stage in STAGE_ORDER:
+        parents = [tasks[parent] for parent, _ in STAGE_DEPENDENCIES.get(stage, ())]
+        tasks[stage] = workflow.durable_task(
+            name=f"umd-{stage.lower()}", parents=parents, eviction_policy=None
+        )(_make_handler(work_registry, executor, store=store, stage_override=stage))
+    return workflow, tasks
+
+
 def _flat_ack(
     manifest: StageManifest,
     *,
@@ -473,16 +426,15 @@ class WorkerHandle:
     ONLY when real callbacks are bound to a :class:`DurableStageExecutor` (a
     non-empty registry AND a present executor).
 
-    ``registered_workflows`` holds every task/workflow binding collected during
-    registration — the ``Standalone``/``Workflow`` objects returned by the SDK
-    1.38.1 ``Hatchet.task``/``Hatchet.workflow`` decorators on the real-client
-    path, and the callback handlers on the recording/double path — so
+    ``registered_workflows`` contains the single native ``Workflow`` object built
+    by the SDK, so
     ``cli.worker()`` can construct the SDK Worker as ``client.worker("umd-worker",
     workflows=handle.registered_workflows)`` and start the loop exactly once. Both
     client branches expose the same handle shape.
     """
 
     _client: Any
+    _workflow: Any
     _stages: list[str]
     _ready: bool = False
     registered_workflows: list[Any] = field(default_factory=list)
@@ -490,14 +442,23 @@ class WorkerHandle:
     def submit(
         self, *, job_id: str, source_id: str | None, dag_universe: str
     ) -> list[StageRunEvent]:
-        """Submit one workflow run per canonical stage with the durable context."""
-        return submit_workflow_runs(
-            self._client,
-            job_id=job_id,
-            source_id=source_id,
-            dag_universe=dag_universe,
-            stages=list(self._stages),
+        """Submit one native workflow run containing all canonical stages."""
+        manifests = {
+            stage: _manifest_for(job_id, source_id, dag_universe, stage).to_dict()
+            for stage in self._stages
+        }
+        root_manifest = manifests[STAGE_ORDER[0]]
+        self._workflow.run_no_wait(
+            input=UmdStageInput(
+                job_id=job_id,
+                source_id=source_id,
+                dag_universe=dag_universe,
+                stage=STAGE_ORDER[0],
+                manifest=root_manifest,
+                manifests=manifests,
+            )
         )
+        return [StageRunEvent(stage, "queued") for stage in self._stages]
 
     def is_ready(self) -> bool:
         """True when real callbacks are bound to a durable executor."""
@@ -517,19 +478,13 @@ WorkerHandle.registered_workflows = []
 class HatchetWorkerFactory:
     """Registers the pinned Hatchet workflows/tasks and binds callbacks (CONTRACTS.md:62).
 
-    ``start(runtime, work_registry, executor, client)`` builds one workflow per
-    ``STAGE_ORDER`` stage (``depends_on`` derived from ``STAGE_DEPENDENCIES``) and
+    ``start(runtime, work_registry, executor, client)`` builds one native workflow
+    containing every ``STAGE_ORDER`` task (parents derived from ``STAGE_DEPENDENCIES``) and
     binds each callback through :meth:`_make_handler` — execution always flows
     through :class:`DurableStageExecutor`.
 
-    The ``client`` is DUCK-TYPED, supporting two shapes:
-
-    * a recording/double client whose ``workflows``/``callbacks`` are plain dicts —
-      workflows are registered directly (a spec dict with ``name``/``depends_on``)
-      and callbacks are stored under ``callbacks[name]``;
-    * a real SDK client (``workflows`` is not a dict) — workflows/tasks are
-      registered through the SDK's ``client.task(name)``/``client.workflow(name)``
-      decorator surface.
+    The client is duck-typed to the pinned SDK shape: ``workflow(...)`` creates one
+    workflow and its scoped ``durable_task(..., parents=...)`` methods create the DAG.
 
     Readiness requires BOTH a non-empty work registry AND a present executor; with
     zero bound executors ``client.start()`` is never called and ``is_ready()`` is
@@ -547,50 +502,24 @@ class HatchetWorkerFactory:
     ) -> WorkerHandle:
         del runtime  # consumed by the production registry via work_registry (Plan G)
         callbacks_bound = bool(work_registry) and executor is not None
-        # Durable-only registration (AT-18): every canonical stage registers
-        # EXCLUSIVELY through ``client.durable_task``. A missing surface is a hard
-        # ConfigurationError — there is NO ``task``/``workflow`` fallback, retry
-        # loop, or ``contextlib.suppress(Exception)`` around registration.
-        durable_task = getattr(client, "durable_task", None)
-        if not callable(durable_task):
-            raise ConfigurationError(
-                "client has no 'durable_task' registration surface; every canonical "
-                "umd-<stage> must register exclusively via client.durable_task(...) "
-                "(no task/workflow fallback)"
-            )
-        #: SDK Standalone/workflow objects returned by the durable_task decorator,
-        #: collected so ``cli.worker()`` can pass them to ``client.worker(workflows=...)``.
-        registered_workflows: list[Any] = []
-        for spec in build_hatchet_workflows():
-            wf_name = f"umd-{spec.stage.lower()}"
-            handler = _make_handler(work_registry, executor, store=store)
-            # SDK 1.38.1: ``name``/``input_validator`` are KEYWORD-ONLY. A decorator
-            # failure must SURFACE (it aborts startup) — never suppressed or retried.
-            workflow_obj = durable_task(
-                name=wf_name,
-                input_validator=UmdStageInput,
-                eviction_policy=None,
-            )(handler)
-            if workflow_obj is not None:
-                registered_workflows.append(workflow_obj)
-
+        workflow, tasks = _build_native_workflow(client, work_registry, executor, store)
+        tasks_complete = len(tasks) == len(STAGE_ORDER) and all(
+            task is not None for task in tasks.values()
+        )
+        registered_workflows = [workflow] if tasks_complete else []
         # The CALLER owns the single worker-loop start (P2-S3): start() registers
         # the workflows/tasks and returns a handle; cli.worker() starts the SDK
         # worker loop itself. HatchetWorkerFactory.start must NOT call client.start()
         # so the not-ready path never starts a worker loop.
         #
-        # Submission duck-typing: the recording double exposes submit_workflow_run,
-        # so it is used as-is (byte-identical). A real SDK client does not have it;
-        # wrap it so the shared submit_workflow_runs path maps to the SDK's
-        # admin.run_workflow one-shot API.
-        dict_client = isinstance(getattr(client, "workflows", None), dict)
-        submission_client = client if dict_client else _SDKSubmissionShim(client)
+        submission_client = _NativeSubmissionClient(workflow)
         # Readiness is truthful: true ONLY after complete non-empty actual
         # registration of every canonical stage AND a real executor is bound.
         # Zero or partial registration can never make is_ready() true.
-        ready = callbacks_bound and len(registered_workflows) == len(STAGE_ORDER)
+        ready = callbacks_bound and tasks_complete
         return WorkerHandle(
             _client=submission_client,
+            _workflow=workflow,
             _stages=list(STAGE_ORDER),
             _ready=ready,
             registered_workflows=registered_workflows,
@@ -598,37 +527,19 @@ class HatchetWorkerFactory:
 
 
 class _UnconfiguredClient:
-    """An honest no-live-Hatchet submission surface (CONTRACTS.md:61/:63).
-
-    Returned by :func:`build_hatchet_client` when the SDK is absent or the server
-    URL/token are not configured, so a release factory can still select
-    :class:`ProductionDAGRunner` while submission REFUSES loudly (never a silent
-    fake success). ``submit_workflow_run`` raises :class:`HatchetNotConfiguredError`;
-    every other attribute is absent. This is NOT a recording double and never
-    counts as execution evidence.
-    """
+    """Honest no-live-Hatchet submission surface."""
 
     def __init__(self, reason: str) -> None:
         self._reason = reason
 
-    def submit_workflow_run(
-        self, workflow_name: str, input: dict[str, Any], parent_id: str | None = None
-    ) -> None:
-        del parent_id  # refused regardless of parent barrier
-        raise HatchetNotConfiguredError(f"cannot submit {workflow_name!r}: {self._reason}")
+    def run_no_wait(self, *, input: dict[str, Any]) -> None:
+        del input
+        raise HatchetNotConfiguredError(f"cannot submit native DAG: {self._reason}")
 
 
 def build_hatchet_client(settings: Any = None) -> Any:
-    """Build the release submission client (a ``submit_workflow_run`` surface).
-
-    Returns a real hatchet_sdk client wrapped in :class:`_SDKSubmissionShim` when
-    the SDK is importable AND ``UMD_HATCHET_SERVER_URL``/``UMD_HATCHET_TOKEN`` are
-    configured; otherwise returns an honest :class:`_UnconfiguredClient` whose
-    submission raises :class:`HatchetNotConfiguredError`. This is the single shared
-    client assembly used by the API release factory (P1-S3); the worker (Plan G/H
-    cli) builds its SDK ``Hatchet`` separately for registration/looping.
-    """
-    del settings  # client config is env-driven today (UMD_HATCHET_*); kept for parity
+    """Build the native workflow submission surface for the API."""
+    del settings
     if importlib.util.find_spec("hatchet_sdk") is None:
         return _UnconfiguredClient("hatchet_sdk not installed")
     import hatchet_sdk as sdk
@@ -645,16 +556,17 @@ def build_hatchet_client(settings: Any = None) -> Any:
 
         host = (urlsplit(server_url).hostname) or "localhost"
         config.host_port = f"{host}:7070"
-    return _SDKSubmissionShim(sdk.Hatchet(config=config))
+    sdk_client = sdk.Hatchet(config=config)
+    workflow = sdk_client.workflow(name="umd-decomposition", input_validator=UmdStageInput)
+    return _NativeSubmissionClient(workflow)
 
 
 class HatchetRunner:
     """:class:`DAGRunner` adapter over a real Hatchet client.
 
-    The ``client`` is the real-Hatchet integration point (its REST/gRPC submit
-    surface). With a client present, ``run_graph`` submits a real workflow run per
-    stage carrying job/source/dag-universe context and returns the durable
-    ``queued`` events. Without a client it refuses (raises
+    The ``client`` is the native workflow submission surface. With a client present,
+    ``run_graph`` submits one complete workflow run carrying job/source/dag-universe
+    context and returns durable ``queued`` events. Without a client it refuses (raises
     :class:`HatchetNotConfiguredError`) rather than fabricating an empty success.
     """
 
@@ -678,7 +590,7 @@ class HatchetRunner:
             raise HatchetNotConfiguredError(
                 f"cannot submit {job_id} (dag_universe={dag_universe}) to a live cluster"
             )
-        return submit_workflow_runs(
+        return submit_native_workflow(
             self._client,
             job_id=job_id,
             source_id=source_id,
