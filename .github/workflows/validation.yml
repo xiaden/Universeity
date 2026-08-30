@@ -219,6 +219,13 @@ jobs:
       - name: Install dev dependencies (host, for running pytest over HTTP)
         run: pip install --no-cache-dir -e ".[dev]"
 
+      # The live boundary fixtures synthesize audio/video bytes with FFmpeg on
+      # the host before uploading them to the Compose API.
+      - name: Install FFmpeg for host-generated E2E fixtures
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
       # P3-S3: compose interpolation vars the pinned topology requires.
       # HATCHET_COOKIE_SECRET / HATCHET_MASTER_KEY are REQUIRED (${VAR:?}) by the
       # split Hatchet services; generated here, never committed.
