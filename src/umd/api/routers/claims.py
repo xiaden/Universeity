@@ -64,8 +64,8 @@ def override_claim(
 ) -> ClaimResponse:
     commit = ctx.commands.record_override(
         subject_ref=ref,
-        predicate="CANONICAL_ENTITY",
-        object_ref=None,
+        predicate=body.predicate_code or "CANONICAL_ENTITY",
+        object_ref=body.object_ref,
         actor=_p.key,
         evidence=body.refs,
         reason=body.reason or body.cause,

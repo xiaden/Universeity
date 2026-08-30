@@ -178,6 +178,8 @@ class ClaimResponse(BaseModel):
 class ClaimMutationRequest(BaseModel):
     cause: str | None = None
     reason: str | None = None
+    object_ref: str | None = None
+    predicate_code: str | None = None
     scope: str | None = None
     stage: str | None = None
     refs: list[str] = Field(default_factory=list)

@@ -85,6 +85,7 @@ def test_override_is_user_authority() -> None:
     prep = ledger.appended[0][0]
     assert prep.event_type == "OverrideApplied"
     assert prep.payload["authority"] == "USER_OVERRIDE"
+    assert prep.payload["object_ref"] == "user:truth"
 
 
 def test_entity_resolved_kinds() -> None:

@@ -544,6 +544,8 @@ def test_boundary_correction_invalidation_selective_rerun(api_ctx: ApiCtx) -> No
         "/v1/claims/e:alice/override",
         json={
             "reason": "manual transcription correction of the spoken utterance",
+            "object_ref": corrected,
+            "predicate_code": "SPEAKS",
             "refs": [f"source://{s.audio['source_id']}/audio/0"],
         },
         headers=W,

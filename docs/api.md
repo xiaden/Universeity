@@ -75,7 +75,7 @@ reversible resolver (ledger + mention rebind + quarantine), returning
 
 `ClaimCreateRequest`: `predicate_code`, `subject_ref`, `object_ref`,
 `confidence` (0–1), `scope` (default `GLOBAL`), `support_refs`.
-`ClaimMutationRequest`: `cause`, `reason`, `scope`, `stage`, `refs`.
+`ClaimMutationRequest`: `cause`, `reason`, optional `predicate_code` and `object_ref` for the corrected claim value, `scope`, `stage`, `refs`. An override with an explicit predicate/value replaces the current Tier-0 value while retaining append-only history.
 
 ## Segments (edits / correction)
 
