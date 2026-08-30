@@ -223,7 +223,9 @@ fi
 # ============================================================================
 # Live job-ID set for the selected tenant = distinct UMD job_id carried in the
 # engine-visible v1_task.input submissions of THIS tenant (never a global scan).
-live_job_ids="$(psql -tAc "SELECT string_agg(DISTINCT quote_literal(input->>'job_id'), ',') FROM v1_task WHERE tenant_id = '$selected_tenant' AND input->>'job_id' IS NOT NULL" | tr -d '[:space:]')"
+# SDK 1.38.1 stores the workflow input under the v1 task envelope's nested
+# `input` object; retain the direct form for compatibility with older rows.
+live_job_ids="$(psql -tAc "SELECT string_agg(DISTINCT quote_literal(COALESCE(input->>'job_id', input->'input'->>'job_id')), ',') FROM v1_task WHERE tenant_id = '$selected_tenant' AND COALESCE(input->>'job_id', input->'input'->>'job_id') IS NOT NULL" | tr -d '[:space:]')"
 if [ -z "$live_job_ids" ]; then
   fail "no live UMD job_id found in the selected tenant's v1_task.input submissions; cannot scope callback-owned rows to the live submission set"
 fi
@@ -242,10 +244,10 @@ audit_rows="$(psql -tAc "SELECT count(*) FROM job_run_audit WHERE job_id IN ($li
 # false positive: count how many StageCompleted rows fall OUTSIDE the live
 # tenant-scoped set (e.g. the mock `mock-job`) and confirm they are NOT what
 # satisfies the gate.
-mock_or_outside="$(psql -tAc "SELECT count(*) FROM semantic_event WHERE event_type = 'StageCompleted' AND NOT (payload->>'job_id' = ANY (SELECT input->>'job_id' FROM v1_task WHERE tenant_id = '$selected_tenant'))" | tr -d '[:space:]')"
+mock_or_outside="$(psql -tAc "SELECT count(*) FROM semantic_event WHERE event_type = 'StageCompleted' AND NOT (payload->>'job_id' = ANY (SELECT COALESCE(input->>'job_id', input->'input'->>'job_id') FROM v1_task WHERE tenant_id = '$selected_tenant'))" | tr -d '[:space:]')"
 {
   echo "submission_marker: $submission_marker"
-  echo "live_job_ids (scoped predicate): $live_job_ids"
+  echo "live_job_ids (scoped v1 task input predicate): $live_job_ids"
   echo "scoped stage_run rows (job_id IN live set, created_at >= marker): ${stage_run_rows:-0}"
   echo "scoped semantic_event event_type=StageCompleted (payload job_id IN live set, tx_time >= marker): ${completed_events:-0}"
   echo "scoped job_run_audit rows (job_id IN live set, created_at >= marker): ${audit_rows:-0}"
