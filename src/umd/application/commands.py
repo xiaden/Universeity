@@ -15,8 +15,13 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+import sqlalchemy as sa
+
 from umd.domain.events import EventType, SemanticEvent
 from umd.storage.postgres.ledger import CommitResult, SemanticLedger
+from umd.storage.postgres.tables import metadata as db_meta
+
+_alignment_t = db_meta.tables["alignment"]
 
 
 class SemanticCommandService:
@@ -317,8 +322,24 @@ class SemanticCommandService:
         confidence: float | None = None,
         correlation_id: Any | None = None,
     ) -> CommitResult:
-        return self._ledger.append(
-            [
+        alignment_id = uuid.uuid4()
+
+        def record_row(conn: sa.Connection) -> None:
+            conn.execute(
+                _alignment_t.insert().values(
+                    id=alignment_id,
+                    left_ref=left_ref,
+                    right_ref=right_ref,
+                    alignment_type=alignment_type,
+                    method=method,
+                    assumptions=assumptions or {},
+                    source_events={},
+                    confidence=confidence,
+                )
+            )
+
+        return self._ledger.complete_and_append(
+            events=[
                 SemanticEvent(
                     event_type=EventType.ALIGNED,
                     payload={
@@ -333,7 +354,8 @@ class SemanticCommandService:
                     confidence=confidence,
                     correlation_id=correlation_id,
                 )
-            ]
+            ],
+            side_effects=record_row,
         )
 
     def rebase_locator(

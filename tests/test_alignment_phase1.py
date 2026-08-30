@@ -26,6 +26,7 @@ from umd.alignment.align import (
     dtw_path,
     timecode_distance,
 )
+from umd.application.commands import SemanticCommandService
 from umd.storage.postgres.ledger import SemanticLedger
 from umd.storage.postgres.tables import metadata as db_meta
 
@@ -135,10 +136,47 @@ def test_align_many_to_many_dispatch_labels_method():
     assert len(plan.pairs) == 2
 
 
+def test_public_alignment_command_binds_event_to_query_row(umd_db):
+    """The REST command's ledger event and correspondence row commit together."""
+    svc = SemanticCommandService(SemanticLedger(umd_db))
+    commit = svc.record_alignment(
+        left_ref="source:left#text/1",
+        right_ref="source:right#text/1",
+        alignment_type="ADAPTATION",
+        method="api",
+        confidence=1.0,
+    )
+    assert commit.seq > 0
+
+    with umd_db.connect() as conn:
+        row = conn.execute(
+            sa.select(
+                _alignment_t.c.left_ref,
+                _alignment_t.c.right_ref,
+                _alignment_t.c.alignment_type,
+                _alignment_t.c.method,
+                _alignment_t.c.confidence,
+            )
+        ).one()
+        event = conn.execute(
+            sa.select(_event_t.c.payload).where(_event_t.c.event_type == "Aligned")
+        ).one()
+
+    assert dict(row._mapping) == {
+        "left_ref": "source:left#text/1",
+        "right_ref": "source:right#text/1",
+        "alignment_type": "ADAPTATION",
+        "method": "api",
+        "confidence": 1.0,
+    }
+    assert event.payload["left_ref"] == row.left_ref
+    assert event.payload["right_ref"] == row.right_ref
+
+
 def test_alignment_service_appends_non_semantic_events_and_rows(umd_db):
     """Aligned events are NON_SEMANTIC (no Tier-0 fold) and bound to alignment rows."""
 
-    def record_row(aid: str, pair: AlignedPair, _plan: AlignmentPlan, conn: object) -> None:
+    def record_row(aid: str, pair: AlignedPair, _plan: AlignmentPlan, conn: sa.Connection) -> None:
         al_t = db_meta.tables["alignment"]
         conn.execute(
             al_t.insert().values(
