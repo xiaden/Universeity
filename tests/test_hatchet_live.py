@@ -1086,16 +1086,15 @@ def test_live_hatchet_local_binding_shape_exact_umd_stages(
     live_db: sa.Engine,
 ) -> None:
     """Local BINDING SHAPE (not engine visibility): the real ``hatchet_sdk``
-    client registers a ``Standalone`` per canonical stage under the exact
-    ``umd-<stage>`` names via ``durable_task``, and the factory exposes every
-    binding through ``WorkerHandle.registered_workflows``.
+    client registers one native workflow containing a durable task for every
+    canonical stage under the exact ``umd-<stage>`` names.
 
     This asserts the LOCAL shape the factory produces on the real SDK surface —
-    it does NOT prove engine-visible registration (that is the hosted AT-18 gate
-    checked against the engine's ``v1_task.is_durable`` rows). ``is_ready()`` is
-    True only because a real executor is bound AND every canonical stage was
-    actually registered. Registration-only: ``HatchetWorkerFactory.start`` never
-    starts a worker loop, so this does not compete with the compose worker.
+    it does NOT prove engine-visible registration (that is the hosted AT-18 gate).
+    ``is_ready()`` is True only because a real executor is bound AND every
+    canonical task was actually registered. Registration-only:
+    ``HatchetWorkerFactory.start`` never starts a worker loop, so this does not
+    compete with the compose worker.
     """
     _require_live_hatchet()
     _ensure_source(live_db)
@@ -1110,19 +1109,11 @@ def test_live_hatchet_local_binding_shape_exact_umd_stages(
     assert worker.is_ready() is True, "real worker did not report ready with bound executors"
     workflows = worker.registered_workflows
     assert workflows, "no local bindings were registered on the real client"
-    assert len(workflows) == len(STAGE_ORDER), (
-        f"registered {len(workflows)} workflows; expected {len(STAGE_ORDER)}"
-    )
-    names: set[str] = set()
-    for wf in workflows:
-        if isinstance(wf, dict):
-            names.add(str(wf.get("name", "")))
-        else:
-            names.add(str(getattr(wf, "name", "")))
-    for stage in STAGE_ORDER:
-        assert f"umd-{stage.lower()}" in names, (
-            f"stage {stage} not registered on the real client as umd-{stage.lower()}"
-        )
+    assert len(workflows) == 1, f"registered {len(workflows)} workflows; expected one"
+    workflow = workflows[0]
+    assert getattr(workflow, "name", None) == "umd-decomposition"
+    task_names = {str(getattr(task, "name", "")) for task in workflow.tasks}
+    assert task_names == {f"umd-{stage.lower()}" for stage in STAGE_ORDER}
 
 
 # ---------------------------------------------------------------------------
@@ -1531,8 +1522,8 @@ def test_partial_registration_never_reports_ready() -> None:
 
 @pytest.mark.cluster
 @pytest.mark.postgres
-def test_sdk_shaped_standalone_mock_run_reaches_executor(live_db: sa.Engine) -> None:
-    """Real-SDK-shaped: ``Standalone.mock_run(input=UmdStageInput(...))`` reaches
+def test_sdk_shaped_native_task_mock_run_reaches_executor(live_db: sa.Engine) -> None:
+    """Real-SDK-shaped: a native task's ``mock_run(input=UmdStageInput(...))`` reaches
     the existing DurableStageExecutor and returns the flat JSON-safe ack.
 
     This is cluster-gated because the SDK client requires a real tenant-bearing
@@ -1550,9 +1541,10 @@ def test_sdk_shaped_standalone_mock_run_reaches_executor(live_db: sa.Engine) -> 
         client=_real_client(),
     )
     assert handle.is_ready() is True
-    target = next(
-        w for w in handle.registered_workflows if getattr(w, "name", None) == "umd-ingest"
+    workflow = next(
+        w for w in handle.registered_workflows if getattr(w, "name", None) == "umd-decomposition"
     )
+    target = next(task for task in workflow.tasks if task.name == "umd-ingest")
     assert hasattr(target, "mock_run")
     manifest = _make_manifest("INGEST", job_id="mock-job")
     inp = _hatchet_module().UmdStageInput(

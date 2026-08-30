@@ -9,8 +9,9 @@
 # requires real engine rows and FAILS CLOSED on:
 #   1. v1_task rows never leaving QUEUED (zero assignments) — the exact hosted
 #      failure mode of run 33229130339,
-#   2. latest-version v1_task.is_durable != true for every canonical umd-<stage>,
-#   3. missing worker / assignment / runtime rows,
+#   2. the native umd-decomposition workflow is missing, non-durable, or has the
+#      wrong nine-task parent graph,
+#   3. missing worker / assignment evidence,
 #   4. missing real callback-owned rows (stage_run, semantic_event
 #      event_type='StageCompleted', job_run_audit operational audit),
 #   5. missing required tables/columns (never silently degrades to "release proof
@@ -20,12 +21,12 @@
 # recorded to engine-visible-proof.txt (PASS/FAIL) for the aggregate gate.
 #
 # Schema (v0.105.2): Hatchet v1 tables are lowercase unquoted (v1_task,
-# v1_task_runtime, v1_tasks_olap); worker/workflow are legacy quoted mixed-case
+# v1_task_events_olap, v1_tasks_olap); worker/workflow are legacy quoted mixed-case
 # public."Worker" / public."Workflow" / public."WorkflowVersion". Status is NOT on
-# v1_task: the readable status lives on v1_tasks_olap.readable_status and the live
-# assignment is v1_task_runtime.worker_id IS NOT NULL. "umd-<stage>" workflow names
-# live on public."Workflow"."name". UMD callback-owned tables: stage_run,
-# semantic_event, job_run_audit.
+# v1_task: readable status and the latest worker assignment live on
+# v1_tasks_olap. The task-event table also records worker assignment. The native
+# workflow definition and its parent graph live in WorkflowVersion.createWorkflowVersionOpts.
+# UMD callback-owned tables: stage_run, semantic_event, job_run_audit.
 set -eu
 
 compose_file="${1:?usage: engine-visible-proof.sh <compose_file> <diag_dir>}"
@@ -57,8 +58,8 @@ if [ -z "$selected_tenant" ]; then
   fail "tenant-identity.txt has no tenant_id"
 fi
 
-# canonical stages -> workflow names umd-<stage.lower()>
-UMD_STAGES="ingest format_analysis basic_segmentation low_level_extraction structural_analysis entity_resolution cross_source_alignment semantic_reconciliation current_search_projection"
+# The production adapter registers one native workflow containing all nine tasks.
+NATIVE_WORKFLOW="umd-decomposition"
 
 # --- required tables; discover + require each (fail closed if missing) ----
 require_table() {
@@ -71,7 +72,7 @@ require_table() {
 }
 
 V1_TASK="$(require_table v1_task)"
-V1_TASK_RUNTIME="$(require_table v1_task_runtime)"
+V1_TASK_EVENTS_OLAP="$(require_table v1_task_events_olap)"
 V1_TASKS_OLAP="$(require_table v1_tasks_olap)"
 WORKER="$(require_table Worker)"
 WORKFLOW="$(require_table Workflow)"
@@ -96,8 +97,8 @@ require_column() {
 require_column v1_task tenant_id
 require_column v1_task is_durable
 require_column v1_task workflow_version_id
-require_column v1_task_runtime worker_id
-require_column v1_task_runtime tenant_id
+require_column v1_task_events_olap worker_id
+require_column v1_task_events_olap tenant_id
 require_column v1_tasks_olap readable_status
 require_column v1_tasks_olap latest_worker_id
 require_column v1_tasks_olap tenant_id
@@ -117,15 +118,14 @@ require_column job_run_audit id
 # --- capture the discovered schema for the evidence bundle ---
 {
   echo "discovered tables (schema public):"
-  psql -tAc "SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND (lower(table_name) IN ('v1_task','v1_task_runtime','v1_tasks_olap') OR lower(table_name) IN ('worker','workflow','workflowversion','stage_run','semantic_event','job_run_audit')) ORDER BY 1"
+  psql -tAc "SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND (lower(table_name) IN ('v1_task','v1_task_events_olap','v1_tasks_olap') OR lower(table_name) IN ('worker','workflow','workflowversion','stage_run','semantic_event','job_run_audit')) ORDER BY 1"
 } > "$diag_dir/engine-visible-schema.txt"
 
 # ============================================================================
 # Check 1: v1_task QUEUED -> ASSIGNED/RUNNING (bounded 30x2s poll, fail closed)
-#   Assignment evidence = v1_task_runtime.worker_id IS NOT NULL; active evidence
-#   = v1_tasks_olap.readable_status IN ('RUNNING','COMPLETED'). ASSIGNED is not a
-#   v1 readable status (it is a v1_task_events_olap event_type / the assignment
-#   marker is worker_id); we treat worker_id-assigned as the ASSIGNED transition.
+#   The v1.105.2 OLAP projection is authoritative for assignment/runtime evidence:
+#   v1_tasks_olap.latest_worker_id identifies the assigned worker, while
+#   v1_task_events_olap records ASSIGNED/SENT_TO_WORKER/STARTED/FINISHED events.
 # ============================================================================
 total_tasks=0
 assigned=0
@@ -133,7 +133,7 @@ active=0
 : > "$diag_dir/v1-task-transition-history.txt"
 for i in $(seq 1 30); do
   total_tasks="$(psql -tAc "SELECT count(*) FROM v1_task WHERE tenant_id = '$selected_tenant'" | tr -d '[:space:]')"
-  assigned="$(psql -tAc "SELECT count(*) FROM v1_task_runtime WHERE tenant_id = '$selected_tenant' AND worker_id IS NOT NULL" | tr -d '[:space:]')"
+  assigned="$(psql -tAc "SELECT count(*) FROM v1_tasks_olap WHERE tenant_id = '$selected_tenant' AND latest_worker_id IS NOT NULL" | tr -d '[:space:]')"
   active="$(psql -tAc "SELECT count(*) FROM v1_tasks_olap WHERE tenant_id = '$selected_tenant' AND readable_status IN ('RUNNING','COMPLETED')" | tr -d '[:space:]')"
   total_tasks="${total_tasks:-0}"
   assigned="${assigned:-0}"
@@ -146,7 +146,7 @@ for i in $(seq 1 30); do
 done
 {
   echo "total v1_task rows (tenant $selected_tenant): $total_tasks"
-  echo "v1_task_runtime rows with worker_id (ASSIGNED): $assigned"
+  echo "v1_tasks_olap rows with latest_worker_id (ASSIGNED): $assigned"
   echo "v1_tasks_olap readable_status RUNNING/COMPLETED: $active"
 } > "$diag_dir/v1-task-summary.txt"
 if [ "$total_tasks" -le 0 ]; then
@@ -157,52 +157,56 @@ if [ "$assigned" -le 0 ] && [ "$active" -le 0 ]; then
 fi
 
 # ============================================================================
-# Check 2: latest-version v1_task.is_durable=true for every canonical umd-<stage>
-#   AT-18 is a LATEST-VERSION check: per workflow name, the max-version row(s)
-#   must have is_durable=true. Stale historical versions can never satisfy it, so
-#   we keep only the max-version v1_task rows (MAX of the version-ordering column
-#   per "Workflow"."name") and require bool_and(is_durable)=t with count>0 there.
-#
-#   NOTE (fix for run 33237228740): In Hatchet v0.105.2 the goose DDL stores the
-#   per-workflow version ordering in the "order" column (quoted); the "version"
-#   column is always NULL on durable registrations. Using wv."version" made
-#   MAX(...)=NULL and ver=maxver evaluate to NULL=NULL (never true), so the
-#   subquery returned zero rows and the gate false-failed. "order" is the correct
-#   discriminator: it is unique per workflow, so its max row is exactly the latest
-#   version, preserving AT-18's latest-version semantics.
+# Check 2: the latest native workflow version contains exactly the canonical
+# durable task graph. Hatchet persists the graph in WorkflowVersion's
+# createWorkflowVersionOpts JSON; this is the engine-visible registration surface
+# for the pinned v0.105.2 server.
 # ============================================================================
-DUR_OUT="$(psql -tAc "SELECT wf, bool_and(is_durable), count(*) FROM (SELECT w.\"name\" AS wf, wv.\"order\" AS ver, t.is_durable, MAX(wv.\"order\") OVER (PARTITION BY w.\"name\") AS maxver FROM v1_task t JOIN \"WorkflowVersion\" wv ON wv.\"id\" = t.workflow_version_id JOIN \"Workflow\" w ON w.\"id\" = wv.\"workflowId\" WHERE t.tenant_id = '$selected_tenant' AND w.\"name\" LIKE 'umd-%') sub WHERE sub.ver = sub.maxver GROUP BY sub.wf ORDER BY sub.wf")"
+DUR_OUT="$(psql -tAc "SELECT w.\"name\", wv.\"order\", jsonb_array_length(wv.\"createWorkflowVersionOpts\"->'Tasks') FROM \"WorkflowVersion\" wv JOIN \"Workflow\" w ON w.\"id\" = wv.\"workflowId\" WHERE w.\"name\" = '$NATIVE_WORKFLOW' AND w.\"tenantId\" = '$selected_tenant' AND wv.\"order\" = (SELECT max(latest.\"order\") FROM \"WorkflowVersion\" latest WHERE latest.\"workflowId\" = w.\"id\")")"
 printf '%s\n' "$DUR_OUT" > "$diag_dir/engine-visible-durability.txt"
-for stage in $UMD_STAGES; do
-  wf="umd-$stage"
-  line="$(printf '%s\n' "$DUR_OUT" | grep -F "$wf|" | head -n1 || true)"
-  if [ -z "$line" ]; then
-    fail "no latest-version v1_task rows for canonical workflow $wf (AT-18 durability unproven)"
-  fi
-  all_durable="$(printf '%s\n' "$line" | awk -F'|' '{print $2}')"
-  n="$(printf '%s\n' "$line" | awk -F'|' '{print $3}')"
-  n="${n:-0}"
-  if [ "$all_durable" != "t" ] || [ "$n" -le 0 ]; then
-    fail "workflow $wf latest-version tasks are not durably registered (is_durable=$all_durable, tasks=$n); AT-18 durability unproven"
+if [ -z "$DUR_OUT" ]; then
+  fail "no latest native workflow version for $NATIVE_WORKFLOW (AT-18 durability unproven)"
+fi
+native_task_count="$(printf '%s\n' "$DUR_OUT" | awk -F'|' '{print $3}' | tr -d '[:space:]')"
+if [ "${native_task_count:-0}" -ne 9 ]; then
+  fail "native workflow $NATIVE_WORKFLOW has ${native_task_count:-0} tasks; expected 9"
+fi
+for task in ingest format_analysis basic_segmentation low_level_extraction structural_analysis entity_resolution cross_source_alignment semantic_reconciliation current_search_projection; do
+  expected_parents=""
+  case "$task" in
+    format_analysis) expected_parents="umd-ingest" ;;
+    basic_segmentation) expected_parents="umd-format_analysis" ;;
+    low_level_extraction) expected_parents="umd-basic_segmentation" ;;
+    structural_analysis) expected_parents="umd-low_level_extraction" ;;
+    entity_resolution) expected_parents="umd-structural_analysis,umd-low_level_extraction" ;;
+    cross_source_alignment) expected_parents="umd-entity_resolution,umd-structural_analysis" ;;
+    semantic_reconciliation) expected_parents="umd-entity_resolution,umd-cross_source_alignment" ;;
+    current_search_projection) expected_parents="umd-semantic_reconciliation" ;;
+  esac
+  task_row="$(psql -tAc "WITH latest AS (SELECT wv.\"createWorkflowVersionOpts\" AS opts FROM \"WorkflowVersion\" wv JOIN \"Workflow\" w ON w.\"id\" = wv.\"workflowId\" WHERE w.\"name\" = '$NATIVE_WORKFLOW' AND w.\"tenantId\" = '$selected_tenant' ORDER BY wv.\"order\" DESC LIMIT 1) SELECT task->>'ReadableId' || '|' || (task->>'isDurable') || '|' || COALESCE((SELECT string_agg(parent, ',' ORDER BY parent) FROM jsonb_array_elements_text(task->'Parents') AS parent), '') FROM latest, jsonb_array_elements(latest.opts->'Tasks') AS task WHERE task->>'ReadableId' = 'umd-$task'")"
+  actual_name="$(printf '%s' "$task_row" | awk -F'|' '{print $1}')"
+  durable="$(printf '%s' "$task_row" | awk -F'|' '{print $2}')"
+  actual_parents="$(printf '%s' "$task_row" | awk -F'|' '{print $3}')"
+  if [ "$actual_name" != "umd-$task" ] || [ "$durable" != "true" ] || [ "$actual_parents" != "$expected_parents" ]; then
+    fail "native task umd-$task has durable=$durable parents=$actual_parents; expected durable=true parents=$expected_parents"
   fi
 done
 
 # ============================================================================
-# Check 3: worker registration / assignment / runtime rows exist
+# Check 3: worker registration / assignment evidence exists
 # ============================================================================
 worker_count="$(psql -tAc "SELECT count(*) FROM \"$WORKER\" WHERE \"tenantId\" = '$selected_tenant'" | tr -d '[:space:]')"
-runtime_rows="$(psql -tAc "SELECT count(*) FROM v1_task_runtime WHERE tenant_id = '$selected_tenant'" | tr -d '[:space:]')"
+event_rows="$(psql -tAc "SELECT count(*) FROM v1_task_events_olap WHERE tenant_id = '$selected_tenant'" | tr -d '[:space:]')"
 {
   echo "registered Worker rows (tenant $selected_tenant): ${worker_count:-0}"
-  # P3-S3: v0.105.2 uses "isActive"/"isPaused" booleans, never "status".
   psql -tAc "SELECT \"id\", \"name\", \"tenantId\", \"isActive\", \"isPaused\" FROM \"$WORKER\" WHERE \"tenantId\" = '$selected_tenant'"
-  echo "v1_task_runtime rows (tenant $selected_tenant): ${runtime_rows:-0}"
+  echo "v1_task_events_olap rows (tenant $selected_tenant): ${event_rows:-0}"
 } > "$diag_dir/worker-assignment-runtime.txt"
 if [ "${worker_count:-0}" -le 0 ]; then
   fail "no registered Worker rows for tenant $selected_tenant (worker never registered durably)"
 fi
-if [ "${runtime_rows:-0}" -le 0 ]; then
-  fail "no v1_task_runtime rows for tenant $selected_tenant (no assignment/runtime evidence)"
+if [ "${event_rows:-0}" -le 0 ]; then
+  fail "no v1_task_events_olap rows for tenant $selected_tenant (no assignment/runtime evidence)"
 fi
 
 # ============================================================================
@@ -305,4 +309,4 @@ echo "PASS" > engine-visible-proof.txt
   echo "callback-owned-rows=OK"
   echo "engine-visible-proof=PASS"
 } > engine-verdicts.txt
-echo "[engine-visible-proof] PASS: assignments, durable latest-version umd-<stage>, worker/runtime rows, callback-owned rows, and identity agreement all verified for tenant $selected_tenant"
+  echo "[engine-visible-proof] PASS: assignments, native durable DAG, worker/event rows, callback-owned rows, and identity agreement all verified for tenant $selected_tenant"
