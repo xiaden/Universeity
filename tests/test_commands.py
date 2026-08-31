@@ -69,7 +69,7 @@ def test_semantic_assertion_requires_scope_at_latest_version() -> None:
     )
     prep = ledger.appended[0][0]
     assert prep.event_type == "SemanticAsserted"
-    assert prep.event_version == 2  # latest retained version
+    assert prep.event_version == 3  # latest retained version
     assert prep.payload["scope"] == "CONTINUITY"
 
 

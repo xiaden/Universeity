@@ -65,7 +65,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from umd.domain.ids import canonical_entity_ref
-from umd.domain.models import ConfidenceState
+from umd.domain.models import ConfidenceState, IdentityClassification
 from umd.resolution.candidates import CandidatePolicy, MentionBlockIndex, normalize_name
 from umd.resolution.mentions import SourceMention
 
@@ -108,6 +108,8 @@ class CanonicalEntity(BaseModel):
     generated_by: dict[str, Any] = Field(default_factory=dict)
     #: Work/source/continuity membership context of the canonical identity.
     memberships: dict[str, list[str]] = Field(default_factory=_empty_memberships)
+    #: Honest resolution classification (accepted/probable) — Plan T P1-S3/R8.
+    classification: str = IdentityClassification.PROBABLE.value
 
 
 class AliasMapping(BaseModel):
@@ -127,6 +129,8 @@ class UnresolvedMention(BaseModel):
     text: str = ""
     reason: str = "ambiguous"  # ambiguous | conflicting
     candidates: list[str] = Field(default_factory=list)
+    #: Honest resolution classification (unresolved/ambiguous) — Plan T P1-S3/R8.
+    classification: str = IdentityClassification.UNRESOLVED.value
 
 
 class Contradiction(BaseModel):
@@ -172,6 +176,105 @@ class ResolutionBatch(BaseModel):
     confidence: float = 0.0
     state: str = ConfidenceState.UNKNOWN.value
     generated_by: dict[str, Any] = Field(default_factory=dict)
+    #: Honest aggregate classification (accepted/probable/unresolved/ambiguous).
+    #: Plan T P1-S3/R8 — never infers an identity without evidence.
+    classification: str = IdentityClassification.UNRESOLVED.value
+
+    @classmethod
+    def from_committed(
+        cls,
+        committed: Iterable[tuple[str, dict[str, Any]]],
+        *,
+        source_id: str,
+        generated_by: dict[str, Any] | None = None,
+    ) -> ResolutionBatch:
+        """Build a READ-ONLY ``ResolutionBatch`` from committed canonical identities.
+
+        Plan T P1-S1/R1: SEMANTIC_RECONCILIATION consumes the committed result of
+        ENTITY_RESOLUTION (the ESTABLISHed canonicals folded into ``current_state``),
+        never a second resolution batch. This projection carries ``canonical_entities``
+        + ``alias_mappings`` ONLY — no commands, no assignments, no topology change —
+        so the reconciler maps surfaces to refs without re-resolving or inventing
+        canonical identity. ``committed`` is an iterable of ``(ref, meta)`` where
+        ``meta`` carries display_label / aliases / memberships / support_refs /
+        state / confidence / canonical_type / classification.
+        """
+        canonical_entities: list[CanonicalEntity] = []
+        alias_mappings: list[AliasMapping] = []
+        state_set: set[str] = set()
+        for ref, meta in committed:
+            label = str(meta.get("display_label") or "")
+            if not label:
+                continue
+            conf = float(meta["confidence"]) if meta.get("confidence") is not None else 0.0
+            classification = str(
+                meta.get("classification") or IdentityClassification.PROBABLE.value
+            )
+            entity_state = str(meta.get("state") or ConfidenceState.PROBABLE.value)
+            state_set.add(entity_state)
+            canonical_entities.append(
+                CanonicalEntity(
+                    ref=str(ref),
+                    label=label,
+                    source_id=source_id,
+                    entity_type=str(meta["canonical_type"]) if meta.get("canonical_type") else None,
+                    member_mention_ids=list(meta.get("support_refs") or []),
+                    confidence=conf,
+                    state=entity_state,
+                    support_refs=list(meta.get("support_refs") or []),
+                    aliases=list(meta.get("aliases") or []),
+                    generated_by=dict(generated_by or {}),
+                    memberships=dict(meta.get("memberships") or {}),
+                    classification=classification,
+                )
+            )
+            for i, alias in enumerate(meta.get("aliases") or []):
+                alias_mappings.append(
+                    AliasMapping(
+                        alias_ref=f"canonical:{ref}:alias:{i}",
+                        canonical_ref=str(ref),
+                        alias_text=str(alias),
+                        canonical_text=label,
+                        confidence=conf,
+                    )
+                )
+        return cls(
+            source_id=source_id,
+            canonical_entities=canonical_entities,
+            alias_mappings=alias_mappings,
+            assignments={},
+            unresolved=[],
+            contradictions=[],
+            commands=[],
+            confidence=(
+                round(sum(e.confidence for e in canonical_entities) / len(canonical_entities), 4)
+                if canonical_entities
+                else 0.0
+            ),
+            state=(
+                ConfidenceState.AMBIGUOUS.value
+                if "AMBIGUOUS" in state_set
+                else (
+                    ConfidenceState.CONFIRMED.value
+                    if canonical_entities
+                    else ConfidenceState.UNKNOWN.value
+                )
+            ),
+            classification=(
+                IdentityClassification.ACCEPTED.value
+                if canonical_entities
+                and all(
+                    e.classification == IdentityClassification.ACCEPTED.value
+                    for e in canonical_entities
+                )
+                else (
+                    IdentityClassification.PROBABLE.value
+                    if canonical_entities
+                    else IdentityClassification.UNRESOLVED.value
+                )
+            ),
+            generated_by=dict(generated_by or {}),
+        )
 
 
 class ResolutionInput(BaseModel):
@@ -192,6 +295,70 @@ class ResolutionInput(BaseModel):
     continuity_id: str | None = None
     #: Membership context carried from the source registry (source/work/continuity).
     memberships: dict[str, list[str]] = Field(default_factory=_empty_memberships)
+
+
+class ResolutionInputBuilder:
+    """Single pure bounded input/batch builder (Plan T P1-S1 / requirement R1).
+
+    ENTITY_RESOLUTION is the ONLY stage that builds, resolves, and applies a
+    resolution batch. SEMANTIC_RECONCILIATION consumes the COMMITTED result via
+    :meth:`ResolutionBatch.from_committed` and never rebuilds topology — there is
+    exactly one resolution-input/batch builder and one domain decision per
+    execution generation.
+
+    ``build`` deterministically assembles a :class:`ResolutionInput` from:
+
+      * ``source`` — the source scope (source_id / work_id / continuity_id);
+      * ``evidence`` — the deterministic + provider :class:`SourceMention` records;
+      * ``memberships`` — the source-registry work/source/continuity context;
+      * ``committed_observations`` — existing canonical ASSIGNMENTS (mention ->
+        existing canonical ref) so an accepted identity is reused, never re-derived;
+      * ``correspondence`` — explicit correspondence decisions (mention -> ref);
+      * ``human_support`` — human-confirmed refs that lock/override machine output.
+
+    The existing-canonical seeding (committed_observations / correspondence /
+    human_support) is the ONLY cross-source join a resolution performs here, and it
+    is gated on a genuine existing canonical assignment or human confirmation —
+    same-name/same-work string equality is NEVER proof (candidate narrowing only).
+
+    Pure: writes nothing; the same inputs always yield the identical
+    :class:`ResolutionInput` (idempotent rerun convergence).
+    """
+
+    def build(
+        self,
+        *,
+        source: dict[str, Any],
+        evidence: Iterable[SourceMention],
+        memberships: dict[str, list[str]] | None = None,
+        committed_observations: dict[str, str] | None = None,
+        correspondence: dict[str, str] | None = None,
+        human_support: dict[str, str] | None = None,
+        generated_by: dict[str, Any] | None = None,
+    ) -> ResolutionInput:
+        by_id = {m.mention_id: m for m in evidence}
+        # Candidate narrowing (Plan T P1-S2/R2/R3): reuse an EXISTING canonical
+        # assignment / explicit correspondence / human-confirmed ref. We never
+        # seed by same-name/same-work string equality.
+        narrowing: list[dict[str, str]] = [
+            committed_observations or {},
+            correspondence or {},
+            human_support or {},
+        ]
+        for mid, existing in {k: v for m in narrowing for k, v in m.items()}.items():
+            if mid in by_id and existing:
+                by_id[mid] = by_id[mid].model_copy(update={"entity_id": str(existing)})
+        gb = dict(generated_by or {})
+        gb.setdefault("stage", "ENTITY_RESOLUTION")
+        gb.setdefault("analyzer", "umd-entity-resolution@1")
+        return ResolutionInput(
+            source_id=str(source.get("source_id") or ""),
+            mentions=sorted(by_id.values(), key=lambda m: m.mention_id),
+            generated_by=gb,
+            work_id=source.get("work_id"),
+            continuity_id=source.get("continuity_id"),
+            memberships=memberships or _empty_memberships(),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +478,52 @@ def _cluster_confidence(members: list[SourceMention]) -> float:
 def _entity_type_of(members: list[SourceMention]) -> str | None:
     types = {str(m.metadata_.get("entity_type")) for m in members if m.metadata_.get("entity_type")}
     return sorted(types)[0] if len(types) == 1 else (next(iter(types)) if types else None)
+
+
+def _evidence_tokens(m: SourceMention) -> list[str]:
+    """Content-derived evidence tokens for a mention (Plan T P1-S2).
+
+    The anchor is deliberately source-independent: it uses the deterministic
+    structural evidence (segment id / locator), never the source id, transient
+    mention id, filename, job, or any per-source UUID. A mention with no
+    registered segment falls back to its canonicalized surface form only so the
+    anchor stays non-empty (the work/continuity scope still disambiguates).
+    """
+    tokens: list[str] = []
+    if m.segment_id:
+        tokens.append(f"seg:{m.segment_id}")
+    loc = (m.provenance or {}).get("locator")
+    if loc:
+        tokens.append(f"loc:{loc}")
+    if not tokens:
+        norm = normalize_name(m.mention_text) or m.mention_text.casefold()
+        tokens.append(f"text:{norm}")
+    return tokens
+
+
+def _evidence_canonical_ref(
+    members: list[SourceMention],
+    label: str,
+    memberships: dict[str, list[str]],
+) -> str:
+    """Evidence-backed opaque canonical ref for a NEW (unseeded) cluster.
+
+    The anchor material is the canonicalized display label plus the
+    work/continuity scope plus the deterministic content-derived evidence refs
+    of every member — sorted and deduplicated so a rerun over the same accepted
+    cluster converges to the same ref, independent of ingest order, source,
+    filename, job, transient id, or first establisher. Same-name text alone
+    never merges: distinct work scope or distinct evidence yields a distinct
+    ref, so same-name characters coexist and cross-source joins require accepted
+    evidence / correspondence / existing assignment / human confirmation.
+    """
+    norm = normalize_name(label) or label.casefold()
+    anchor: list[str] = [f"label:{norm}"]
+    anchor.extend(f"work:{w}" for w in sorted(memberships.get("work_ids") or []))
+    anchor.extend(f"cont:{c}" for c in sorted(memberships.get("continuity_ids") or []))
+    for m in sorted(members, key=lambda x: x.mention_id):
+        anchor.extend(_evidence_tokens(m))
+    return canonical_entity_ref(anchor)
 
 
 # ---------------------------------------------------------------------------
@@ -451,12 +664,6 @@ class EntityResolutionService:
         for root in sorted(roots, key=lambda r: (uf.seed_of(r) or "", r)):
             members = sorted(roots[root], key=lambda m: m.mention_id)
             seed = uf.seed_of(root)
-            if seed is not None:
-                canonical_ref = seed
-                entity_state = ConfidenceState.CONFIRMED.value
-            else:
-                canonical_ref = canonical_entity_ref(m.mention_id for m in members)
-                entity_state = ConfidenceState.PROBABLE.value
 
             # Decide whether this component resolves to a canonical or stays
             # reviewable. A singleton with no seed and an ambiguous state, or
@@ -486,6 +693,18 @@ class EntityResolutionService:
                 memberships["continuity_ids"] = [input_continuity_id]
             if not memberships["source_ids"] and input_scope.get("source_ids"):
                 memberships["source_ids"] = list(input_scope["source_ids"])
+
+            if seed is not None:
+                canonical_ref = seed
+                entity_state = ConfidenceState.CONFIRMED.value
+            else:
+                canonical_ref = _evidence_canonical_ref(members, label, memberships)
+                entity_state = ConfidenceState.PROBABLE.value
+            classification = (
+                IdentityClassification.ACCEPTED.value
+                if seed is not None
+                else IdentityClassification.PROBABLE.value
+            )
             canonical_entities.append(
                 CanonicalEntity(
                     ref=canonical_ref,
@@ -499,6 +718,7 @@ class EntityResolutionService:
                     aliases=aliases,
                     generated_by=dict(gb),
                     memberships=memberships,
+                    classification=classification,
                 )
             )
             # Canonical establishment: a first-class append-only ledger event that
@@ -520,6 +740,7 @@ class EntityResolutionService:
                         "memberships": memberships,
                         "state": entity_state,
                         "confidence": conf,
+                        "classification": classification,
                         "generated_by": dict(gb),
                     },
                 )
@@ -573,6 +794,26 @@ class EntityResolutionService:
             if canonical_entities
             else 0.0
         )
+        # Honest aggregate classification (Plan T P1-S3/R8): ambiguity that must
+        # stay reviewable outranks a probable machine inference, which outranks a
+        # fully-accepted batch. Unknown surfaces are never fabricated as accepted.
+        if unresolved:
+            batch_class = (
+                IdentityClassification.AMBIGUOUS.value
+                if any(u.reason == "ambiguous" for u in unresolved)
+                else IdentityClassification.UNRESOLVED.value
+            )
+        elif canonical_entities:
+            batch_class = (
+                IdentityClassification.ACCEPTED.value
+                if all(
+                    e.classification == IdentityClassification.ACCEPTED.value
+                    for e in canonical_entities
+                )
+                else IdentityClassification.PROBABLE.value
+            )
+        else:
+            batch_class = IdentityClassification.UNRESOLVED.value
 
         return ResolutionBatch(
             source_id=source_id,
@@ -584,6 +825,7 @@ class EntityResolutionService:
             commands=commands,
             confidence=batch_conf,
             state=batch_state,
+            classification=batch_class,
             generated_by=gb,
         )
 
@@ -639,4 +881,11 @@ def _to_unresolved(m: SourceMention, hits: Any) -> UnresolvedMention:
         text=m.mention_text,
         reason=reason,
         candidates=seeded,
+        # Honest classification (Plan T P1-S3/R8): a genuinely ambiguous mention
+        # must stay reviewable as AMBIGUOUS, never silently guessed.
+        classification=(
+            IdentityClassification.AMBIGUOUS.value
+            if reason == "ambiguous"
+            else IdentityClassification.UNRESOLVED.value
+        ),
     )

@@ -9,10 +9,15 @@ deterministic cast across two works:
     (Astra). The shared work membership is the *supported correspondence* that
     authorizes Mara/Ellis to collapse to ONE opaque canonical ref across A and B.
   * Work ``OTHER`` (source C) contains Mara and Ellis again — UNRELATED
-    same-name characters that must remain distinct from the Novel cast and stay
-    reviewable (never merged by string equality).
+     same-name characters that must remain distinct from the Novel cast and stay
+     reviewable (never merged by string equality).
+  * Source A adds ``John`` at ``paragraph/6`` and source B adds ``John`` at
+     ``paragraph/7`` — the SAME name and the SAME work but NO shared evidence
+     (distinct locators, no explicit correspondence). Same-name/same-work is
+     only candidate narrowing, never proof: John A and John B must resolve to
+     TWO DISTINCT opaque canonical refs (Plan T P1-S2 / R3 collision proof).
   * ``ASTRA`` is deliberately ambiguous (``confidence_state=AMBIGUOUS`` with two
-    plausible co-occurring candidates) so identity stays unresolved / reviewable.
+     plausible co-occurring candidates) so identity stays unresolved / reviewable.
 
 All source bytes are deterministic and small. Immutable bytes and the Lantern
 Keeper fixture values (``tests/fixtures.py``) are NOT touched.
@@ -83,6 +88,8 @@ TWO_SOURCE_MENTION_SPECS: dict[str, list[dict]] = {
             confidence_state="AMBIGUOUS",
             co_occurring=["Zed", "Wren"],  # two plausible candidates -> reviewable
         ),
+        # John A: same work, no shared evidence with B's John -> distinct ref.
+        _q("John", locator="chapter/1/paragraph/6", co_occurring=["Mara"]),
     ],
     SOURCE_B: [
         _q("Mara", locator="chapter/1/paragraph/1", co_occurring=["Ellis"]),
@@ -96,6 +103,8 @@ TWO_SOURCE_MENTION_SPECS: dict[str, list[dict]] = {
             confidence_state="AMBIGUOUS",
             co_occurring=["Zed", "Wren"],
         ),
+        # John B: same name + work but different evidence -> distinct from John A.
+        _q("John", locator="chapter/1/paragraph/7", co_occurring=["Ellis"]),
     ],
     SOURCE_C: [
         _q("Mara", locator="chapter/1/paragraph/1", co_occurring=["Ellis"]),
@@ -113,6 +122,10 @@ TWO_SOURCE_MENTION_SPECS: dict[str, list[dict]] = {
 SHARED_NOVEL_NAMES = ("Mara", "Ellis")  # supported shared identity across A and B
 AMBIGUOUS_NAME = "Astra"  # unresolved / reviewable in Novel
 AMBIGUOUS_OTHER_NAME = "Nyx"  # unresolved / reviewable in Other
+
+#: Same name + same work in A and B but NO shared evidence -> must stay separate
+#: (Plan T R3 collision proof). John A lives at paragraph/6, John B at paragraph/7.
+SAME_NAME_COLLISION = "John"
 
 
 def two_source_mention_specs(source_id: str) -> list[dict]:

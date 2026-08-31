@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/events/SemanticAsserted/v3.json",
+  "title": "SemanticAsserted",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "predicate_code",
+    "subject_ref",
+    "scope"
+  ],
+  "properties": {
+    "predicate_code": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]{0,63}$"
+    },
+    "subject_ref": {
+      "type": "string"
+    },
+    "subject_entity_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "object_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "object_entity_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "authority": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "confidence": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "UNKNOWN",
+        "AMBIGUOUS",
+        "CONFLICTING",
+        "PROBABLE",
+        "CONFIRMED",
+        "USER_CONFIRMED"
+      ]
+    },
+    "continuity_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "narrative_time": {
+      "type": "object"
+    },
+    "spatial": {
+      "type": "object"
+    },
+    "support_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "contradiction_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "derived_from": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "generated_by": {
+      "type": "object"
+    },
+    "scope": {
+      "type": "string",
+      "enum": [
+        "GLOBAL",
+        "CONTINUITY",
+        "EDITION",
+        "SOURCE"
+      ]
+    },
+    "relationship_type": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]{0,63}$"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Plan T P2-S4 (R7): the validated normalized relationship type carried by a RELATED_TO predicate (e.g. MENTOR_OF). Null for non-typed predicates."
+    }
+  }
+}

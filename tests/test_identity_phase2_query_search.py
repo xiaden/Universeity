@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import uuid
 from typing import Any
 
 import pytest
@@ -30,6 +31,12 @@ import sqlalchemy as sa
 from fastapi.testclient import TestClient
 
 from job_helpers import ensure_source, make_manifest
+from umd.analysis.semantic import (
+    GeneratedBy,
+    RelationshipCandidate,
+    SegmentEvidenceRef,
+    SemanticAnalysisResult,
+)
 from umd.api.app import create_app
 from umd.application.commands import SemanticCommandService
 from umd.config import (
@@ -39,18 +46,25 @@ from umd.config import (
     Settings,
 )
 from umd.domain.evidence import EvidenceBatch
-from umd.domain.models import Evidence, EvidenceKind
+from umd.domain.models import Evidence, EvidenceKind, is_known_predicate
 from umd.projections.base import ReplayDriver
 from umd.projections.checkpoint import ProjectionCheckpointStore
 from umd.projections.current import CurrentTierOneBuilder
-from umd.projections.query import QueryService, StructuredQuery
+from umd.projections.edges import ActiveSemanticEdgeProjectionBuilder
+from umd.projections.query import (
+    QueryService,
+    ScopeUnmappableError,
+    StructuredQuery,
+)
 from umd.projections.search import (
     SearchFilters,
     SearchProjectionBuilder,
     SearchService,
 )
-from umd.projections.tables import RESULT_KIND_CANONICAL_ENTITY
+from umd.projections.tables import RESULT_KIND_CANONICAL_ENTITY, search_document
+from umd.reconciliation.reconciler import ReconciliationInput, SemanticReconciler
 from umd.resolution.resolution import resolved_event
+from umd.resolution.service import CanonicalEntity, ResolutionBatch
 from umd.storage.postgres.ledger import SemanticLedger
 from umd.storage.postgres.reducer import CANONICAL_IDENTITY_PREDICATE
 from umd.storage.postgres.tables import metadata as db_meta
@@ -60,6 +74,7 @@ pytestmark = pytest.mark.postgres
 _cs = db_meta.tables["current_state"]
 
 R = {"Authorization": "Bearer read-key"}
+W = {"Authorization": "Bearer write-key"}
 
 
 # ---------------------------------------------------------------------------
@@ -340,3 +355,389 @@ def test_entities_api_exposes_canonical_metadata(umd_db: sa.Engine, source_store
         r2 = client.get(f"/v1/entities/{item['ref']}", headers=R)
         assert r2.status_code == 200
         assert r2.json()["ref"] == item["ref"]
+
+
+# ---------------------------------------------------------------------------
+# Plan T Phase 2 (P2-S5): bounded membership filters, scoped search,
+# operator establishment, typed relationships + replay equality
+# ---------------------------------------------------------------------------
+
+
+def test_entity_bounded_source_membership_filter(umd_db: sa.Engine) -> None:
+    """P2-S1: bounded source_id membership filter restricts ENTITY reads to the
+    active canonicals whose replay-derived source membership intersects the scope."""
+    _composer, sid, _refs = _build_cast(umd_db)
+    q = QueryService(umd_db)
+    # All three cast canonicals belong to the source they were resolved from.
+    inside = q.entities(StructuredQuery(kind="ENTITY", filters={"source_id": sid}))
+    assert inside.total == 3
+    # A disjoint source scope honestly returns zero (membership-scoped, not stale).
+    outside = q.entities(StructuredQuery(kind="ENTITY", filters={"source_id": "src:elsewhere"}))
+    assert outside.total == 0
+    # Combining the source filter with a name filter still resolves the in-scope canonical.
+    by_name = q.entities(
+        StructuredQuery(kind="ENTITY", filters={"name": "Alice", "source_id": sid})
+    )
+    assert by_name.total == 1
+    assert by_name.results[0].label == "Alice"
+
+
+def test_entity_membership_filter_rejects_malformed_scope(umd_db: sa.Engine) -> None:
+    """P2-S1: a malformed work_id/continuity_id is an RFC 7807-style scope error, never
+    a silent unfiltered read."""
+    _composer, _sid, _refs = _build_cast(umd_db)
+    q = QueryService(umd_db)
+    with pytest.raises(ScopeUnmappableError):
+        q.entities(StructuredQuery(kind="ENTITY", filters={"work_id": "not-a-uuid"}))
+    with pytest.raises(ScopeUnmappableError):
+        q.entities(StructuredQuery(kind="ENTITY", filters={"continuity_id": "nope"}))
+
+
+def test_entity_work_and_continuity_membership_filter(umd_db: sa.Engine) -> None:
+    """P2-S1: bounded work_id and continuity_id membership filters restrict the read;
+    work+continuity valid combinations intersect; a disjoint scope returns zero."""
+    _composer, _sid, _refs = _build_cast(umd_db)
+    work = str(uuid.uuid4())
+    cont = str(uuid.uuid4())
+    # Establish a canonical that belongs to this work + continuity + a source.
+    app = create_app(engine=umd_db, source_store=None, settings=_client_settings())
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/entities",
+            json={
+                "ref": "entity:canonical:workbound:1",
+                "display_label": "WorkWarden",
+                "canonical_type": "character",
+                "aliases": ["Warden"],
+                "memberships": {
+                    "work_ids": [work],
+                    "continuity_ids": [cont],
+                    "source_ids": ["src:w1"],
+                },
+                "state": "CONFIRMED",
+                "authority": "operator",
+                "actor": "plan-t",
+            },
+            headers=W,
+        )
+        assert r.status_code == 201, r.text
+    q = QueryService(umd_db)
+    assert q.entities(StructuredQuery(kind="ENTITY", filters={"work_id": work})).total >= 1
+    assert (
+        q.entities(
+            StructuredQuery(kind="ENTITY", filters={"work_id": work, "continuity_id": cont})
+        ).total
+        >= 1
+    )
+    # A disjoint work scope excludes the established canonical (membership-scoped).
+    assert (
+        q.entities(StructuredQuery(kind="ENTITY", filters={"work_id": str(uuid.uuid4())})).total
+        == 0
+    )
+
+
+def test_entity_api_membership_filter_rfc7807(umd_db: sa.Engine) -> None:
+    """P2-S1: the REST boundary surfaces a malformed work_id as RFC 7807 422."""
+    _composer, _sid, _refs = _build_cast(umd_db)
+    app = create_app(engine=umd_db, source_store=None, settings=_client_settings())
+    with TestClient(app) as client:
+        r = client.get("/v1/entities", params={"work_id": "bogus"}, headers=R)
+        assert r.status_code == 422
+        assert r.json()["code"] == "unmappable_scope"
+
+
+def test_operator_establish_create_and_read(umd_db: sa.Engine) -> None:
+    """P2-S3: POST /v1/entities routes through Resolver.establish (operator authority),
+    carrying display label / type / aliases / memberships / provenance, and legacy reads."""
+    app = create_app(engine=umd_db, source_store=None, settings=_client_settings())
+    ref = "entity:canonical:op:1"
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/entities",
+            json={
+                "ref": ref,
+                "display_label": "Opal",
+                "canonical_type": "character",
+                "aliases": ["Op"],
+                "memberships": {"source_ids": ["src:op"], "work_ids": [], "continuity_ids": []},
+                "state": "CONFIRMED",
+                "authority": "operator",
+                "actor": "plan-t",
+            },
+            headers=W,
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["entity_ref"] == ref
+        # Legacy read by name surfaces the established canonical with its metadata.
+        r2 = client.get("/v1/entities", params={"name": "Opal"}, headers=R)
+        assert r2.status_code == 200
+        assert r2.json()["total"] == 1
+        item = r2.json()["items"][0]
+        assert item["ref"] == ref
+        assert item["display_label"] == "Opal"
+        assert item["canonical_type"] == "character"
+        assert item["aliases"] == ["Op"]
+        assert item["memberships"]["source_ids"] == ["src:op"]
+        assert item["state"] == "CONFIRMED"
+
+
+def test_operator_establish_is_idempotent(umd_db: sa.Engine) -> None:
+    """P2-S3: re-running POST /v1/entities for the same ref converges (no duplicate)."""
+    app = create_app(engine=umd_db, source_store=None, settings=_client_settings())
+    ref = "entity:canonical:op:2"
+    body = {
+        "ref": ref,
+        "display_label": "Idem",
+        "canonical_type": "character",
+        "aliases": [],
+        "memberships": {"source_ids": ["src:id"], "work_ids": [], "continuity_ids": []},
+        "state": "CONFIRMED",
+        "authority": "operator",
+    }
+    with TestClient(app) as client:
+        assert client.post("/v1/entities", json=body, headers=W).status_code == 201
+        assert client.post("/v1/entities", json=body, headers=W).status_code == 201
+        listed = client.get("/v1/entities", params={"name": "Idem"}, headers=R)
+        assert listed.status_code == 200
+        assert listed.json()["total"] == 1
+
+
+def test_operator_establish_rejects_invalid_authority(umd_db: sa.Engine) -> None:
+    """P2-S3: an unsupported authority is a 422, never silently coerced to operator."""
+    app = create_app(engine=umd_db, source_store=None, settings=_client_settings())
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/entities",
+            json={
+                "ref": "entity:canonical:op:3",
+                "display_label": "NoAuth",
+                "authority": "robot",
+                "memberships": {"source_ids": [], "work_ids": [], "continuity_ids": []},
+            },
+            headers=W,
+        )
+        assert r.status_code == 422
+        assert r.json()["code"] == "invalid_authority"
+
+
+def test_search_source_scoped_excludes_unrelated_source(umd_db: sa.Engine) -> None:
+    """P2-S2: source-scoped canonical search includes only in-scope canonicals — a
+    canonical belonging to source C never surfaces in source A's scoped search."""
+    _composer, sid, _refs = _build_cast(umd_db)
+    app = create_app(engine=umd_db, source_store=None, settings=_client_settings())
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/entities",
+            json={
+                "ref": "entity:canonical:zephyr:1",
+                "display_label": "Zephyr",
+                "canonical_type": "character",
+                "aliases": ["Zeph"],
+                "memberships": {
+                    "source_ids": ["src:c"],
+                    "work_ids": [],
+                    "continuity_ids": [],
+                },
+                "state": "CONFIRMED",
+                "authority": "operator",
+            },
+            headers=W,
+        )
+        assert r.status_code == 201, r.text
+    _build_search(umd_db)
+    svc = SearchService(umd_db)
+    # Global search finds Zephyr (its own source doc) AND the cast canonicals.
+    assert svc.exact("Zephyr").total >= 1
+    # Source C scoped search finds Zephyr (in C's membership).
+    assert svc.exact("Zephyr", SearchFilters(source_id="src:c")).total >= 1
+    # Source A (the cast's source) scoped search EXCLUDES Zephyr — unrelated scope.
+    assert svc.exact("Zephyr", SearchFilters(source_id=sid)).total == 0
+
+
+def test_search_work_scoped_includes_only_in_scope(umd_db: sa.Engine) -> None:
+    """P2-S2: work-scoped canonical search returns only canonicals whose replay-derived
+    work membership intersects the requested work scope."""
+    work = str(uuid.uuid4())
+    app = create_app(engine=umd_db, source_store=None, settings=_client_settings())
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/entities",
+            json={
+                "ref": "entity:canonical:workbound:2",
+                "display_label": "WorkCloak",
+                "canonical_type": "character",
+                "aliases": [],
+                "memberships": {
+                    "work_ids": [work],
+                    "source_ids": ["src:w"],
+                    "continuity_ids": [],
+                },
+                "state": "CONFIRMED",
+                "authority": "operator",
+            },
+            headers=W,
+        )
+        assert r.status_code == 201, r.text
+    _build_search(umd_db)
+    svc = SearchService(umd_db)
+    assert svc.exact("WorkCloak").total >= 1
+    assert svc.exact("WorkCloak", SearchFilters(work_id=work)).total >= 1
+    assert svc.exact("WorkCloak", SearchFilters(work_id=str(uuid.uuid4()))).total == 0
+
+
+def test_reconciler_mentor_of_becomes_typed_related_to(umd_db: sa.Engine) -> None:
+    """P2-S4: a valid MENTOR_OF relationship is emitted as a typed RELATED_TO carrying
+    the normalized relationship_type, through the ledger and edge projection, and is
+    queryable by relationship_type."""
+    _composer, sid, _refs = _build_cast(umd_db)
+    alice = _canonical_by_label(umd_db, "Alice")
+    carol = _canonical_by_label(umd_db, "Carol")
+    seg = SegmentEvidenceRef(locator="source://s1/rel/1", evidence_ref="ev:rel:1")
+    gb = GeneratedBy(path="deterministic", config_digest="cfg@1")
+    analysis = SemanticAnalysisResult(
+        source_id=sid,
+        generated_by=gb,
+        relationships=[
+            RelationshipCandidate(
+                subject_ref=alice,
+                predicate="MENTOR_OF",
+                object_ref=carol,
+                confidence=0.9,
+                segment=seg,
+                generated_by=gb,
+            )
+        ],
+    )
+    res = ResolutionBatch(
+        source_id=sid,
+        canonical_entities=[
+            CanonicalEntity(ref=alice, label=alice, source_id=sid),
+            CanonicalEntity(ref=carol, label=carol, source_id=sid),
+        ],
+    )
+    events = SemanticReconciler().reconcile(
+        ReconciliationInput(source_id=sid, analysis=analysis, resolution=res)
+    )
+    typed = [e for e in events if e.payload["predicate_code"] == "RELATED_TO"]
+    assert len(typed) == 1
+    assert typed[0].payload["relationship_type"] == "MENTOR_OF"
+    assert typed[0].payload["subject_ref"] == alice
+    assert typed[0].payload["object_ref"] == carol
+    SemanticLedger(umd_db).append(typed)
+    store = ProjectionCheckpointStore(umd_db)
+    ReplayDriver(umd_db, store).run(ActiveSemanticEdgeProjectionBuilder(), wipe=True)
+    q = QueryService(umd_db)
+    by_type = q.relationship_edges(
+        StructuredQuery(kind="RELATIONSHIP_EDGES", filters={"relationship_type": "MENTOR_OF"})
+    )
+    assert by_type.total >= 1
+    h = by_type.results[0]
+    assert h.predicate == "RELATED_TO"
+    assert h.data.get("relationship_type") == "MENTOR_OF"
+    assert h.value == carol  # object endpoint preserved
+    # A different relationship_type filters it out.
+    none = q.relationship_edges(
+        StructuredQuery(kind="RELATIONSHIP_EDGES", filters={"relationship_type": "SIBLING_OF"})
+    )
+    assert all(
+        r.predicate != "RELATED_TO" or r.data.get("relationship_type") != "MENTOR_OF"
+        for r in none.results
+    )
+
+
+def test_reconciler_related_to_requires_valid_type(umd_db: sa.Engine) -> None:
+    """P2-S4: RELATED_TO without a validated relationship_type is evidence-only."""
+    _composer, sid, _refs = _build_cast(umd_db)
+    alice = _canonical_by_label(umd_db, "Alice")
+    carol = _canonical_by_label(umd_db, "Carol")
+    seg = SegmentEvidenceRef(locator="source://s1/rel/2", evidence_ref="ev:rel:2")
+    gb = GeneratedBy(path="deterministic", config_digest="cfg@1")
+    analysis = SemanticAnalysisResult(
+        source_id=sid,
+        generated_by=gb,
+        relationships=[
+            RelationshipCandidate(
+                subject_ref=alice,
+                predicate="RELATED_TO",
+                object_ref=carol,
+                confidence=0.9,
+                segment=seg,
+                generated_by=gb,
+            )
+        ],
+    )
+    res = ResolutionBatch(
+        source_id=sid,
+        canonical_entities=[
+            CanonicalEntity(ref=alice, label=alice, source_id=sid),
+            CanonicalEntity(ref=carol, label=carol, source_id=sid),
+        ],
+    )
+    events = SemanticReconciler().reconcile(
+        ReconciliationInput(source_id=sid, analysis=analysis, resolution=res)
+    )
+    # No RELATED_TO assertion is fabricated for a type-less generic relationship.
+    assert all(e.payload["predicate_code"] != "RELATED_TO" for e in events)
+
+
+def test_registry_immutable_mentor_of_not_registered() -> None:
+    """P2-S4: promoting MENTOR_OF to a typed RELATED_TO does NOT mutate the trusted
+    vocabulary — MENTOR_OF is not a registered predicate, so payloads cannot forge one."""
+    assert is_known_predicate("MENTOR_OF") is False
+    assert is_known_predicate("RELATED_TO") is True
+    assert is_known_predicate("SIBLING_OF") is True
+
+
+def test_scoped_search_replay_equality(umd_db: sa.Engine) -> None:
+    """P2-S2 / replay equality: wipe-and-replay of the search projection (force_resume)
+    yields byte-identical membership-scoped search documents — the disposable,
+    deterministically-rebuildable non-authoritative store."""
+    _composer, _sid, _refs = _build_cast(umd_db)
+    app = create_app(engine=umd_db, source_store=None, settings=_client_settings())
+    with TestClient(app) as client:
+        assert (
+            client.post(
+                "/v1/entities",
+                json={
+                    "ref": "entity:canonical:replay:1",
+                    "display_label": "ReplayRune",
+                    "canonical_type": "character",
+                    "aliases": ["Rune"],
+                    "memberships": {
+                        "source_ids": ["src:r"],
+                        "work_ids": [],
+                        "continuity_ids": [],
+                    },
+                    "state": "CONFIRMED",
+                    "authority": "operator",
+                },
+                headers=W,
+            ).status_code
+            == 201
+        )
+    _build_search(umd_db)
+    docs = search_document
+
+    def _snapshot() -> set[tuple[str, str, str, str, str | None, str | None, str | None]]:
+        with umd_db.connect() as conn:
+            rows = conn.execute(
+                sa.select(
+                    docs.c.ref,
+                    docs.c.kind,
+                    docs.c.text,
+                    docs.c.entity_ref,
+                    docs.c.source_id,
+                    docs.c.work_id,
+                    docs.c.continuity_id,
+                )
+            ).fetchall()
+        return {(str(r[0]), str(r[1]), str(r[2]), str(r[3]), r[4], r[5], r[6]) for r in rows}
+
+    first = _snapshot()
+    # Deterministic wipe-and-replay rebuild (force_resume acknowledges authority events).
+    _build_search(umd_db)
+    second = _snapshot()
+    assert first == second
+    assert len(first) == len(second)  # no drift, no duplicates after rebuild
+    # The source-scoped canonical doc is present and correctly scoped.
+    assert any(r[2] == "ReplayRune" and r[4] == "src:r" for r in second)

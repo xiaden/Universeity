@@ -206,11 +206,23 @@ def _upcast_entity_resolved_1_to_2(payload: dict[str, Any]) -> dict[str, Any]:
     return widened
 
 
+def _upcast_semantic_asserted_2_to_3(payload: dict[str, Any]) -> dict[str, Any]:
+    """v2 -> v3 (Plan T P2-S4 / R7): v3 adds an optional ``relationship_type``
+    carried by a RELATED_TO predicate. The pure upcaster supplies the neutral
+    ``None`` default so retained v2 rows replay unchanged as v3; nothing
+    historical is mutated."""
+    widened = dict(payload)
+    widened.setdefault("relationship_type", None)
+    return widened
+
+
 UPCASTERS: dict[tuple[str, int], Upcaster] = {
     # SemanticAsserted v1 -> v2 (pure upcaster, no I/O).
     ("SemanticAsserted", 1): _upcast_semantic_asserted_1_to_2,
     # EntityResolved v1 -> v2 (Plan S P1-S3): additive canonical-identity metadata.
     ("EntityResolved", 1): _upcast_entity_resolved_1_to_2,
+    # SemanticAsserted v2 -> v3 (Plan T P2-S4 / R7): additive RELATED_TO type.
+    ("SemanticAsserted", 2): _upcast_semantic_asserted_2_to_3,
 }
 
 

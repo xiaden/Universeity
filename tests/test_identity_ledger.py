@@ -72,6 +72,7 @@ def _establish(canonical: str, seq: int, **meta: Any) -> SemanticEvent:
         support_refs=meta.get("support_refs", []),
         memberships=meta.get("memberships", {}),
         state=meta.get("state"),
+        classification=meta.get("classification"),
         intensity=meta.get("confidence"),
     )
     return ev.model_copy(update={"seq": seq})
@@ -113,6 +114,37 @@ def test_establish_folds_to_identity_row_and_canonical_entity() -> None:
     assert meta["display_label"] == "Alice"
     assert meta["canonical_type"] == "character"
     assert row.state == "CONFIRMED"  # ESTABLISH is a confirmed accepted canonical
+
+
+def test_classification_folds_and_persists_in_identity_metadata() -> None:
+    """Plan T P1-S3/P1-S4: ESTABLISH classification is additive identity metadata.
+
+    The honest accepted/probable/unresolved/ambiguous classification carried by the
+    event folds through the ONE reducer into the current_state identity metadata
+    (and hence into the object_ref JSON that wipe/replay reconstructs).
+    """
+    events = [
+        _establish("entity:canonical:aaa", 1, display_label="Mara", classification="probable"),
+        _establish("entity:canonical:bbb", 2, display_label="Alice", classification="accepted"),
+    ]
+    state = CurrentStateReducer().replay(events)
+    assert (
+        _metadata_of(_identity_row(state, "entity:canonical:aaa"))["classification"] == "probable"
+    )
+    assert (
+        _metadata_of(_identity_row(state, "entity:canonical:bbb"))["classification"] == "accepted"
+    )
+    # No classification present on a legacy event -> reducer stays neutral (no fabricated
+    # classification), preserving additive backward compatibility.
+    legacy = resolved_event(
+        kind="ESTABLISH",
+        entity_id="entity:canonical:ccc",
+        target_entity_id="entity:canonical:ccc",
+        display_label="Bob",
+        state="PROBABLE",
+    ).model_copy(update={"seq": 3})
+    state2 = CurrentStateReducer().replay([*events, legacy])
+    assert _metadata_of(_identity_row(state2, "entity:canonical:ccc")).get("classification") is None
 
 
 def test_at_least_three_canonicals_no_synthetic_alias_entity() -> None:
@@ -428,6 +460,40 @@ def test_inline_vs_wipe_replay_equivalence(umd_db: sa.Engine) -> None:
     assert builder.checksum(umd_db) == t0
     # The replayed identity rows reconstruct exactly the same metadata.
     assert len(_identity_rows(umd_db)) == 3
+
+
+def test_wipe_replay_preserves_classification_and_opaque_refs(umd_db: sa.Engine) -> None:
+    """Plan T P1-S5: wipe/replay equality for the new identity/ref paths.
+
+    Replaying the SAME event batch through the single shared reducer reconstructs
+    the exact same canonical refs AND their additive ``classification`` metadata —
+    identical opaque refs, identical accepted/probable classification — with no
+    duplicate establishment. force_resume/wipe uses the one CurrentTierOneBuilder
+    + CurrentStateReducer fold (the replay builder owns the projection).
+    """
+    composer, sid = _build_composer(umd_db)
+    _seed_cast(composer, sid)
+    composer._entity_resolution(make_manifest("ENTITY_RESOLUTION"))  # noqa: SLF001
+
+    def _snapshot() -> dict[str, str]:
+        out: dict[str, str] = {}
+        for r in _identity_rows(umd_db):
+            meta = json.loads(r.object_ref)
+            out[str(r.entity_ref)] = str(meta.get("classification"))
+        return out
+
+    before = _snapshot()
+    assert before, "resolution established at least one canonical"
+    assert set(before.values()) <= {"accepted", "probable"}
+
+    store = ProjectionCheckpointStore(umd_db)
+    builder = CurrentTierOneBuilder()
+    ReplayDriver(umd_db, store).run(builder, wipe=True)
+    assert _snapshot() == before
+    # A second wipe-and-replay is byte-identical (deterministic replay convergence).
+    expected = tier0_checksum(umd_db)
+    ReplayDriver(umd_db, store).run(CurrentTierOneBuilder(), wipe=True)
+    assert tier0_checksum(umd_db) == expected
 
 
 def test_merge_split_reversible_preserves_identity(umd_db: sa.Engine) -> None:

@@ -191,7 +191,7 @@ def test_old_locator_and_event_readable_after_version_change(
         row = conn.execute(
             sa.select(_se.c.event_version, _se.c.payload).where(_se.c.seq == 1)
         ).one()
-    assert int(row.event_version) == 2  # stored at the current (v2) schema
+    assert int(row.event_version) == 3  # stored at the current (v3) schema
 
     snapshot = tmp_path / "backup"
     backup_postgres(umd_db, snapshot)

@@ -90,6 +90,9 @@ def resolved_event(
     support_refs: list[str] | None = None,
     memberships: dict[str, list[str]] | None = None,
     state: str | None = None,
+    classification: str | None = None,
+    authority: str = "machine",
+    created_by: str | None = None,
 ) -> SemanticEvent:
     """Build an ``EntityResolved`` event conforming to ``EntityResolved/v2.json``.
 
@@ -97,6 +100,12 @@ def resolved_event(
     display label, active aliases, support refs, memberships, state). Retained
     v1 MERGE/SPLIT/ALIAS events upcast with neutral defaults; nothing historical
     is mutated.
+
+    ``authority`` defaults to ``"machine"`` (the deterministic resolution path).
+    Plan T (P2-S3) lets the operator/human boundary establish a canonical with
+    ``"operator"`` / ``"human"`` authority; the reducer keeps ``USER_OVERRIDE``
+    precedence unchanged, and a non-USER_OVERRIDE authority behaves like machine
+    w.r.t. lock/override protection.
     """
     payload: dict[str, Any] = {
         "kind": kind,
@@ -112,13 +121,15 @@ def resolved_event(
         "support_refs": support_refs or [],
         "memberships": memberships or {},
         "state": state,
+        "classification": classification,
     }
     if intensity is not None:
         payload["confidence"] = intensity
     return SemanticEvent(
         event_type="EntityResolved",
-        authority="machine",
+        authority=authority,
         confidence=intensity,
+        created_by=created_by,
         payload=payload,
     )
 
@@ -390,6 +401,8 @@ class Resolver:
         canonical: str,
         metadata: dict[str, Any] | None = None,
         reason: str | None = None,
+        authority: str = "machine",
+        created_by: str | None = None,
     ) -> CommitResult:
         """ESTABLISH: record an accepted canonical's identity metadata.
 
@@ -412,7 +425,10 @@ class Resolver:
             support_refs=list(meta.get("support_refs") or []),
             memberships=meta.get("memberships"),
             state=meta.get("state"),
+            classification=meta.get("classification"),
             intensity=meta.get("confidence"),
+            authority=authority,
+            created_by=created_by,
         )
         # Plan S (P3-S1): the idempotency key includes a deterministic fingerprint
         # of the identity metadata, so re-establishing the SAME canonical with a
@@ -423,7 +439,12 @@ class Resolver:
         # a transient annotation, not new identity content — dropping it keeps the
         # fingerprint stable so a rerun over the same members converges instead of
         # appending a duplicate establishment.
-        fingerprint = {k: v for k, v in meta.items() if k != "state"}
+        # ``classification`` is likewise excluded (Plan T P1-S3/R8): a rerun that
+        # first saw a fresh (probable) canonical and, on a later pass, seeds it from
+        # the now-committed assignment (accepted) must NOT emit a duplicate
+        # ESTABLISH. Dropping both keeps the fingerprint stable so a rerun converges
+        # instead of creating a second canonical topology (R1 — one authority).
+        fingerprint = {k: v for k, v in meta.items() if k not in ("state", "classification")}
         digest = json.dumps(fingerprint, sort_keys=True, default=str)
         idem = uuid.uuid5(uuid.NAMESPACE_URL, f"umd-establish:{canonical}\x1f{digest}")
         return self._ledger.append([event], idempotency_key=idem)

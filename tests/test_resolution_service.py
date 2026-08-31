@@ -24,7 +24,7 @@ import uuid
 from umd.domain.models import ConfidenceState
 from umd.resolution.candidates import normalize_name
 from umd.resolution.mentions import SourceMention
-from umd.resolution.service import EntityResolutionService
+from umd.resolution.service import EntityResolutionService, ResolutionInputBuilder
 
 # Fixed mention ids so the deterministic member ordering (sorted by mention id)
 # is stable across runs and the alias-member is never accidentally the cluster
@@ -187,3 +187,194 @@ def test_accepted_canonicals_carry_full_identity_metadata():
             "continuity_ids",
         }
         assert cmd.metadata["aliases"] == by_label[cmd.metadata["display_label"]].aliases
+
+
+# ---------------------------------------------------------------------------
+# Plan T P1-S5: semantic identity boundary hardening (pure resolution domain)
+# ---------------------------------------------------------------------------
+NOVEL = "11111111-1111-1111-1111-111111111111"
+
+
+def _m2(
+    *,
+    text: str,
+    mid: str,
+    source: str,
+    segment: str,
+    work_id: str | None = NOVEL,
+    entity_id: str | None = None,
+    conf: float = 0.85,
+    state: str = ConfidenceState.CONFIRMED.value,
+) -> SourceMention:
+    """A mention with content-derived evidence (segment) and an optional work scope."""
+    return SourceMention(
+        id=uuid.UUID(mid),
+        source_id=source,
+        entity_id=entity_id,
+        segment_id=segment,
+        mention_text=text,
+        normalized_forms=[normalize_name(text)],
+        confidence_state=state,
+        confidence=conf,
+        provenance={"locator": f"chapter/1/{segment}"},
+        metadata_={"entity_type": "character"},
+        work_id=work_id,
+    )
+
+
+def _single(batch) -> list[SourceMention]:
+    """The member mentions of a one-character canonical cluster."""
+    assert len(batch.canonical_entities) == 1
+    return batch.canonical_entities[0]
+
+
+def test_builder_is_single_pure_bounded_input_authority():
+    """Plan T P1-S1/R1: the builder deterministically assembles a bounded input.
+
+    Routing the same mentions through ``ResolutionInputBuilder.build`` yields the
+    identical ``ResolutionBatch`` as resolving the mentions directly — there is ONE
+    bounded input/batch builder and ONE domain decision per execution generation.
+    The builder is pure (writes nothing) and sorts mentions by mention id.
+    """
+    mentions = [
+        _m2(text="Mara", mid="10000000-0000-0000-0000-000000000001", source="A", segment="p/1"),
+        _m2(text="Mara", mid="10000000-0000-0000-0000-000000000003", source="A", segment="p/3"),
+    ]
+    direct = EntityResolutionService(resolve_floor=0.4).resolve_mentions(mentions)
+    built = EntityResolutionService(resolve_floor=0.4).resolve_mentions(
+        ResolutionInputBuilder().build(
+            source={"source_id": "A", "work_id": NOVEL},
+            evidence=mentions,
+            memberships={"source_ids": ["A"], "work_ids": [NOVEL], "continuity_ids": []},
+        )
+    )
+    assert [e.ref for e in built.canonical_entities] == [e.ref for e in direct.canonical_entities]
+    # One ESTABLISH decision (plus per-member MENTION commands) — a single
+    # authoritative resolution per generation, no duplicate establishment.
+    assert sum(1 for c in built.commands if c.kind == "ESTABLISH") == 1
+    # Bounded: the built input carries exactly the source scope and no topology.
+    assert built.assignments == direct.assignments
+    assert not built.contradictions
+
+
+def test_same_work_same_evidence_unifies_same_canonical_across_sources():
+    """Plan T P1-S5: Mara A<->B equality — same canonical when evidence supports it.
+
+    Two sources of the SAME work, with the SAME content-derived evidence (segments),
+    unify onto ONE canonical ref — evidence (not display-name-only) authorizes the
+    join. The ref is source-independent (no source prefix) and opaque.
+    """
+    a = [
+        _m2(text="Mara", mid="10000000-0000-0000-0000-000000000001", source="A", segment="p/1"),
+        _m2(text="Mara", mid="10000000-0000-0000-0000-000000000003", source="A", segment="p/3"),
+    ]
+    b = [
+        _m2(text="Mara", mid="20000000-0000-0000-0000-000000000001", source="B", segment="p/1"),
+        _m2(text="Mara", mid="20000000-0000-0000-0000-000000000003", source="B", segment="p/3"),
+    ]
+    ref_a = _single(EntityResolutionService(resolve_floor=0.4).resolve_mentions(a)).ref
+    ref_b = _single(EntityResolutionService(resolve_floor=0.4).resolve_mentions(b)).ref
+    assert ref_a == ref_b, "same work + same evidence must unify onto one canonical"
+    assert ref_a.startswith("entity:canonical:")
+    assert ":" not in ref_a[len("entity:canonical:") :]
+
+
+def test_same_name_same_work_different_evidence_stays_separate():
+    """Plan T P1-S5/R3: John/C same-name separation — evidence disambiguates.
+
+    Same name AND same work is NOT proof of identity. Two "John" characters at
+    DIFFERENT evidence segments in the same work stay SEPARATE (distinct refs) and
+    never get a fabricated alias linking them. Each source is resolved independently
+    (as ENTITY_RESOLUTION does per source), then the resulting refs are compared —
+    identical names never collapse across sources without accepted evidence.
+    """
+    service = EntityResolutionService(resolve_floor=0.4)
+    john_a = service.resolve_mentions(
+        [_m2(text="John", mid="30000000-0000-0000-0000-000000000006", source="A", segment="p/6")]
+    )
+    john_b = service.resolve_mentions(
+        [_m2(text="John", mid="40000000-0000-0000-0000-000000000007", source="B", segment="p/7")]
+    )
+    ref_a = _single(john_a).ref
+    ref_b = _single(john_b).ref
+    assert ref_a != ref_b, "same name + same work but different evidence must stay separate"
+    assert not john_a.alias_mappings and not john_b.alias_mappings
+    assert _single(john_a).classification == "probable"
+    assert _single(john_b).classification == "probable"
+
+
+def test_moss_never_inferred_as_mara():
+    """Plan T P1-S5/R8: honest fallback — Moss is never merged into Mara.
+
+    Without evidence linking them, Moss and Mara keep distinct refs; Moss is NOT an
+    alias of Mara and no canonical identity is fabricated for it beyond its own
+    probable cluster.
+    """
+    moss = _m2(text="Moss", mid="50000000-0000-0000-0000-000000000009", source="A", segment="p/9")
+    mara = [
+        _m2(text="Mara", mid="10000000-0000-0000-0000-000000000001", source="A", segment="p/1"),
+        _m2(text="Mara", mid="10000000-0000-0000-0000-000000000003", source="A", segment="p/3"),
+    ]
+    batch = EntityResolutionService(resolve_floor=0.4).resolve_mentions([moss, *mara])
+    assert len(batch.canonical_entities) == 2
+    mara_e = next(e for e in batch.canonical_entities if e.label == "Mara")
+    moss_e = next(e for e in batch.canonical_entities if e.label == "Moss")
+    assert mara_e.ref != moss_e.ref
+    assert "Moss" not in mara_e.aliases and "moss" not in mara_e.aliases
+    assert moss_e.ref not in mara_e.aliases
+    assert moss_e.classification == "probable"
+    assert moss_e.state == ConfidenceState.PROBABLE.value
+
+
+def test_classification_accepted_probable_ambiguous():
+    """Plan T P1-S3: resolution distinguishes accepted/probable/unresolved/ambiguous.
+
+    A cluster seeded from an existing committed assignment is ACCEPTED; a fresh
+    machine-inferred canonical is PROBABLE; a genuinely ambiguous mention stays
+    UNRESOLVED with an AMBIGUOUS batch classification — no fabricated ref or alias.
+    """
+    # Fresh (no existing assignment) -> probable.
+    fresh = [
+        _m2(text="Mara", mid="10000000-0000-0000-0000-000000000001", source="A", segment="p/1"),
+        _m2(text="Mara", mid="10000000-0000-0000-0000-000000000003", source="A", segment="p/3"),
+    ]
+    fresh_batch = EntityResolutionService(resolve_floor=0.4).resolve_mentions(fresh)
+    assert fresh_batch.classification == "probable"
+    assert fresh_batch.canonical_entities[0].classification == "probable"
+
+    # Ambiguous singleton -> unresolved, batch AMBIGUOUS.
+    ambiguous = _m2(
+        text="Moss",
+        mid="50000000-0000-0000-0000-000000000099",
+        source="A",
+        segment="p/9",
+        state=ConfidenceState.AMBIGUOUS.value,
+        conf=0.4,
+    )
+    amb_batch = EntityResolutionService(resolve_floor=0.4).resolve_mentions([ambiguous])
+    assert amb_batch.classification == "ambiguous"
+    assert amb_batch.unresolved and amb_batch.unresolved[0].classification == "ambiguous"
+    assert amb_batch.state == ConfidenceState.AMBIGUOUS.value
+
+
+def test_human_support_build_narrowing_seeds_accepted():
+    """Plan T P1-S5/R2: human_support candidate narrowing reuses a committed ref.
+
+    A human-confirmed ref passed to the builder seeds the mention, producing an
+    ACCEPTED canonical that reuses the confirmed ref (no duplicate derivation) —
+    human confirmation is a legitimate join that outranks a fresh machine guess.
+    """
+    human_ref = "entity:canonical:beef000000000001"
+    m = _m2(text="Mara", mid="10000000-0000-0000-0000-000000000001", source="A", segment="p/1")
+    built = ResolutionInputBuilder().build(
+        source={"source_id": "A", "work_id": NOVEL},
+        evidence=[m],
+        human_support={m.mention_id: human_ref},
+    )
+    assert built.mentions[0].entity_id == human_ref
+    batch = EntityResolutionService(resolve_floor=0.4).resolve_mentions(built)
+    assert len(batch.canonical_entities) == 1
+    ent = batch.canonical_entities[0]
+    assert ent.ref == human_ref
+    assert ent.classification == "accepted"
+    assert ent.state == ConfidenceState.CONFIRMED.value

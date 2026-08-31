@@ -148,9 +148,33 @@ class EntityListResponse(BaseModel):
 
 
 class EntityCreateRequest(BaseModel):
-    ref: str
+    """POST /v1/entities payload (Plan T P2-S3 / R6).
+
+    Routed through the SAME canonical authority as resolution
+    (:class:`Resolver.establish`): the payload becomes an ``EntityResolved``
+    ``ESTABLISH`` event carrying display label, canonical type, aliases,
+    replay-derived memberships, support/evidence refs, state and authority. It
+    never fabricates an SQL ``entity`` row and never mutates the predicate
+    vocabulary. ``ref`` is the opaque canonical ref (Plan N Option B: a non-UUID
+    ref keeps ``entity_id`` NULL on any mention rows).
+    """
+
+    ref: str = Field(min_length=1)
+    display_label: str | None = Field(default=None, description="active display label")
+    # Legacy alias: the pre-Plan-T create payload used ``label`` for the display
+    # label. Kept for backward compatibility; ``display_label`` wins when both set.
     label: str | None = None
-    kind: str = "ENTITY"
+    canonical_type: str | None = Field(default=None, description="canonical type (e.g. character)")
+    aliases: list[str] = Field(default_factory=list, description="active alias surfaces")
+    memberships: dict[str, list[str]] = Field(
+        default_factory=dict, description="replay-derived source/work/continuity memberships"
+    )
+    support_refs: list[str] = Field(default_factory=list, description="evidence/segment support")
+    state: str | None = Field(default=None, description="identity state (defaults to CONFIRMED)")
+    authority: str = Field(default="operator", description="operator | human")
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    reason: str | None = None
+    actor: str | None = None
 
 
 class EntityActionResponse(BaseModel):
@@ -225,6 +249,12 @@ class StructuredQueryRequest(BaseModel):
     filters: dict[str, Any] = Field(default_factory=dict)
     confidence_min: float | None = None
     continuity_id: str | None = None
+    # Plan T (P2-S1): bounded replay-derived membership filters on ENTITY reads, merged
+    # into ``filters`` by the router. They are distinct from the top-level
+    # ``continuity_id`` (the source-declared continuity seam). Membership continuity on
+    # an ENTITY read may also be expressed directly as ``filters.continuity_id``.
+    work_id: str | None = None
+    source_id: str | None = None
     temporal_from: str | None = None
     temporal_to: str | None = None
     spatial: dict[str, Any] | None = None
@@ -266,6 +296,8 @@ class SearchRequest(BaseModel):
     query: str
     mode: Literal["exact", "fuzzy", "hybrid"] = "hybrid"
     source_id: str | None = None
+    work_id: str | None = None
+    continuity_id: str | None = None
     segment_id: str | None = None
     entity_ref: str | None = None
     kind: str | None = None

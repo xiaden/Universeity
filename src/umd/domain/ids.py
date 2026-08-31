@@ -42,22 +42,27 @@ def canonical_identity(sha512: str, work_id: str | None = None, kind: str = "sou
 
 
 def canonical_entity_ref(member_ids: Iterable[str]) -> str:
-    """Deterministic, source-independent canonical ENTITY ref (Plan S P1-S2).
+    """Deterministic, source-independent canonical ENTITY ref (Plan T P1-S2).
 
-    Replaces the old source-bound ``entity:canonical:<source_id>:<digest>`` form:
-    the returned ref carries NO source-bound prefix and no filename input. The
-    digest is derived solely from the *accepted identity anchor* — the sorted
-    member mention ids of the accepted canonical cluster:
+    Replaces the Plan S member-mention-hashing form (which was source-bound
+    because deterministic mention ids embed the source id). The ``member_ids``
+    passed here are now the **evidence-backed identity anchor tokens** of the
+    accepted canonical cluster (canonicalized display label + work/continuity
+    scope + content-derived evidence refs) — NOT the mention ids and NOT any
+    source/transient id:
 
+      * the returned ref carries NO source prefix, filename, job id, transient
+        UUID, ingest order, or first-establisher signal;
       * reruns over the same accepted cluster converge to the SAME ref;
-      * same-name text in different contexts yields distinct member ids and thus
-        distinct (separate or reviewable) identities — same-name text alone
-        never merges;
-      * the ref does not embed a source id, so sources are only joined through
-        explicit supported correspondence or human-confirmed identity evidence.
+      * same-name text alone never merges — the work/continuity scope and the
+        evidence tokens disambiguate distinct identities, so same-name
+        characters at different evidence (or in different works) stay separate;
+      * sources are joined only through accepted evidence, explicit
+        correspondence, an existing canonical assignment, or human
+        confirmation/lock (never by same-name/same-work string equality alone).
 
-    :param member_ids: the mention ids accepted as members of the canonical
-        cluster (the deterministic identity anchor for that scope).
+    :param member_ids: the sorted, deduplicated identity-anchor tokens of the
+        accepted canonical cluster.
     """
     members = sorted(set(str(m) for m in member_ids))
     material = "\x1f".join(members)

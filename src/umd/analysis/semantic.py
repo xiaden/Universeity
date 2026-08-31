@@ -163,11 +163,20 @@ class DescriptiveTrait(SemanticCandidate):
 
 
 class RelationshipCandidate(SemanticCandidate):
-    """A relationship candidate between two entities."""
+    """A relationship candidate between two entities.
+
+    ``predicate`` is the relationship predicate (a registered vocabulary entry or a
+    semantically-valid unregistered type such as ``MENTOR_OF``). ``relationship_type``,
+    when present, names the normalized specific relationship type carried by a
+    ``RELATED_TO`` predicate (Plan T P2-S4 / R7). It is advisory input only — the
+    reconciler validates/normalizes it and never lets an arbitrary payload mutate the
+    trusted predicate vocabulary.
+    """
 
     subject_ref: str = Field(min_length=1)
     predicate: str = Field(min_length=1)
     object_ref: str = Field(min_length=1)
+    relationship_type: str | None = Field(default=None, min_length=1)
 
 
 class EmotionObservation(SemanticCandidate):

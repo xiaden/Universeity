@@ -85,12 +85,21 @@ def structured_query(
     depth, limit, offset = _bounded(body, ctx)
     guard = _freshness_guard(ctx, edge_derived=body.kind == "RELATIONSHIP_EDGES")
     snap = guard.ensure_read(body.consistency_token)
+    # Plan T (P2-S1): merge the explicit bounded membership filters (work_id / source_id)
+    # into the query filters. Membership continuity may be passed either as
+    # ``filters.continuity_id`` or via the explicit ``continuity_id``-independent path —
+    # the top-level ``continuity_id`` remains the declared-continuity seam.
+    filters = dict(body.filters)
+    if body.work_id:
+        filters["work_id"] = body.work_id
+    if body.source_id:
+        filters["source_id"] = body.source_id
     try:
         page = ctx.query.structured(
             StructuredQuery(
                 kind=body.kind,
                 ref=body.ref,
-                filters=body.filters,
+                filters=filters,
                 confidence_min=body.confidence_min,
                 continuity_id=body.continuity_id,
                 temporal_from=body.temporal_from,

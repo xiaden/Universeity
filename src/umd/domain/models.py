@@ -42,6 +42,27 @@ class ConfidenceState(StrEnum):
     USER_CONFIRMED = "USER_CONFIRMED"
 
 
+class IdentityClassification(StrEnum):
+    """Honest resolution classification (Plan T P1-S3 / requirement R8).
+
+    Distinguishes the outcome of a resolution/reconciliation decision so unknown
+    surfaces are never silently promoted or merged:
+
+      * ``ACCEPTED`` — a canonical identity established on accepted evidence /
+        existing canonical assignment / human confirmation (CONFIRMED state);
+      * ``PROBABLE`` — a machine-inferred canonical that is plausible but not
+        confirmed;
+      * ``UNRESOLVED`` — a mention kept reviewable with no guessed target;
+      * ``AMBIGUOUS`` — a mention with competing candidates that must not be
+        merged without evidence (e.g. Moss vs Mara is never inferred).
+    """
+
+    ACCEPTED = "accepted"
+    PROBABLE = "probable"
+    UNRESOLVED = "unresolved"
+    AMBIGUOUS = "ambiguous"
+
+
 class EvidenceKind(StrEnum):
     """Modality-native evidence kinds (P2-S1 requirement list)."""
 
@@ -188,6 +209,13 @@ register_predicate("STARTS_AT", "A scene starts at a source segment.")
 # exactly like every other relationship predicate. Malformed/arbitrary model strings
 # are still rejected by is_known_predicate in the reconciler (never fabricated).
 register_predicate("SIBLING_OF", "An entity is a sibling of another entity.")
+# Plan T Phase 2 (P2-S4 / R7): the generic typed-relationship predicate. A
+# registered RELATED_TO carries a validated normalized ``relationship_type``
+# (e.g. MENTOR_OF) that names the specific relationship; a valid unanticipated
+# relationship predicate (MENTOR_OF) is emitted as a typed RELATED_TO. The
+# vocabulary is immutable to model/API payloads — only register_predicate (a
+# module/trusted path) admits entries, never a request body.
+register_predicate("RELATED_TO", "A generic typed relationship between two entities.")
 
 
 class Predicate(BaseModel):

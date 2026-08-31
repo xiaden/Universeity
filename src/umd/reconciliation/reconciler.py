@@ -33,6 +33,7 @@ semantics win (``reducer.py`` is unchanged).
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -78,6 +79,75 @@ class _Emit:
     support_refs: list[str]
     obs_generated_by: GeneratedBy | None
     contradiction_refs: list[str] = field(default_factory=list)
+    relationship_type: str | None = None
+
+
+_REL_TYPE_RE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+
+#: Recognized semantic relationship types that are NOT registered predicates but are
+#: valid to promote to a typed ``RELATED_TO`` (Plan T P2-S4 / R7). The DD names a
+#: valid unanticipated ``MENTOR_OF``; arbitrary well-formed but unknown predicates
+#: (e.g. ``QUX_LINK``) are NOT in this set and stay evidence-only — the trusted
+#: vocabulary is never invented by input.
+_SEMANTIC_RELATIONSHIP_TYPES = frozenset({"MENTOR_OF"})
+
+
+def _normalize_relationship_type(value: str | None) -> str | None:
+    """Validate + normalize a relationship type (Plan T P2-S4 / R7).
+
+    Strips, upper-cases and enforces the same syntax gate as predicate codes. An
+    empty / malformed value returns ``None`` so the caller can treat it as
+    type-invalid (evidence-only, never an assertion).
+    """
+    if value is None:
+        return None
+    norm = value.strip().upper()
+    if not norm or _REL_TYPE_RE.fullmatch(norm) is None:
+        return None
+    return norm
+
+
+def _relationship_target(rel: Any) -> tuple[str, str | None] | None:
+    """Resolve a relationship observation's predicate + validated relationship type.
+
+    Plan T (P2-S4 / R7) — the generic relationship fallback that keeps the trusted
+    predicate vocabulary immutable:
+
+    * ``RELATED_TO`` with a valid normalized ``relationship_type`` -> emit as
+      ``RELATED_TO`` carrying that type.
+    * a registered predicate (e.g. the Lantern Keeper ``SIBLING_OF``) -> emit as
+      itself, its own predicate preserved (no relationship_type).
+    * a valid unanticipated relationship predicate (e.g. ``MENTOR_OF``) -> emit as
+      a typed ``RELATED_TO`` preserving the semantic predicate as its
+      ``relationship_type``.
+    * malformed sibling-of (a registered sibling carrying a conflicting type),
+      unregistered / type-invalid input -> ``None`` (evidence-only, never an
+      assertion).
+    """
+    predicate = (rel.predicate or "").strip().upper()
+    rt = _normalize_relationship_type(getattr(rel, "relationship_type", None))
+    if predicate == "RELATED_TO":
+        # generic typed relationship: a validated relationship_type is REQUIRED
+        return ("RELATED_TO", rt) if rt is not None else None
+    if predicate == "SIBLING_OF":
+        # registered sibling stays its own predicate. A sibling-of that attempts to
+        # subtype itself (a conflicting relationship_type) is malformed -> evidence.
+        if rt is not None and rt != "SIBLING_OF":
+            return None
+        if is_known_predicate("SIBLING_OF"):
+            return ("SIBLING_OF", None)
+        return None  # unregistered sibling-of -> evidence-only
+    if is_known_predicate(predicate):
+        # any other registered predicate (e.g. HAS_EMOTION) -> as-is, no type
+        return (predicate, None)
+    # An unregistered but recognized semantic relationship type (e.g. MENTOR_OF)
+    # becomes a typed RELATED_TO preserving the semantic predicate. An explicit
+    # valid relationship_type wins; otherwise the recognized predicate is the type.
+    if rt is not None:
+        return ("RELATED_TO", rt)
+    if predicate in _SEMANTIC_RELATIONSHIP_TYPES:
+        return ("RELATED_TO", predicate)
+    return None  # unregistered / type-invalid -> evidence-only
 
 
 def _promote(confidence: float, obs_state: ConfidenceState) -> str:
@@ -186,6 +256,7 @@ class SemanticReconciler:
                         "support_refs": list(e.support_refs),
                         "contradiction_refs": list(e.contradiction_refs),
                         "derived_from": [],
+                        "relationship_type": e.relationship_type,
                         "generated_by": _provenance(input.generated_by, e.obs_generated_by),
                     },
                     authority=input.authority,
@@ -401,11 +472,14 @@ class SemanticReconciler:
             )
 
         for rel in result.relationships:
-            predicate = rel.predicate.strip().upper()
-            if not is_known_predicate(predicate):
-                # Unknown relationship predicate: never invent ontology. The
-                # observation stays evidence; no assertion is fabricated.
+            # Plan T (P2-S4 / R7): resolve the relationship to a registered
+            # predicate + validated relationship type. Unknown / type-invalid /
+            # malformed sibling-of input yields None -> evidence-only, never an
+            # assertion (the trusted predicate vocabulary is never mutated by input).
+            target = _relationship_target(rel)
+            if target is None:
                 continue
+            predicate, rel_type = target
             subject = self._resolve(rel.subject_ref)
             obj = self._resolve(rel.object_ref)
             if subject is None or obj is None:
@@ -419,6 +493,7 @@ class SemanticReconciler:
                     rel.state,
                     _support_refs(rel.segment),
                     rel.generated_by,
+                    relationship_type=rel_type,
                 )
             )
 

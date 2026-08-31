@@ -57,8 +57,8 @@ def test_retained_schemas_exist_for_every_event_type() -> None:
         assert sch["type"] == "object"
         assert sch["$schema"].startswith("https://json-schema.org/draft/2020-12/schema")
         assert sch.get("title") == t
-    # SemanticAsserted is the demonstrative versioned event: v2 exists as latest.
-    assert latest_version("SemanticAsserted") == 2
+    # SemanticAsserted is the demonstrative versioned event: v3 exists as latest.
+    assert latest_version("SemanticAsserted") == 3
 
 
 def test_schema_url_matches_retained_layout() -> None:
@@ -74,9 +74,9 @@ def test_every_retained_version_is_referenceable() -> None:
     for ref in refs:
         by_type.setdefault(ref.event_type, set()).add(ref.version)
         load_schema(ref.event_type, ref.version)  # must parse
-    # CI fixture: every event type has a v1; only the upcast demo adds a v2.
+    # CI fixture: every event type has a v1; SemanticAsserted adds v2 (scope) and v3.
     assert set(by_type) == set(EVENT_TYPES)
-    assert by_type["SemanticAsserted"] == {1, 2}
+    assert by_type["SemanticAsserted"] == {1, 2, 3}
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +114,7 @@ def test_validate_accepts_conforming_payload() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_upcaster_replays_v1_semantic_asserted_to_v2_without_mutation() -> None:
+def test_upcaster_replays_v1_semantic_asserted_to_latest_without_mutation() -> None:
     v1_payload = {
         "predicate_code": "SPEAKS",
         "subject_ref": "e:1",
@@ -125,11 +125,12 @@ def test_upcaster_replays_v1_semantic_asserted_to_v2_without_mutation() -> None:
     }
     original = dict(v1_payload)
     version, upcast = upcast_payload("SemanticAsserted", 1, v1_payload)
-    assert version == 2
-    assert upcast["scope"] == "GLOBAL"  # COnservative default filled by the upcaster
+    assert version == 3
+    assert upcast["scope"] == "GLOBAL"  # Conservative default filled by the upcaster
+    assert upcast["relationship_type"] is None  # v3 default filled by the upcaster
     assert v1_payload == original  # the retained row is never mutated
-    # The upcast result itself conforms to the latest (v2) schema.
-    validate_payload("SemanticAsserted", 2, upcast)
+    # The upcast result itself conforms to the latest (v3) schema.
+    validate_payload("SemanticAsserted", 3, upcast)
 
 
 def test_semantic_event_prepare_replays_retained_v1() -> None:
@@ -147,13 +148,14 @@ def test_semantic_event_prepare_replays_retained_v1() -> None:
         seq=7,
     )
     prep = ev.prepare()
-    assert prep.event_version == 2
+    assert prep.event_version == 3
     assert prep.payload["scope"] == "GLOBAL"
-    assert prep.schema_url == "schemas/events/SemanticAsserted/v2.json"
+    assert prep.payload["relationship_type"] is None
+    assert prep.schema_url == "schemas/events/SemanticAsserted/v3.json"
 
 
 def test_semantic_event_prepare_requires_current_scope() -> None:
-    # A freshly constructed event defaults to the latest version (v2), which
+    # A freshly constructed event defaults to the latest version (v3), which
     # requires `scope`; providing it passes.
     ev = SemanticEvent(
         event_type="SemanticAsserted",
@@ -167,7 +169,7 @@ def test_semantic_event_prepare_requires_current_scope() -> None:
             "scope": "CONTINUITY",
         },
     )
-    assert ev.prepare().event_version == 2
+    assert ev.prepare().event_version == 3
 
 
 def test_json_schemas_load_as_valid_due_to_load_schema() -> None:

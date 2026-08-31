@@ -196,6 +196,9 @@ class ActiveSemanticEdgeProjectionBuilder:
             "source_refs": payload.get("support_refs") or [],
             "narrative_time": _normalize_narrative_time(payload.get("narrative_time")),
             "spatial": payload.get("spatial"),
+            # Plan T P2-S4 (R7): validated normalized relationship type carried by a
+            # RELATED_TO edge (e.g. MENTOR_OF); null for non-typed predicates.
+            "relationship_type": payload.get("relationship_type"),
         }
         values = {
             "fact_id": fact_id,

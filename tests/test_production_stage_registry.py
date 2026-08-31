@@ -612,6 +612,101 @@ def test_entity_resolution_stage_live_command_path_option_b(umd_db: sa.Engine) -
     )
 
 
+def test_semantic_reconciliation_is_not_a_second_resolution_authority(
+    umd_db: sa.Engine,
+) -> None:
+    """Plan T P1-S1/R1: SEMANTIC_RECONCILIATION consumes the COMMITTED result.
+
+    After ENTITY_RESOLUTION commits its canonicals, the reconciliation seam
+    (``_committed_resolution``) must yield a READ-ONLY batch with NO commands and
+    NO assignments — reconciliation enriches observations against the accepted
+    identity and never re-builds or re-applies a resolution topology. So a rerun
+    of ENTITY_RESOLUTION + reconciliation never adds a second establishment.
+    """
+    import importlib
+
+    from umd.application.commands import SemanticCommandService
+    from umd.domain.evidence import EvidenceBatch
+    from umd.domain.models import Evidence, EvidenceKind
+    from umd.storage.postgres.ledger import SemanticLedger
+    from umd.storage.postgres.tables import metadata as db_meta
+
+    production = importlib.import_module("umd.jobs.production")
+    ensure_source(umd_db)
+
+    _se = db_meta.tables["semantic_event"]
+
+    ledger = SemanticLedger(umd_db)
+    runtime = production.ProductionRuntime(
+        engine=umd_db,
+        commands=SemanticCommandService(ledger),
+        ledger=ledger,
+    )
+    composer = production._Composer(umd_db, runtime)  # noqa: SLF001
+    src = composer._require_source(make_manifest("ENTITY_RESOLUTION"))  # noqa: SLF001
+    sid = src["id"]
+
+    _c = {"entity_type": "character", "confidence": 0.85, "confidence_state": "CONFIRMED"}
+    records = [
+        Evidence(
+            source_id=sid,
+            evidence_kind=EvidenceKind.TEXT_SPAN,
+            locator=locator,
+            extraction_stage="STRUCTURAL_ANALYSIS",
+            tool_versions={"analyzer": "umd-text-structural@2"},
+            config_digest="umd-entity-resolution@1",
+            confidence=0.85,
+            quality={"candidate_kind": "entity", "mention_text": text, **quality},
+        )
+        for text, locator, quality in [
+            ("Mara", "chapter/1/paragraph/1", _c),
+            ("Mara", "chapter/1/paragraph/3", _c),
+            ("Ellis", "chapter/1/paragraph/2", _c),
+            (
+                "Moss",
+                "chapter/1/paragraph/9",
+                {**_c, "confidence_state": "AMBIGUOUS", "confidence": 0.4},
+            ),
+        ]
+    ]
+    composer._evidence.record(EvidenceBatch(records=records))  # noqa: SLF001
+
+    def _count_entity_resolved() -> int:
+        with umd_db.connect() as conn:
+            return int(
+                conn.execute(
+                    sa.select(sa.func.count())
+                    .select_from(_se)
+                    .where(_se.c.event_type == "EntityResolved")
+                ).scalar()
+            )
+
+    before = _count_entity_resolved()
+
+    # ENTITY_RESOLUTION is the single authority: it establishes canonicals.
+    composer._entity_resolution(make_manifest("ENTITY_RESOLUTION"))  # noqa: SLF001
+    est = _count_entity_resolved() - before
+    assert est >= 2, f"expected >=2 establishments from ENTITY_RESOLUTION, got {est}"
+
+    # The reconciliation seam consumes the COMMITTED result: a read-only batch
+    # with no topology-changing commands/assignments.
+    committed = composer._committed_resolution(src)  # noqa: SLF001
+    assert committed.commands == []
+    assert committed.assignments == {}
+    assert committed.canonical_entities, "expected committed canonicals"
+    # Moss is never silently merged into Mara — no alias/merge from the committed
+    # set, and no surface named Moss is assigned a Mara canonical.
+    for ce in committed.canonical_entities:
+        assert "Moss" not in (ce.aliases or []), f"Moss must never alias {ce.ref}"
+
+    # Reconciliation itself emits NO additional EntityResolved events.
+    reconciliation_before = _count_entity_resolved()
+    composer._semantic_reconciliation(make_manifest("SEMANTIC_RECONCILIATION"))  # noqa: SLF001
+    assert _count_entity_resolved() == reconciliation_before, (
+        "SEMANTIC_RECONCILIATION must not emit EntityResolved events (no second authority)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # P3-S1: real StageWorkRegistryFactory-built registry over the book fixture
 # ("The Lantern Keeper") through the nine-stage universe — durable evidence,

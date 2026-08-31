@@ -421,6 +421,7 @@ def _identity_metadata(event: SemanticEvent) -> dict[str, Any]:
         "memberships": dict(payload.get("memberships") or {}),
         "state": payload.get("state") or (STATE_CONFIRMED if kind == "ESTABLISH" else None),
         "confidence": payload.get("confidence"),
+        "classification": payload.get("classification"),
     }
 
 

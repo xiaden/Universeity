@@ -86,7 +86,9 @@ def test_assert_semantic_materializes_full_row(umd_db: sa.Engine) -> None:
     assert r.state == "CONFIRMED"
     assert r.support_refs == ["ev:1"]
     assert r.contradiction_refs == ["ev:2"]
-    assert r.schema_ref.endswith("v2.json")
+    # SemanticAsserted is now at v3 (Plan T P2-S4 / R7 added the additive optional
+    # relationship_type); the v2->v3 upcaster supplies relationship_type=None.
+    assert r.schema_ref.endswith("v3.json")
     assert r.derivation["generated_by"] == {"path": "deterministic", "config_digest": "cfg@1"}
     assert r.derivation["scope"] == "CONTINUITY"
     assert r.derivation["derived_from"] == ["ev:0"]

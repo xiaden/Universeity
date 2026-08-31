@@ -843,27 +843,26 @@ class _Composer:
             )
         return out
 
-    def _seed_supported_correspondence(
-        self, src: dict[str, Any], mentions: list[SourceMention]
-    ) -> list[SourceMention]:
-        """Seed mentions onto an existing supported cross-source canonical.
+    def _existing_canonical_assignments(
+        self, _src: dict[str, Any], mentions: list[SourceMention]
+    ) -> dict[str, str]:
+        """Candidate narrowing: existing canonical assignments for this source's mentions.
 
-        Plan S (P3-S1/S2): cross-source identity is inferred ONLY within an explicit
-        supported scope — a shared work/continuity membership that already established
-        a canonical from a SIBLING source. A mention whose normalized surface uniquely
-        matches one established canonical in the SAME work scope (from a different
-        source) is seeded to that ref so the resolver reuses it (one opaque ref across
-        sources). Same-name characters in DIFFERENT scopes never match, and a name with
-        several candidates stays unseeded (separate/reviewable) — never guessed.
+        Plan T (P1-S2/R2/R3): replaces the Plan S ``_seed_supported_correspondence``
+        name/alias-as-proof seeding. Shared work/continuity or a shared normalized
+        surface is NEVER proof of identity here. A mention is only re-seeded onto an
+        EXISTING canonical ref when it already carries a committed assignment to that
+        ref — it appears among the accepted canonical's ``support_refs`` (an accepted
+        identity from a prior resolution or a human confirmation/override). Same-name/
+        same-work joins without accepted evidence, explicit correspondence, an existing
+        assignment, or human confirmation are left separate and reviewable.
 
-        This is a pure read over the committed identity ``current_state``; it writes
-        nothing. Reruns over the same state converge to the same seeds.
+        Purely a read over the committed identity ``current_state``; writes nothing.
+        Reruns over the same state converge to the same assignments.
         """
-        work_id = src.get("work_id")
-        continuity_id = src.get("continuity_id")
-        if (not work_id and not continuity_id) or not mentions:
-            return mentions
-        from umd.resolution.candidates import normalize_name
+        by_id = {m.mention_id for m in mentions}
+        if not by_id:
+            return {}
         from umd.storage.postgres.reducer import CANONICAL_IDENTITY_PREDICATE
 
         _cs = db_meta.tables["current_state"]
@@ -875,15 +874,7 @@ class _Composer:
                     )
                 ).fetchall()
             )
-
-        # Map a normalized surface -> candidate canonical refs that are established in
-        # an EXPLICIT supported scope (shared work or continuity membership) and not
-        # invalidated. Seeding to a canonical this source already shares is harmless
-        # (the ESTABLISH idempotency key dedups identical metadata), so we never skip a
-        # ref merely because this source is already a member — that would break rerun
-        # convergence. Same-name refs in DIFFERENT scopes are never candidates, and a
-        # surface mapping to several candidate refs is left unseeded (reviewable).
-        candidates: dict[str, list[str]] = {}
+        assigned: dict[str, str] = {}
         for r in rows:
             if r.state in ("INVALIDATED",):
                 continue
@@ -891,39 +882,89 @@ class _Composer:
                 meta = json.loads(r.object_ref)
             except (TypeError, ValueError):
                 continue
-            memberships = meta.get("memberships") or {}
-            if not (
-                (work_id and work_id in (memberships.get("work_ids") or []))
-                or (continuity_id and continuity_id in (memberships.get("continuity_ids") or []))
-            ):
-                continue  # no supported scope -> unrelated, never matched
-            surfaces: list[str] = []
-            if meta.get("display_label"):
-                surfaces.append(str(meta["display_label"]))
-            surfaces.extend(str(a) for a in (meta.get("aliases") or []))
-            for surf in {normalize_name(s) for s in surfaces if normalize_name(s)}:
-                candidates.setdefault(surf, []).append(str(r.entity_ref))
+            if not isinstance(meta, dict):
+                continue
+            for mid in meta.get("support_refs") or []:
+                if str(mid) in by_id:
+                    assigned[str(mid)] = str(r.entity_ref)
+        return assigned
 
-        def _unique_seed(m: SourceMention) -> str | None:
-            surfaces = [normalize_name(m.mention_text)] + [
-                f for f in (m.normalized_forms or []) if f
-            ]
-            found: set[str] = set()
-            for s in surfaces:
-                if not s:
-                    continue
-                found.update(candidates.get(s, []))
-            if len(found) == 1:
-                return next(iter(found))
-            return None  # none or ambiguous -> leave separate/reviewable
+    def _provider_aware_analysis(self, src: dict[str, Any]) -> Any | None:
+        """Deterministic + committed provider observations analysis (Plan R, no re-invoke).
 
-        out: list[SourceMention] = []
-        for m in mentions:
-            seed = _unique_seed(m)
-            if seed is not None:
-                m = m.model_copy(update={"entity_id": seed})
-            out.append(m)
-        return out
+        Re-runs the deterministic text analyzer over the memoized dispatch the text
+        stages consumed, then hydrates ONLY the already-validated, committed
+        ``semantic_observations`` evidence STRUCTURAL_ANALYSIS recorded
+        (:func:`_hydrate_provider_observations`) into the typed buckets. It never
+        re-invokes a provider, constructs a second provider analyzer, or reads raw/
+        unvalidated model output. Returns ``None`` when the source has no text
+        segments to analyze.
+        """
+        result = self._dispatch_text(src)
+        if result is None or result.route != "text":
+            return None
+        config_digest = _dispatch_evidence_config_digest(result)
+        analyzer = SemanticTextAnalyzer(
+            None,
+            provider=None,
+            model=None,
+            stage="STRUCTURAL_ANALYSIS",
+            config_digest=config_digest,
+        )
+        try:
+            segments = self._paragraph_segments(result, src)
+        except ValueError:
+            segments = []
+        if not segments:
+            return None
+        analysis = analyzer.analyze(
+            SemanticAnalysisInput(
+                source_id=src["id"],
+                segments=segments,
+                language=None,
+            )
+        )
+        locators = {s.locator for s in segments}
+        buckets, hydrate_warnings = _hydrate_provider_observations(
+            self._evidence.get_by_source(src["id"]), locators
+        )
+        for attr, candidates in buckets.items():
+            if candidates:
+                getattr(analysis, attr).extend(candidates)
+        analysis.warnings.extend(hydrate_warnings)
+        # Truthful degradation: a configured provider with no rehydratable
+        # committed observations is reported, not silently dropped.
+        if self._semantic_provider() and not any(buckets.values()):
+            analysis.warnings.append(
+                "semantic provider configured but no committed semantic-observation "
+                "evidence rehydrated; reconciliation uses the deterministic baseline"
+            )
+        return analysis
+
+    def _resolution_mentions_with_provider(self, src: dict[str, Any]) -> list[SourceMention]:
+        """Deterministic + provider entity/alias mentions for the SINGLE resolution input.
+
+        Plan T (P1-S1/R1): ENTITY_RESOLUTION is the only resolution authority, so its
+        bounded input must span the same surface set the provider observed. The
+        deterministic committed-evidence mentions are unioned with the provider
+        entity/alias mentions (:func:`~umd.resolution.mentions.mentions_from_semantic`),
+        deduplicated by mention id so the deterministic baseline is preserved exactly
+        while provider aliases/entities become resolvable (their explicit
+        ``canonical_name`` correspondence is the evidence-backed join — never an
+        inferred same-name merge). Purely a read; writes nothing.
+        """
+        mentions = self._resolution_mentions(src)
+        analysis = self._provider_aware_analysis(src)
+        if analysis is None:
+            return mentions
+        from umd.resolution.mentions import mentions_from_semantic
+
+        seen = {m.mention_id for m in mentions}
+        for m in mentions_from_semantic(analysis):
+            if m.mention_id not in seen:
+                mentions.append(m)
+                seen.add(m.mention_id)
+        return mentions
 
     def _apply_resolution(self, batch: Any, mentions: list[Any] | None = None) -> None:
         """Apply a resolution batch through the existing command path (P2-S2).
@@ -1842,37 +1883,44 @@ class _Composer:
         """
         src = self._require_source(manifest)
         commands = self._opt("commands")
-        mentions = self._resolution_mentions(src)
+        # Plan T (P1-S1/R1): ENTITY_RESOLUTION is the single authority, so its input
+        # spans deterministic committed evidence AND provider entity/alias mentions
+        # (explicit correspondence) — no second resolution anywhere else.
+        mentions = self._resolution_mentions_with_provider(src)
         if commands is not None and mentions:
-            from umd.resolution.service import EntityResolutionService, ResolutionInput
+            from umd.resolution.service import (
+                EntityResolutionService,
+                ResolutionInputBuilder,
+            )
 
-            # Plan S (P3-S1): seed mentions that already resolve to a supported
-            # cross-source canonical (same work/continuity scope) so a rerun reuses
-            # the established ref instead of deriving a source-local duplicate. This
-            # is the ONLY cross-source identity path: an explicit shared work/
-            # continuity scope authorizes the link — never same-name string
-            # equality across unrelated sources.
-            mentions = self._seed_supported_correspondence(src, mentions)
+            # Plan T (P1-S1/R1): ENTITY_RESOLUTION is the SINGLE authority that
+            # builds, resolves, and applies a resolution batch. It routes through
+            # the pure bounded ``ResolutionInputBuilder``; the only cross-source
+            # join is candidate narrowing on EXISTING canonical assignments /
+            # human confirmation (never same-name/same-work proof).
             memberships = {
                 "source_ids": [src["id"]] if src["id"] else [],
                 "work_ids": [src["work_id"]] if src.get("work_id") else [],
                 "continuity_ids": [src["continuity_id"]] if src.get("continuity_id") else [],
             }
-            service = EntityResolutionService()
-            batch = service.resolve_mentions(
-                ResolutionInput(
-                    source_id=src["id"],
-                    mentions=mentions,
-                    generated_by={
-                        "stage": "ENTITY_RESOLUTION",
-                        "analyzer": "umd-entity-resolution@1",
-                        "config_digest": _ENTITY_RESOLUTION_CONFIG_DIGEST,
-                    },
-                    work_id=src.get("work_id"),
-                    continuity_id=src.get("continuity_id"),
-                    memberships=memberships,
-                )
+            builder = ResolutionInputBuilder()
+            input_ = builder.build(
+                source={
+                    "source_id": src["id"],
+                    "work_id": src.get("work_id"),
+                    "continuity_id": src.get("continuity_id"),
+                },
+                evidence=mentions,
+                memberships=memberships,
+                committed_observations=self._existing_canonical_assignments(src, mentions),
+                generated_by={
+                    "stage": "ENTITY_RESOLUTION",
+                    "analyzer": "umd-entity-resolution@1",
+                    "config_digest": _ENTITY_RESOLUTION_CONFIG_DIGEST,
+                },
             )
+            service = EntityResolutionService()
+            batch = service.resolve_mentions(input_)
             self._apply_resolution(batch, mentions)
             refs = [f"resolved_entities:{src['id']}"] + [e.ref for e in batch.canonical_entities]
             return StageOutcome(artifact_refs=refs, evidence_refs=refs)
@@ -2032,17 +2080,13 @@ class _Composer:
             )
         if input_ is None:
             return StageOutcome(artifact_refs=refs, evidence_refs=refs)
-        # Plan S (P5-S1): the reconciliation path is the canonical-establishment
-        # seam for provider/observation-backed identities. ``_reconciliation_input``
-        # already built a deterministic resolution batch over the committed
-        # deterministic + hydrated provider mentions; apply its ESTABLISH/ALIAS/
-        # MENTION commands through the existing command path so provider-derived
-        # canonicals (and their aliases/memberships) become durable, queryable
-        # identities — not just reconciler assertions. Idempotent: reruns converge
-        # to the same refs, and the ENTITY_RESOLUTION stage's own application for
-        # purely-deterministic sources remains authoritative.
-        if input_.resolution is not None:
-            self._apply_resolution(input_.resolution)
+        # Plan T (P1-S1/R1): SEMANTIC_RECONCILIATION is NOT a second resolution
+        # authority. It CONSUMES the committed result of ENTITY_RESOLUTION (the
+        # accepted canonicals folded into current_state, surfaced via
+        # ``_committed_resolution``) and enriches observations only — it never
+        # applies a resolution batch, and never establishes/aliases/merges/
+        # invents canonical identity. ``_reconciliation_input`` therefore
+        # carries a read-only committed batch with no commands.
         from umd.reconciliation.reconciler import SemanticReconciler
 
         events = SemanticReconciler().reconcile(input_)
@@ -2070,99 +2114,28 @@ class _Composer:
         )
 
     def _reconciliation_input(self, src: dict[str, Any]) -> Any | None:
-        """Deterministic + validated provider observations and resolution (Plan R).
+        """Deterministic + validated provider observations and committed resolution.
 
-        Re-runs the deterministic text analyzer over the same memoized dispatch
-        the text stages consumed, then hydrates ONLY the already-validated,
-        committed ``semantic_observations`` evidence the provider-aware
-        STRUCTURAL_ANALYSIS recorded (:func:`_hydrate_provider_observations`) into
-        the typed buckets — a deterministic union of the baseline and the
-        committed provider candidates. It never re-invokes a provider, constructs
-        a second provider analyzer, or reads raw/unvalidated model output.
-
-        The resolution bridge unions the deterministic committed-evidence
-        mentions with the provider entity/alias mentions via
-        :func:`~umd.resolution.mentions.mentions_from_semantic`, deduplicating by
-        mention id so the deterministic baseline resolution is preserved exactly
-        while provider aliases/entities become resolvable. Idempotent rerun
-        convergence is retained: the same committed evidence yields the same
-        typed input.
+        Builds the provider-aware analysis once (deterministic analyzer + committed
+        ``semantic_observations`` hydration, never re-invoking a provider) and then
+        consumes the COMMITTED canonical identities from ENTITY_RESOLUTION
+        (:func:`_committed_resolution`) — it never re-resolves or re-derives a second
+        topology. Idempotent rerun convergence is retained: the same committed
+        evidence yields the same typed input.
         """
         from umd.reconciliation.reconciler import ReconciliationInput
-        from umd.resolution.mentions import mentions_from_semantic
-        from umd.resolution.service import EntityResolutionService, ResolutionInput
 
-        result = self._dispatch_text(src)
-        if result is None or result.route != "text":
+        analysis = self._provider_aware_analysis(src)
+        if analysis is None:
             return None
-        config_digest = _dispatch_evidence_config_digest(result)
-        analyzer = SemanticTextAnalyzer(
-            None,
-            provider=None,
-            model=None,
-            stage="STRUCTURAL_ANALYSIS",
-            config_digest=config_digest,
-        )
-        try:
-            segments = self._paragraph_segments(result, src)
-        except ValueError:
-            segments = []
-        if not segments:
-            return None
-        analysis = analyzer.analyze(
-            SemanticAnalysisInput(
-                source_id=src["id"],
-                segments=segments,
-                language=None,
-            )
-        )
-        # P1-S1..S3: hydrate committed semantic_observations evidence (the exact
-        # source is the durable evidence returned by get_by_source; the structural
-        # analyzer is the only provider invocation site). Require exact input-segment
-        # locator membership and reject malformed/unknown/ambiguous payloads rather
-        # than repairing or fabricating them. Deterministic baseline always retained.
-        locators = {s.locator for s in segments}
-        buckets, hydrate_warnings = _hydrate_provider_observations(
-            self._evidence.get_by_source(src["id"]), locators
-        )
-        for attr, candidates in buckets.items():
-            if candidates:
-                getattr(analysis, attr).extend(candidates)
-        analysis.warnings.extend(hydrate_warnings)
-        # Truthful degradation: a configured semantic provider that left no
-        # rehydratable committed observations is reported rather than silently
-        # presenting a provider-less result as provider-backed. Deterministic-only
-        # runs (no provider configured) emit no such warning.
-        if self._semantic_provider() and not any(buckets.values()):
-            analysis.warnings.append(
-                "semantic provider configured but no committed semantic-observation "
-                "evidence rehydrated; reconciliation uses the deterministic baseline"
-            )
-        # P1-S4: resolution bridge = deterministic committed-evidence mentions
-        # (preserved exactly) unioned with provider entity/alias mentions from the
-        # hydrated analysis, deduplicated by deterministic mention id. Provider
-        # mentions whose id already exists (same surface at the same segment) stay
-        # on the deterministic baseline row; genuinely new provider aliases/entities
-        # become resolvable without fabricating mention rows or canonical refs.
-        mentions = self._resolution_mentions(src)
-        seen_ids = {m.mention_id for m in mentions}
-        for m in mentions_from_semantic(analysis):
-            if m.mention_id not in seen_ids:
-                seen_ids.add(m.mention_id)
-                mentions.append(m)
-        batch = None
-        if mentions:
-            batch = EntityResolutionService().resolve_mentions(
-                ResolutionInput(
-                    source_id=src["id"],
-                    mentions=mentions,
-                    generated_by={
-                        "stage": "ENTITY_RESOLUTION",
-                        "analyzer": "umd-entity-resolution@1",
-                        "config_digest": _ENTITY_RESOLUTION_CONFIG_DIGEST,
-                    },
-                )
-            )
+        # Plan T (P1-S1/R1): SEMANTIC_RECONCILIATION consumes the COMMITTED
+        # canonical identities from ENTITY_RESOLUTION (folded into current_state).
+        # The committed batch is read-only — no commands, no second resolution
+        # batch, no topology change. Provider/observation surfaces that are not
+        # among the committed canonicals fall back to the reconciler's
+        # deterministic assertion ref (never a fabricated canonical identity or
+        # alias — and never an inferred Moss=Mara without evidence).
+        batch = self._committed_resolution(src)
         return ReconciliationInput(
             source_id=src["id"],
             analysis=analysis,
@@ -2172,6 +2145,59 @@ class _Composer:
                 "reconciler": "umd-semantic-reconciler@1",
                 "config_digest": "umd-semantic-reconciliation@1",
                 "path": "deterministic",
+            },
+        )
+
+    def _committed_resolution(self, src: dict[str, Any]) -> Any | None:
+        """A READ-ONLY committed-resolution batch scoped to the source (Plan T P1-S1/R1).
+
+        Replays the accepted canonical identities that ENTITY_RESOLUTION folded
+        into ``current_state`` and that belong to this source's supported scope
+        (shared work/continuity membership or this source's own membership). The
+        returned :class:`ResolutionBatch` carries canonical_entities + alias_mappings
+        ONLY — no commands, no assignments — so the reconciler maps surfaces to refs
+        without re-resolving or inventing canonical identity. Provider surfaces not
+        present here are left to the reconciler's honest deterministic fallback.
+        """
+        from umd.resolution.service import ResolutionBatch
+        from umd.storage.postgres.reducer import CANONICAL_IDENTITY_PREDICATE
+
+        _cs = db_meta.tables["current_state"]
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(_cs.c.entity_ref, _cs.c.object_ref, _cs.c.state).where(
+                    _cs.c.predicate == CANONICAL_IDENTITY_PREDICATE
+                )
+            ).fetchall()
+        work_id = src.get("work_id")
+        continuity_id = src.get("continuity_id")
+        sid = src["id"]
+        committed: list[tuple[str, dict[str, Any]]] = []
+        for r in rows:
+            if r.state in ("INVALIDATED",):
+                continue
+            try:
+                meta = json.loads(r.object_ref)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+            memberships = meta.get("memberships") or {}
+            if not (
+                (work_id and work_id in (memberships.get("work_ids") or []))
+                or (continuity_id and continuity_id in (memberships.get("continuity_ids") or []))
+                or (sid in (memberships.get("source_ids") or []))
+            ):
+                continue  # unrelated canonical -> never surfaces in this source's reconciliation
+            committed.append((str(r.entity_ref), meta))
+        return ResolutionBatch.from_committed(
+            committed,
+            source_id=sid,
+            generated_by={
+                "stage": "SEMANTIC_RECONCILIATION",
+                "reconciler": "umd-semantic-reconciler@1",
+                "config_digest": "umd-semantic-reconciliation@1",
+                "path": "deterministic-committed",
             },
         )
 

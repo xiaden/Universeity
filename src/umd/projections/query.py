@@ -152,6 +152,16 @@ def _parse_dt(value: str) -> datetime | None:
         return None
 
 
+def _derivation_type(row: Any) -> str | None:
+    """Read the validated normalized relationship type from an edge row's
+    derivation JSONB (Plan T P2-S4 / R7); ``None`` when absent."""
+    derivation = getattr(row, "derivation", None)
+    if not isinstance(derivation, dict):
+        return None
+    value = derivation.get("relationship_type")
+    return value if isinstance(value, str) and value else None
+
+
 class QueryService:
     """Compiles bounded typed queries over the relational semantic/current-state tables."""
 
@@ -192,9 +202,19 @@ class QueryService:
         display label (exact / case-insensitive substring) — all resolve the same
         canonical. Historical labels/aliases live in ``row.alternatives`` and the
         immutable ledger; they are audit-only and never active here.
+
+        Plan T (P2-S1): bounded ``work_id`` / ``source_id`` / ``continuity_id``
+        membership filters (via ``q.filters``) restrict the read to ACTIVE canonicals
+        whose replay-derived memberships (the ``CANONICAL_IDENTITY`` metadata's
+        ``memberships`` dict, accumulated by the reducer) intersect the requested
+        scope. A malformed ``work_id`` / ``continuity_id`` (not a valid UUID) raises
+        :class:`ScopeUnmappableError`, surfaced as an RFC 7807 ``422`` by the REST
+        boundary. Invalidated identities are never active here.
         """
         self._scope(q)
-        base: list[Any] = [(_cs.c.object_ref.is_not(None))]
+        scope = self._membership_scope(q)
+        # Active-only (Plan T P2-S1): invalidated identities never surface.
+        base: list[Any] = [(_cs.c.object_ref.is_not(None)), (_cs.c.state != "INVALIDATED")]
         if q.confidence_min is not None:
             base.append(_cs.c.confidence >= q.confidence_min)
         if q.filters.get("ref"):
@@ -209,6 +229,8 @@ class QueryService:
             conds = base + [_cs.c.predicate == CANONICAL_IDENTITY_PREDICATE]
             filtered: list[Any] = []
             for r in self._identity_rows(conds):
+                if not self._in_membership_scope(r, scope):
+                    continue
                 label = str(_identity_metadata(r.object_ref).get("display_label") or "")
                 if name is not None and label != str(name):
                     continue
@@ -230,7 +252,9 @@ class QueryService:
                 conds.append(_cs.c.entity_ref.in_(refs))
             else:
                 conds.append(sa.literal(False))
-            ordered, total = self._entity_ordered(conds, q)
+            ordered, _total = self._entity_ordered(conds, q)
+            ordered = [r for r in ordered if self._in_membership_scope(r, scope)]
+            total = len(ordered)
         else:
             # General / ref path: canonical identities + legacy CANONICAL_ENTITY rows
             # keyed by a canonical-like ref (contains ':') — never a raw UUID alias
@@ -241,7 +265,9 @@ class QueryService:
                     sa.and_(_cs.c.predicate == "CANONICAL_ENTITY", _cs.c.entity_ref.contains(":")),
                 )
             ]
-            ordered, total = self._entity_ordered(conds, q)
+            ordered, _total = self._entity_ordered(conds, q)
+            ordered = [r for r in ordered if self._in_membership_scope(r, scope)]
+            total = len(ordered)
         results = [self._entity_hit(r) for r in ordered[q.offset : q.offset + q.limit]]
         return ProvenanceBearingPage(
             query=q.kind,
@@ -252,6 +278,54 @@ class QueryService:
             result_kinds=[_CE],
             provenance={"authority": "postgres typed relational projection"},
         )
+
+    def _membership_scope(self, q: StructuredQuery) -> dict[str, set[str]]:
+        """The validated bounded membership scope from ``q.filters`` (Plan T P2-S1).
+
+        Returns a dict of ``{work_ids, source_ids, continuity_ids}`` (non-empty keys
+        only) describing the requested membership intersection. ``work_id`` and
+        ``continuity_id`` must be valid UUIDs — a malformed value raises
+        :class:`ScopeUnmappableError` (surfaced as RFC 7807 ``422 unmappable_scope``)
+        rather than silently returning unfiltered rows. ``source_id`` is an opaque
+        string. An empty dict means no membership filter.
+        """
+        scope: dict[str, set[str]] = {}
+        work = q.filters.get("work_id")
+        source = q.filters.get("source_id")
+        continuity = q.filters.get("continuity_id")
+        if work is not None:
+            if _parse_uuid(work) is None:
+                raise ScopeUnmappableError("work_id is not a valid UUID")
+            scope["work_ids"] = {str(work)}
+        if source is not None:
+            scope["source_ids"] = {str(source)}
+        if continuity is not None:
+            if _parse_uuid(continuity) is None:
+                raise ScopeUnmappableError("continuity_id is not a valid UUID")
+            scope["continuity_ids"] = {str(continuity)}
+        return scope
+
+    def _in_membership_scope(self, r: Any, scope: dict[str, set[str]]) -> bool:
+        """Whether a candidate identity/entity row's memberships intersect ``scope``.
+
+        Membership is the replay-derived ``CANONICAL_IDENTITY`` metadata
+        ``memberships`` dict (accumulated deterministically by the reducer). A
+        CANONICAL_ENTITY-only fallback row (no identity metadata) carries no
+        memberships and therefore never satisfies a non-empty scope.
+        """
+        if not scope:
+            return True
+        meta = _identity_metadata(r.object_ref)
+        memberships = meta.get("memberships") or {}
+        if not isinstance(memberships, dict):
+            memberships = {}
+        for key, requested in scope.items():
+            if not requested:
+                continue
+            owned = memberships.get(key) or []
+            if not (set(str(x) for x in owned) & set(str(x) for x in requested)):
+                return False
+        return True
 
     def _entity_rows(self, conds: list[Any], q: StructuredQuery) -> list[Any]:
         """Fetch candidate entity/identity rows, bounded so pagination+dedup suffice.
@@ -801,6 +875,12 @@ class QueryService:
             conds.append(_edge.c.object_ref == q.filters["object"])
         if q.filters.get("scope"):
             conds.append(_edge.c.scope == q.filters["scope"])
+        if q.filters.get("relationship_type"):
+            # Plan T P2-S4 (R7): filter active edges by their validated normalized
+            # relationship type (carried on RELATED_TO edges' derivation JSONB).
+            conds.append(
+                _edge.c.derivation["relationship_type"].astext == q.filters["relationship_type"]
+            )
         conds.extend(self._edge_temporal_pred(q))
         conds.extend(self._edge_spatial_pred(q))
         if q.result_kind == _SE:
@@ -820,6 +900,7 @@ class QueryService:
                 (_edge.c.scope, "scope"),
                 (_edge.c.ledger_seq, "seq"),
                 (_edge.c.fact_id, "fact_id"),
+                (_edge.c.derivation, "derivation"),
             ],
             conds,
             lambda r: QueryResultHit(
@@ -836,8 +917,13 @@ class QueryService:
                     "seq": r.seq,
                 },
                 generated_by={},
-                capabilities={"edge": True},
-                data={"authority": r.authority, "state": r.state, "scope": r.scope},
+                capabilities={"edge": True, "relationship_type": _derivation_type(r)},
+                data={
+                    "authority": r.authority,
+                    "state": r.state,
+                    "scope": r.scope,
+                    "relationship_type": _derivation_type(r),
+                },
             ),
         )
         page.result_kinds = [_SE, _I]

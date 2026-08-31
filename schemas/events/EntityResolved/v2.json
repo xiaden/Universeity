@@ -122,6 +122,16 @@
         }
       ]
     },
+    "classification": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "confidence": {
       "anyOf": [
         {

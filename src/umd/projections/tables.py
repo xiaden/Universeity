@@ -43,6 +43,8 @@ def search_document_in(schema: str) -> sa.Table:
         sa.Column("text", sa.Text(), nullable=False),
         sa.Column("language", sa.String(16), nullable=True),
         sa.Column("source_id", sa.String(64), nullable=True),
+        sa.Column("work_id", sa.String(64), nullable=True),
+        sa.Column("continuity_id", sa.String(64), nullable=True),
         sa.Column("segment_id", sa.String(64), nullable=True),
         sa.Column("entity_ref", sa.String(512), nullable=True),
         sa.Column("predicate", sa.String(64), nullable=True),
@@ -75,6 +77,12 @@ def add_fulltext_columns(conn: sa.Connection, schema: str = "public") -> None:
     table = search_document_in(schema)
     name = table.name
     q = sa.quoted_name(schema, False)
+    # Plan T (P2-S2): membership scope columns (idempotent for blue/green tables that
+    # predate this change; the public table is migrated by migrations/versions/0009).
+    conn.exec_driver_sql(f"ALTER TABLE {q}.{name} ADD COLUMN IF NOT EXISTS work_id VARCHAR(64)")
+    conn.exec_driver_sql(
+        f"ALTER TABLE {q}.{name} ADD COLUMN IF NOT EXISTS continuity_id VARCHAR(64)"
+    )
     conn.exec_driver_sql(
         f"ALTER TABLE {q}.{name} ADD COLUMN IF NOT EXISTS search_tsv tsvector "
         f"GENERATED ALWAYS AS (to_tsvector('simple', coalesce(text, ''))) STORED"
@@ -101,6 +109,8 @@ def ensure_search_table_created(conn: sa.Connection, schema: str = "public") -> 
             text TEXT NOT NULL,
             language VARCHAR(16),
             source_id VARCHAR(64),
+            work_id VARCHAR(64),
+            continuity_id VARCHAR(64),
             segment_id VARCHAR(64),
             entity_ref VARCHAR(512),
             predicate VARCHAR(64),

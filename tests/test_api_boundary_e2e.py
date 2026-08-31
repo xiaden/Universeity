@@ -669,3 +669,111 @@ def test_boundary_duplicate_retry_cancel_and_consistency(api_ctx: ApiCtx) -> Non
 # stop/start api worker preserving named volumes); the persisted evidence of the
 # completed scenario above is durable and replay-safe (read-your-writes + audit).
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Plan T Phase 3 (P3-S1/S2/S3): public A/B/C full-DAG identity acceptance
+# ---------------------------------------------------------------------------
+
+
+def _dashless(uuid_like: str) -> str:
+    return uuid_like.replace("-", "")
+
+
+def _memb(source_ids: list[str] | None) -> set[str]:
+    return {_dashless(s) for s in (source_ids or [])}
+
+
+_BOOK_A = (
+    "Chapter 1\n\n"
+    "The apprentice Mara met the warden Orin and Mara took the lantern. "
+    "Ellis the cartographer watched the flame and Ellis smiled.\n\n"
+    "Mara knelt and the wick caught, burning clean and steady.\n"
+)
+_BOOK_B = (
+    "Chapter 1\n\n"
+    "Mara and Ellis climbed the hill and Mara carried the lantern. "
+    "Ellis unrolled a fresh map and Ellis traced the eastern road.\n\n"
+    "At the top Mara looked out over the village lights below.\n"
+)
+_BOOK_C = "Chapter 1\n\nThe sailor Mara knew the harbor well and Mara guided the ship at night.\n"
+
+
+def _entities(client: httpx.Client, **params: Any) -> list[dict[str, Any]]:
+    r = client.get("/v1/entities", params=params or {"limit": 100}, headers=R)
+    assert r.status_code == 200, r.text
+    return cast("list[dict[str, Any]]", r.json()["items"])
+
+
+def test_boundary_identity_abc_full_dag(api_ctx: ApiCtx) -> None:
+    """P3-S1/S2/S3 (R1/R3/R4/R9): the full nine-stage public A/B/C acceptance path.
+
+    Through real ``POST /v1/sources`` ingestion + ``/v1/jobs`` polling only (no
+    private helpers, no direct stores/projections), proves:
+      * source A and source B (same work, distinct realizations) unify Mara into
+        ONE active canonical spanning BOTH source memberships (R1/R9);
+      * the other-work Mara (source C) stays a DISTINCT ref -- no cross-work merge
+        and no duplicate canonical established (R1/R3);
+      * bounded scoped reads return only the right canonicals per source (R4);
+      * a re-ingest of the same bytes is idempotent -- the same Mara canonical and
+        the same auto-created work (no duplicate establishment) (R1/R2).
+    """
+    client = api_ctx.client
+    a = _ingest(client, kind="txt", name="novel_a.txt", data=_BOOK_A.encode(), work_id=None)
+    b = _ingest(client, kind="txt", name="novel_b.txt", data=_BOOK_B.encode(), work_id=a["work_id"])
+    c = _ingest(client, kind="txt", name="other.txt", data=_BOOK_C.encode(), work_id=None)
+
+    # Distinct content auto-creates a DISTINCT work for C (never conflated with A).
+    assert _dashless(a["work_id"]) != _dashless(c["work_id"])
+    for src in (a, b, c):
+        assert _poll_to_terminal(client, _job_id(src["source_id"]))["status"] == "complete"
+
+    # The hosted acceptance step must probe every public readiness endpoint.
+    for path in PUBLIC_PROBES:
+        pr = client.get(path)
+        assert pr.status_code in (200, 503), (path, pr.status_code)
+
+    sa_id, sb_id, sc_id = a["source_id"], b["source_id"], c["source_id"]
+    items = _entities(client)
+    by_label: dict[str, list[dict[str, Any]]] = {}
+    for it in items:
+        by_label.setdefault(it.get("display_label") or it["label"], []).append(it)
+    _assert_metadata_contract(items[0], context="entity-item")
+
+    mara = by_label.get("Mara", [])
+    mara_a = [m for m in mara if sa_id in _memb(m["memberships"].get("source_ids"))]
+    mara_c = [m for m in mara if sc_id in _memb(m["memberships"].get("source_ids"))]
+    # Exactly ONE active Mara canonical spans BOTH A and B (same work, shared
+    # correspondence) -- never two, never a fabricated third (R1/R9).
+    assert len(mara_a) == 1, mara_a
+    assert sb_id in _memb(mara_a[0]["memberships"].get("source_ids")), mara_a
+    assert mara_a[0]["ref"].startswith("entity:canonical:")
+    # The other-work Mara (C) is a DISTINCT ref (no cross-work merge) (R3).
+    assert len(mara_c) == 1, mara_c
+    assert mara_c[0]["ref"] != mara_a[0]["ref"]
+    # No duplicate canonical carries source A's membership.
+    assert len([m for m in mara if sa_id in _memb(m["memberships"].get("source_ids"))]) == 1
+
+    # Bounded scoped reads return only the right canonicals per source (R4).
+    for sid, expected in ((sa_id, mara_a[0]), (sc_id, mara_c[0])):
+        scoped = _entities(client, source_id=sid)
+        mara_here = [i for i in scoped if (i.get("display_label") or i["label"]) == "Mara"]
+        assert len(mara_here) == 1, (sid, mara_here)
+        assert mara_here[0]["ref"] == expected["ref"]
+        _assert_metadata_contract(mara_here[0], context=f"scoped-entity-{sid[:8]}")
+
+    # Re-ingest of the same bytes is idempotent: the same Mara canonical and the
+    # same auto-created work result (no duplicate establishment) (R1/R2).
+    a_again = _ingest(client, kind="txt", name="novel_a.txt", data=_BOOK_A.encode(), work_id=None)
+    assert _poll_to_terminal(client, _job_id(a_again["source_id"]))["status"] == "complete"
+    assert _dashless(a_again["work_id"]) == _dashless(a["work_id"]), (
+        "byte-identical re-ingest dedupes to the same work"
+    )
+    items_again = _entities(client)
+    mara_again = [
+        i
+        for i in items_again
+        if (i.get("display_label") or i["label"]) == "Mara"
+        and sa_id in _memb(i["memberships"].get("source_ids"))
+    ]
+    assert len(mara_again) == 1
+    assert mara_again[0]["ref"] == mara_a[0]["ref"]

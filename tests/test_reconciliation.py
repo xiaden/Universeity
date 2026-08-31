@@ -368,6 +368,76 @@ def test_resolution_alias_emits_alias_of_and_known_as() -> None:
     assert by["KNOWN_AS"][0]["object_ref"] == "Ally"
 
 
+def test_reconciliation_consumes_committed_batch_no_topology() -> None:
+    """Plan T P1-S1/R1: SEMANTIC_RECONCILIATION consumes the COMMITTED result.
+
+    ``ResolutionBatch.from_committed`` surfaces the accepted canonicals and aliases
+    that ENTITY_RESOLUTION committed (from current_state) as a READ-ONLY batch with
+    NO commands / assignments — no second resolution, no re-derivation. The
+    reconciler maps observation surfaces to those committed refs and enriches
+    observations only; it never establishes/aliases/merges/invents canonical
+    identity, and unknown surfaces fall back to the honest deterministic ref.
+    """
+    committed = [
+        (
+            "entity:canonical:aaa",
+            {
+                "display_label": "Mara",
+                "aliases": ["Ma"],
+                "canonical_type": "CHARACTER",
+                "state": "CONFIRMED",
+                "confidence": 0.9,
+                "classification": "accepted",
+                "support_refs": ["m:1", "m:2"],
+                "memberships": {"source_ids": ["A"], "work_ids": ["w"], "continuity_ids": []},
+            },
+        ),
+        (
+            "entity:canonical:bbb",
+            {
+                "display_label": "Ellis",
+                "aliases": [],
+                "canonical_type": "CHARACTER",
+                "state": "PROBABLE",
+                "confidence": 0.7,
+                "classification": "probable",
+                "support_refs": ["m:3"],
+                "memberships": {"source_ids": ["A"], "work_ids": ["w"], "continuity_ids": []},
+            },
+        ),
+    ]
+    res = ResolutionBatch.from_committed(committed, source_id="A")
+    # Read-only committed batch: no topology-changing commands/assignments.
+    assert res.commands == []
+    assert res.assignments == {}
+    assert len(res.canonical_entities) == 2
+    assert res.canonical_entities[0].ref == "entity:canonical:aaa"
+    assert res.canonical_entities[0].classification == "accepted"
+    assert res.canonical_entities[1].classification == "probable"
+    assert res.canonical_entities[0].memberships["work_ids"] == ["w"]
+
+    # A mention naming Mara maps to the COMMITTED ref (not a re-derived fallback).
+    analysis = _analysis(
+        entity_mentions=[
+            EntityMention(
+                mention="Mara",
+                confidence=0.9,
+                segment=_seg(),
+                generated_by=_gb(),
+            )
+        ]
+    )
+    events = _events(ReconciliationInput(source_id="A", analysis=analysis, resolution=res))
+    # The committed canonical ref surfaces in the emitted observations (the reconciler
+    # enriches observations against the accepted identity — it does not re-derive or
+    # invent a fresh ref for a surface it already maps).
+    assert any(
+        "entity:canonical:aaa" in str(e.get("subject_ref", ""))
+        or "entity:canonical:aaa" in str(e.get("object_ref", ""))
+        for e in events
+    ), events
+
+
 # ---------------------------------------------------------------------------
 # safety + determinism
 # ---------------------------------------------------------------------------

@@ -67,6 +67,21 @@ def _doc_id(kind: str, ref: str) -> str:
     return hashlib.sha256(_NAMESPACE + kind.encode() + b"\x1f" + ref.encode()).hexdigest()[:36]
 
 
+def _scoped_ref(ref: str, source_id: Any, work_id: Any, continuity_id: Any) -> str:
+    """A deterministic, collision-free document ref for a membership-scoped canonical doc.
+
+    The base ``ref`` stays unique per label/alias; a deterministic suffix of the
+    ``(source_id, work_id, continuity_id)`` membership tuple separates the per-scope
+    docs a multi-membership canonical needs (Plan T P2-S2). ``entity_ref`` still points
+    at the canonical, so every scoped doc resolves to the same opaque ref.
+    """
+    scope = f"{source_id or ''}\x1f{work_id or ''}\x1f{continuity_id or ''}"
+    digest = hashlib.sha256(scope.encode()).hexdigest()[:16]
+    if not any([source_id, work_id, continuity_id]):
+        return ref  # the single global fallback doc keeps the base ref
+    return f"{ref}::scoped::{digest}"
+
+
 class SearchProjectionBuilder:
     """Single-writer search-store projector over the semantic ledger."""
 
@@ -160,12 +175,21 @@ class SearchProjectionBuilder:
     def _index_canonical_identity(self, conn: sa.Connection, ref: str, row: Any) -> None:
         """Index a canonical identity's active display label + aliases under its ref.
 
-        The display label is indexed under the opaque canonical ``ref`` itself; each
-        active alias gets its own CANONICAL_ENTITY doc under a derived ``ref::alias:``
-        ref with ``entity_ref`` pointing back at the canonical — so exact, fuzzy and
-        alias searches all resolve to the same canonical opaque ref. Inactive
-        historical labels/aliases (only in ``row.alternatives`` + the immutable
-        ledger) are never indexed here.
+        Plan S (P2-S3): the display label is indexed under the opaque canonical ``ref``
+        and each active alias under a derived ``ref::alias:`` ref, with ``entity_ref``
+        pointing back at the canonical — so exact, fuzzy and alias searches all resolve
+        to the same canonical opaque ref. Inactive historical labels/aliases (only in
+        ``row.alternatives`` + the immutable ledger) are never indexed here.
+
+        Plan T (P2-S2): the canonical's replay-derived memberships (from the identity
+        metadata's ``memberships`` dict, accumulated by the reducer) scope these docs.
+        One doc per ``(source_id, work_id, continuity_id)`` membership combination is
+        indexed so a global / source / work / continuity scoped search includes only
+        ACTIVE in-scope canonicals and excludes unrelated scopes (e.g. source C never
+        surfaces in source A's scoped search). ``source_id`` carries the per-source
+        membership so source-scoped reads no longer exclude canonicals. A canonical with
+        no source membership (defensive fallback) is indexed once globally with all
+        scope columns NULL.
         """
         try:
             meta = json.loads(str(row.object_ref))
@@ -174,32 +198,73 @@ class SearchProjectionBuilder:
         if not isinstance(meta, dict):
             meta = {}
         label = str(meta.get("display_label") or "")
-        self._upsert(
-            conn,
-            ref=ref,
-            kind=RESULT_KIND_CANONICAL_ENTITY,
-            text=label,
-            source_id=None,
-            segment_id=None,
-            entity_ref=ref,
-            predicate=CANONICAL_IDENTITY_PREDICATE,
-            seq=row.seq,
-        )
-        for alias in meta.get("aliases") or []:
-            if not alias:
-                continue
-            alias_ref = f"{ref}::alias::{hashlib.sha256(str(alias).encode()).hexdigest()[:12]}"
+        memberships = meta.get("memberships") or {}
+        if not isinstance(memberships, dict):
+            memberships = {}
+        combos = self._scope_combos(memberships)
+        for source_id, work_id, continuity_id in combos:
+            scope_ref = _scoped_ref(ref, source_id, work_id, continuity_id)
             self._upsert(
                 conn,
-                ref=alias_ref,
+                ref=scope_ref,
                 kind=RESULT_KIND_CANONICAL_ENTITY,
-                text=str(alias),
-                source_id=None,
+                text=label,
+                source_id=source_id,
+                work_id=work_id,
+                continuity_id=continuity_id,
                 segment_id=None,
                 entity_ref=ref,
                 predicate=CANONICAL_IDENTITY_PREDICATE,
                 seq=row.seq,
             )
+            for alias in meta.get("aliases") or []:
+                if not alias:
+                    continue
+                alias_ref = _scoped_ref(
+                    f"{ref}::alias::{hashlib.sha256(str(alias).encode()).hexdigest()[:12]}",
+                    source_id,
+                    work_id,
+                    continuity_id,
+                )
+                self._upsert(
+                    conn,
+                    ref=alias_ref,
+                    kind=RESULT_KIND_CANONICAL_ENTITY,
+                    text=str(alias),
+                    source_id=source_id,
+                    work_id=work_id,
+                    continuity_id=continuity_id,
+                    segment_id=None,
+                    entity_ref=ref,
+                    predicate=CANONICAL_IDENTITY_PREDICATE,
+                    seq=row.seq,
+                )
+
+    @staticmethod
+    def _scope_combos(memberships: dict[str, Any]) -> list[tuple[Any, Any, Any]]:
+        """The membership ``(source_id, work_id, continuity_id)`` scope combinations.
+
+        Deterministic cross-product of the canonical's replay-derived memberships so a
+        scoped read (by any dimension) finds exactly one doc per matching scope. An
+        empty dimension collapses to ``None``. A canonical with NO source membership is
+        indexed once globally (all ``None``) so it stays discoverable in global search.
+        """
+        sources = [str(s) for s in (memberships.get("source_ids") or [])]
+        works = [str(w) for w in (memberships.get("work_ids") or [])]
+        continuities = [str(c) for c in (memberships.get("continuity_ids") or [])]
+        if not sources:
+            return [(None, None, None)]
+        combos: list[tuple[str, str | None, str | None]] = []
+        source_list = sorted(set(sources))
+        work_list: list[str | None] = []
+        work_list.extend(sorted(set(works))) if works else work_list.append(None)
+        cont_list: list[str | None] = []
+        cont_list.extend(sorted(set(continuities))) if continuities else cont_list.append(None)
+        for s in source_list:
+            for w in work_list:
+                for c in cont_list:
+                    combos.append((s, w, c))
+        return combos
 
     def _index_active_edges(self, conn: sa.Connection, driver: ReplayDriver) -> None:
         # P4-S1 — cross-projection freshness protocol. Serialize this finalize against the
@@ -286,6 +351,8 @@ class SearchProjectionBuilder:
         entity_ref: Any,
         predicate: str | None = None,
         seq: int,
+        work_id: Any = None,
+        continuity_id: Any = None,
     ) -> None:
         if not ref or not text:
             return
@@ -296,6 +363,8 @@ class SearchProjectionBuilder:
             "text": text,
             "language": None,
             "source_id": str(source_id) if source_id else None,
+            "work_id": str(work_id) if work_id else None,
+            "continuity_id": str(continuity_id) if continuity_id else None,
             "segment_id": str(segment_id) if segment_id else None,
             "entity_ref": str(entity_ref) if entity_ref else None,
             "predicate": predicate,
@@ -308,6 +377,8 @@ class SearchProjectionBuilder:
             set_={
                 "text": values["text"],
                 "source_id": values["source_id"],
+                "work_id": values["work_id"],
+                "continuity_id": values["continuity_id"],
                 "segment_id": values["segment_id"],
                 "entity_ref": values["entity_ref"],
                 "predicate": values["predicate"],
@@ -327,6 +398,8 @@ class SearchFilters:
     """Typed locator/content filters (CONTRACTS: exact/full-text + locator filters)."""
 
     source_id: str | None = None
+    work_id: str | None = None
+    continuity_id: str | None = None
     segment_id: str | None = None
     entity_ref: str | None = None
     kind: str | None = None
@@ -577,6 +650,10 @@ class SearchService:
             return conds
         if filters.source_id:
             conds.append(t.c.source_id == filters.source_id)
+        if filters.work_id:
+            conds.append(t.c.work_id == filters.work_id)
+        if filters.continuity_id:
+            conds.append(t.c.continuity_id == filters.continuity_id)
         if filters.segment_id:
             conds.append(t.c.segment_id == filters.segment_id)
         if filters.entity_ref:
