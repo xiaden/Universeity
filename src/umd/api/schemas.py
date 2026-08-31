@@ -209,6 +209,7 @@ class StructuredQueryRequest(BaseModel):
         "CONTRADICTIONS",
         "UNRESOLVED_ALIASES",
         "TRAVERSAL",
+        "RELATIONSHIP_EDGES",
     ]
     ref: str | None = None
     filters: dict[str, Any] = Field(default_factory=dict)

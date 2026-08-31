@@ -51,6 +51,22 @@ The approved CI-repair DD and PatternEnforcer approval identify the remaining G�
 
 The remediation does not weaken prior contracts or add a competing scheduler. Hatchet remains the sole v1 scheduler; reference providers and unvalidated platform features are disclosed with explicit capability statuses and release evidence.
 
+## Semantic-capability repair order
+
+The concrete semantic repair family follows the preserved A–K foundation/remediation plans and is executed sequentially:
+
+| Order | Plan | Outcome | Prerequisite |
+|---|---|---|---|
+| L | `TASK-universal-media-decomposer-L-semantic-format-dispatch.md` | Format-aware production TXT/Markdown/EPUB/PDF dispatch, provenance, deterministic IDs, bounded EPUB extraction, and full-DAG StageWork acceptance | Preserved A–K foundations |
+| M | `TASK-universal-media-decomposer-M-semantic-provider-contract.md` | Typed deterministic/provider-backed semantic text analysis with honest degradation | L |
+| N | `TASK-universal-media-decomposer-N-multi-entity-resolution.md` | Multiple canonical entities, alias/mention mappings, ambiguity, locks, overrides, and idempotent resolution | L, M |
+| O | `TASK-universal-media-decomposer-O-rich-reconciliation-multiedge-query.md` | Rich ledger reconciliation, replay-built active relationship edges, bounded query/search reads | L, M, N |
+| P | `TASK-universal-media-decomposer-P-semantic-book-fixture-parity-e2e.md` | Realistic small-book fixture, generic Alexandria 2a–2f parity matrix, production/public E2E | L–O |
+| Q | `TASK-universal-media-decomposer-Q-semantic-capability-verification.md` | Full static, unit, PostgreSQL, StageWork, public E2E, Docker/hosted and immutable-ledger verification | L–P |
+| R | `TASK-universal-media-decomposer-R-provider-observation-reconciliation-promotion.md` | Evidence-backed provider observations reach existing reconciliation, replay/current/edge/search/query surfaces with exact provenance and honest degradation | Q |
+
+Plans L–R repair existing semantic seams only. They do not amend or re-execute Plan K, add a semantic graph database, copy Alexandria/audiobook state, introduce a second scheduler, or change OCFL/ledger authority.
+
 No v1 plan introduces a semantic graph database, RDF authority/projection, dedicated vector database, XTDB witness, or Dagster scheduler. Their interfaces and measured promotion triggers remain documented extension paths.
 
 ## Shared contracts

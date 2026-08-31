@@ -34,8 +34,12 @@ router = APIRouter(prefix="/v1", tags=["system"], dependencies=[Depends(enforce_
 
 def _projection_components(ctx: AppContext) -> list[HealthComponent]:
     comps: list[HealthComponent] = []
-    for name, guard_name in (("current_tier1", "query_guard"), ("search", "search_guard")):
-        guard = ctx.consistency if guard_name == "query_guard" else ctx.extra.get("search_guard")
+    for name, guard_name in (
+        ("current_tier1", "query_guard"),
+        ("search", "search_guard"),
+        ("semantic_edges", "edge_guard"),
+    ):
+        guard = ctx.consistency if guard_name == "query_guard" else ctx.extra.get(guard_name)
         if guard is None:
             continue
         snap = guard.freshness.snapshot()

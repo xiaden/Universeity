@@ -40,6 +40,20 @@ _UTTERANCE_PATTERNS = (
     re.compile(r"(?:utterance|speech|words) of .*", re.I),
 )
 
+#: Relationship questions: ``relationship between X and Y``, ``relationship of X``,
+#: ``what emotion does X feel``, ``who/what is X related to``. A matched ref pair is
+#: resolved against the ACTIVE relationship-edge store (QueryService.relationship_edges).
+_RELATIONSHIP_PATTERNS = (
+    # "relationship between x and y" -> (x, y)
+    (re.compile(r"relationship\s+between\s+(\S+?)\s+and\s+(\S+)", re.I), 2),
+    # "relationship of x", "x's relationship" handles only the explicit prefix form.
+    (re.compile(r"relationship\s+of\s+(\S+)", re.I), 1),
+    # "what emotion does x feel / have" -> (x, None)
+    (re.compile(r"what\s+emotion\s+does\s+(\S+?)\s+(?:feel|have)", re.I), 1),
+    # "who/why/what is x related to" -> (x, None)
+    (re.compile(r"(?:who|what|why)\s+(?:is|are)\s+(\S+?)\s+related\s+to", re.I), 1),
+)
+
 
 class QuestionConstraints(BaseModel):
     """Bounds applied to every compiled semantic question (query cost limit)."""
@@ -100,6 +114,15 @@ class QuestionService:
         self._query = query
         self._search = search  # optional SearchService for alias/exact alternatives
 
+    def requires_edge_guard(self, question: str) -> bool:
+        """True when this question compiles to the ``RELATIONSHIP_EDGES`` op.
+
+        Edge-derived semantic questions read the ``active_semantic_edge`` store, so a
+        token-bearing read must be gated on the ``semantic_edges`` ``edge_guard``
+        (bounded freshness + 503 behavior) rather than only the scalar ``query_guard``.
+        """
+        return _relationship_refs(question) is not None
+
     # -- entry ------------------------------------------------------------
 
     def answer(
@@ -150,6 +173,23 @@ class QuestionService:
                     StructuredQuery(
                         kind="EVIDENCE",
                         filters={"source_id": entity} if entity else {},
+                        limit=c.limit,
+                    )
+                )
+            )
+        elif rel := _relationship_refs(question):
+            # Relationship question: draw on the ACTIVE relationship-edge store.
+            subject, obj = rel
+            compiled_ops.append("RELATIONSHIP_EDGES")
+            filters: dict[str, Any] = {"subject": subject}
+            if obj:
+                filters["object"] = obj
+            pages.append(
+                self._query.structured(
+                    StructuredQuery(
+                        kind="RELATIONSHIP_EDGES",
+                        filters=filters,
+                        confidence_min=c.confidence_min,
                         limit=c.limit,
                     )
                 )
@@ -250,6 +290,7 @@ class QuestionService:
                 "source_id": h.source_id,
                 "segment_id": h.segment_id,
                 "locator": _locator_of(h),
+                **{k: v for k, v in (h.provenance or {}).items() if v is not None},
             },
             generated_by=dict(h.data.get("generated_by", {})),
             capabilities=dict(h.data.get("capabilities", {})),
@@ -288,6 +329,24 @@ class QuestionService:
 
 def _is_utterance(question: str) -> bool:
     return any(p.search(question) for p in _UTTERANCE_PATTERNS)
+
+
+def _relationship_refs(question: str) -> tuple[str, str | None] | None:
+    """Best-effort ``(subject, object_or_None)`` extraction from a relationship question.
+
+    Returns ``None`` when the question is not a relationship question. Refs are
+    whitespace-trimmed of trailing punctuation but otherwise verbatim so an ``e:hero``
+    style ref matches ``active_semantic_edge.subject_ref`` exactly."""
+    text = question.strip()
+    for pattern, arity in _RELATIONSHIP_PATTERNS:
+        m = pattern.search(text)
+        if not m:
+            continue
+        parts = [(m.group(i).strip().strip("?.,!;:")) for i in range(1, arity + 1)]
+        if not parts or not parts[0]:
+            return None
+        return parts[0], (parts[1] if len(parts) > 1 else None)
+    return None
 
 
 def _aggregate_confidence(answer: list[AnswerItem], contradictions: list[AnswerItem]) -> float:

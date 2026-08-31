@@ -26,18 +26,30 @@ Invariants
   * candidate sets and confidence states are *represented* as a typed model and
     persisted — they are evidence about identity, never a fabricated canonical
     decision.
+
+Plan N canonical-reference representation (v1 — Option B, CONTRACTS.md):
+  production text resolution is *ledger-first*. The resolved canonical ref is a
+  deterministic STRING (``entity:canonical:<src>:<digest>``) carried in the
+  immutable ``EntityMentioned`` payload and reducer-backed ``current_state``;
+  ``entity_mention.entity_id`` is a nullable UUID FK, so a non-UUID ref is
+  stored NULL on the row (never coerced, never fabricated into an ``entity``
+  row). Valid UUID refs (legacy UUID-backed materialized paths) are still
+  stored as-is. Reruns are idempotent (the deterministic mention id is the
+  ledger idempotency key); nothing is ever deleted or mutated in place.
 """
 
 from __future__ import annotations
 
 import hashlib
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import sqlalchemy as sa
 from pydantic import BaseModel, Field
 
+from umd.analysis.semantic import SemanticAnalysisResult
 from umd.domain.events import SemanticEvent
 from umd.domain.models import ConfidenceState
 from umd.storage.postgres.ledger import CommitResult, SemanticLedger
@@ -50,6 +62,25 @@ pg_insert = sa.dialects.postgresql.insert
 
 def _uuid_hex() -> str:
     return uuid.uuid4().hex
+
+
+def uuid_ref_or_none(entity_id: str | None) -> str | None:
+    """Map an entity ref to the ``entity_mention.entity_id`` FK column value (P4-S3).
+
+    Option B: ``entity_mention.entity_id`` is a nullable UUID FK. A valid UUID
+    ref (legacy UUID-backed path) is passed through; a non-UUID STRING canonical
+    ref (the ledger-first text-resolution representation) binds as NULL — the
+    immutable ``EntityMentioned`` event retains the string ref, so the typed
+    row never receives a non-UUID value (which would raise an ``SAUuid`` bind
+    error). ``None`` stays ``None``.
+    """
+    if not entity_id:
+        return None
+    try:
+        uuid.UUID(str(entity_id))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return str(entity_id)
 
 
 #: Stable mention-kind vocabulary (DD §Reversible entity resolution).
@@ -178,6 +209,147 @@ class RecordedMention:
     is_new: bool
 
 
+def _deterministic_mention_id(
+    source_id: str, locator: str, segment_id: str | None, mention_text: str
+) -> str:
+    """A deterministic sha256 mention id keyed by source/segment/span identity.
+
+    P1-S1: two mentions are the *same* mention only when they share the source,
+    the exact segment/span (``locator``, and ``segment_id`` where registered) and
+    the surface text. Confidence, provenance and candidate-set differences never
+    change the id, so a deterministic re-run converges to the same mention row
+    (idempotent) rather than appending a duplicate. Returns a 32-char hex digest
+    that :class:`uuid.UUID` can parse (matching the ``_computed_id`` convention).
+    """
+    raw = f"{source_id}\x1f{locator}\x1f{segment_id or ''}\x1f{mention_text}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+def _co_occurrence_by_locator(result: SemanticAnalysisResult) -> dict[str, list[str]]:
+    """Co-occurring entity names per exact locator, from relationship observations.
+
+    Deterministic (sorted) so the resulting mention metadata is stable across
+    reruns. ``CO_OCCURS`` is the deterministic structural baseline predicate
+    (:mod:`umd.analysis.text_structural`).
+    """
+    by_locator: dict[str, set[str]] = defaultdict(set)
+    for rel in result.relationships:
+        if rel.predicate not in ("CO_OCCURS", "CO_OCCURS_WITH"):
+            continue
+        if rel.subject_ref:
+            by_locator[rel.segment.locator].add(rel.subject_ref)
+        if rel.object_ref:
+            by_locator[rel.segment.locator].add(rel.object_ref)
+    return {loc: sorted(vals) for loc, vals in by_locator.items()}
+
+
+def _mention_provenance(candidate: Any) -> dict[str, Any]:
+    """Exact support refs + provider provenance from a typed observation."""
+    seg = candidate.segment
+    generated = candidate.generated_by
+    generated_by = generated.model_dump() if hasattr(generated, "model_dump") else dict(generated)
+    return {
+        "locator": seg.locator,
+        "evidence_ref": seg.evidence_ref,
+        "chapter": seg.chapter,
+        "paragraph": seg.paragraph,
+        "segment_id": seg.segment_id,
+        "generated_by": generated_by,
+    }
+
+
+def _mention_metadata(candidate: Any, co_occurring: list[str]) -> dict[str, Any]:
+    """Type/context metadata retained on the mention (never fabricated)."""
+    meta: dict[str, Any] = {"entity_type": candidate.entity_type}
+    if co_occurring:
+        meta["co_occurring"] = co_occurring
+    return meta
+
+
+def mentions_from_semantic(result: SemanticAnalysisResult) -> list[SourceMention]:
+    """Bridge typed semantic-analysis observations into deterministic mentions (P1-S1).
+
+    Converts the Plan M typed observations (:class:`EntityMention` and
+    :class:`NormalizedAlias`) into persisted-resolution :class:`SourceMention`
+    records. Each mention is keyed by source/segment/span identity through a
+    deterministic sha256 mention id (:func:`_deterministic_mention_id`) and retains:
+
+      * the normalized form(s) via the existing ``normalize_name`` machinery;
+      * the mention kind (``name`` for entity mentions; aliases keep ``name`` and
+        carry their canonical mapping in metadata, staying within the closed
+        :data:`MENTION_KINDS` vocabulary);
+      * the speaker label where the observation carries one (typed observations
+        do not, so it stays ``None``);
+      * type/context/co-occurrence metadata;
+      * exact support refs (locator / evidence_ref / chapter / paragraph /
+        segment_id) and full provider provenance (``generated_by``);
+      * the observation confidence and semantic state.
+
+    Purely a projection over the observation result — it writes nothing. Prior
+    mention/evidence rows are never touched. ``entity_ref`` from an alias
+    observation becomes the mention's initial ``entity_id`` only when the
+    observation names a canonical entity (provider-backed); ambiguous aliases
+    leave it ``None`` and stay reviewable.
+    """
+    from umd.resolution.candidates import normalize_name  # lazy: candidates imports mentions
+
+    co_occurrence = _co_occurrence_by_locator(result)
+    out: list[SourceMention] = []
+    seen: set[str] = set()
+
+    for em in result.entity_mentions:
+        sid = _deterministic_mention_id(
+            result.source_id, em.segment.locator, em.segment.segment_id, em.mention
+        )
+        if sid in seen:
+            continue
+        seen.add(sid)
+        out.append(
+            SourceMention(
+                id=uuid.UUID(sid),
+                source_id=result.source_id,
+                segment_id=em.segment.segment_id,
+                mention_text=em.mention,
+                mention_kind="name",
+                normalized_forms=[f for f in (normalize_name(em.mention),) if f],
+                confidence_state=em.state.value,
+                confidence=em.confidence,
+                provenance=_mention_provenance(em),
+                metadata_=_mention_metadata(em, co_occurrence.get(em.segment.locator, [])),
+            )
+        )
+
+    for alias in result.aliases:
+        sid = _deterministic_mention_id(
+            result.source_id, alias.segment.locator, alias.segment.segment_id, alias.alias
+        )
+        if sid in seen:
+            continue
+        seen.add(sid)
+        forms = [normalize_name(alias.alias), normalize_name(alias.canonical_name)]
+        out.append(
+            SourceMention(
+                id=uuid.UUID(sid),
+                source_id=result.source_id,
+                segment_id=alias.segment.segment_id,
+                entity_id=alias.entity_ref,
+                mention_text=alias.alias,
+                mention_kind="name",
+                normalized_forms=[f for f in forms if f],
+                confidence_state=alias.state.value,
+                confidence=alias.confidence,
+                provenance=_mention_provenance(alias),
+                metadata_={
+                    "entity_type": "character",
+                    "canonical_name": alias.canonical_name,
+                    "entity_ref": alias.entity_ref,
+                },
+            )
+        )
+
+    return out
+
+
 class PostgresMentionRepository:
     """``MentionRepository`` backed by the ``entity_mention`` table."""
 
@@ -207,6 +379,11 @@ class PostgresMentionRepository:
         return [self._to_mention(r) for r in rows]
 
     def mentions_for_entity(self, entity_id: str) -> list[SourceMention]:
+        # Option B: a non-UUID STRING canonical ref cannot exist in the UUID FK
+        # (rows store NULL for it); binding it here would raise an SAUuid error.
+        # Such mentions are discovered via ledger events, not the typed row.
+        if uuid_ref_or_none(entity_id) is None:
+            return []
         with self._engine.connect() as conn:
             rows = conn.execute(
                 sa.select(_mention_t).where(_mention_t.c.entity_id == entity_id)
@@ -214,19 +391,34 @@ class PostgresMentionRepository:
         return [self._to_mention(r) for r in rows]
 
     def rebind(self, mention_id: str, entity_id: str | None) -> None:
-        """Re-point a mention at an entity (split/merge rebound)."""
+        """Re-point a mention at an entity (split/merge rebound).
+
+        Option B (P4-S4): only a UUID-compatible target is written to the UUID
+        ``entity_id`` FK. A non-UUID STRING canonical ref (ledger-first text
+        resolution) is skipped — the mention's resolution already lives in the
+        immutable ledger events, so a typed-row UPDATE is neither possible nor
+        needed (no second authority). ``None`` (unbind) still writes NULL for
+        the legacy UUID path.
+        """
         if not mention_id:
             return
+        bound: str | None
+        if entity_id is None:
+            bound = None  # unbind -> NULL (legacy path)
+        elif uuid_ref_or_none(entity_id) is None:
+            return  # non-UUID string ref -> ledger owns the resolution
+        else:
+            bound = str(entity_id)
         with self._engine.begin() as conn:
             conn.execute(
-                _mention_t.update().where(_mention_t.c.id == mention_id).values(entity_id=entity_id)
+                _mention_t.update().where(_mention_t.c.id == mention_id).values(entity_id=bound)
             )
 
     @staticmethod
     def _row_values(mention: SourceMention) -> dict[str, Any]:
         return {
             "id": str(mention.id) if mention.id is not None else _uuid_hex(),
-            "entity_id": mention.entity_id,
+            "entity_id": uuid_ref_or_none(mention.entity_id),
             "source_id": mention.source_id,
             "segment_id": mention.segment_id,
             "mention_text": mention.mention_text,
@@ -278,8 +470,16 @@ class MentionService:
         Returns ``(commit, mention_id)``. The row is written via
         ``complete_and_append`` side-effects so the event and the row commit
         atomically — a crash cannot leave an event without its mention row.
+
+        P1-S3 idempotency: when no id is supplied the deterministic
+        ``_computed_id`` (source/segment/span key) is used, and that same key is
+        passed as the ledger ``idempotency_key``. A retry therefore converges to
+        the SAME mention row (``on_conflict_do_nothing``) and the SAME
+        ``EntityMentioned`` event seq (ledger dedup) — never a duplicate row or a
+        second authoritative completion. Prior evidence and mention history are
+        never mutated or deleted.
         """
-        mid = str(mention.id) if mention.id is not None else _uuid_hex()
+        mid = str(mention.id) if mention.id is not None else mention._computed_id
         mention = mention.model_copy(update={"id": uuid.UUID(mid)})
         event = mention.to_event()
 
@@ -291,6 +491,6 @@ class MentionService:
             )
 
         result = self.ledger.complete_and_append(
-            events=[event], idempotency_key=None, side_effects=_side
+            events=[event], idempotency_key=mid, side_effects=_side
         )
         return result, mid

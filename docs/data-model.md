@@ -87,6 +87,56 @@ available for indexed threshold queries. Tier-0 is rebuilt by wiping and
 replaying the log in tests. A mutation commits event and Tier-0 update
 atomically and returns `read_your_writes_token = seq`.
 
+## Semantic assertions, the mirror, and active relationship edges
+
+**Assertion mirror materializes in the append transaction.** Every
+`SemanticAsserted` appended through the command path is materialized into the
+`semantic_assertion` table in the **same transaction** as the event append,
+keyed by a deterministic content-addressable `fact_id` (derived from predicate,
+subject/object refs, entity ids, and scope — never authority/evidence/seq, so a
+rerun of the same fact maps to the same row and wipe-and-replay is stable). The
+mirror is authoritative-agnostic in identity but preserves precedence: a locked
+entity's machine assertion **never** writes a mirror row, and a later machine
+reassertion of a fact whose mirror row carries `USER_OVERRIDE` authority leaves
+that row at `USER_OVERRIDE` (it never downgrades the reduced winner). The mirror
+stays a read-side projection of the event stream — events remain append-only,
+and the reducer/edge authority semantics are unchanged.
+
+**Active relationship-edge projection (`active_semantic_edge`).** The scalar
+`current_state` is a single value per `(entity_ref, predicate)`; the active-edge
+projection is a bounded **multi-edge** read side that retains every currently
+`active` relationship fact, including multiple distinct facts sharing
+`(subject_ref, predicate)` with different objects. It is a disposable,
+single-writer, checkpointed wipe-and-replay projection: the projection builder
+is the **only** writer, and no API/worker path writes it. It replays the
+reconciliation predicates (`MENTIONED_IN`, `UTTERED_IN`, `HAS_TRAIT`,
+`CO_OCCURS`, `HAS_EMOTION`, `IN_STATE`, `HAS_CONTEXT`, `STARTS_AT`) plus the
+typed relation/emotion predicates from the semantic reconciliation vocabulary.
+
+- Each active edge carries `fact_id`, `event_type`, `predicate`,
+  `subject_ref`, `object_ref`, `authority` (`machine` | `USER_OVERRIDE`),
+  `confidence`, `state` (`UNKNOWN|AMBIGUOUS|CONFLICTING|PROBABLE|CONFIRMED|
+  USER_CONFIRMED`), `scope`, `support_refs`/`contradiction_refs` (JSONB), and
+  `ledger_seq`.
+- Overrides / corrections / invalidations **supersede** (flip `active=false` +
+  record `superseded_by_seq`) the targeted active edge(s) and activate the
+  `USER_OVERRIDE` edge; history is retained, never deleted. `USER_OVERRIDE`
+  beats machine inference; while an entity is locked, machine assertions never
+  activate or supersede edges.
+- **Replay multi-edge reads** — `RELATIONSHIP_EDGES` structured queries and
+  relationship semantic questions read this active edge store (bounded,
+  paginated, `edge_guard`-gated). Superseded edges are never returned as active.
+- **Search reconciliation** — `SearchProjectionBuilder` deterministically
+  reconciles the `edge:%` (non-utterance) and `assert:%` (utterance predicates
+  `SPEAKS|SAYS|UTTERANCE|PRONUNCIATION`) search-doc families against this active
+  edge store on every `finalize`, so a corrected / overridden / invalidated
+  utterance or edge is superseded on the search surface and the corrected value
+  is indexed; the immutable assertion stream is no longer a search-doc source
+  for utterances.
+
+See [query-search.md](query-search.md) for the read surface and freshness
+gating, and [consistency.md](consistency.md) for the per-projection guards.
+
 ## Provenance and audit
 
 `AuditService.explain(subject, as_of, causation, correlation)` answers

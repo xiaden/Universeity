@@ -21,6 +21,7 @@ Ownership invariants (CONTRACTS §Core / §Query):
 from __future__ import annotations
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 #: A private metadata namespace for projection tables (never created by 0001).
 _proj_meta = sa.MetaData()
@@ -137,6 +138,54 @@ projection_generation = sa.Table(
 )
 
 
+#: Active relationship-edge store (P2-S1 / rich multi-edge read side).
+#: Replay-built ONLY by :class:`ActiveSemanticEdgeProjectionBuilder` (single-writer).
+#: One row per content-addressed fact (``fact_id`` == ``semantic_assertion.id`` for
+#: assertions); distinct facts sharing ``(subject_ref, predicate)`` with different
+#: ``object_ref`` coexist as separate active edges (multi-edge). Supersession marks
+#: ``active=false`` (history retained, never deleted). Created by migration 0008.
+active_semantic_edge = sa.Table(
+    "active_semantic_edge",
+    _proj_meta,
+    sa.Column("fact_id", postgresql.UUID(as_uuid=True), nullable=False),
+    sa.Column("event_type", sa.String(32), nullable=False),
+    sa.Column("predicate", sa.String(64), nullable=False),
+    sa.Column("subject_ref", sa.String(512), nullable=False),
+    sa.Column("object_ref", sa.String(512), nullable=True),
+    sa.Column("authority", sa.String(64), nullable=True),
+    sa.Column("confidence", sa.Float(), nullable=True),
+    sa.Column("state", sa.String(24), nullable=False, server_default=sa.text("'UNKNOWN'")),
+    sa.Column("scope", sa.String(16), nullable=True),
+    sa.Column(
+        "support_refs",
+        postgresql.JSONB(),
+        nullable=False,
+        server_default=sa.text("'{}'::jsonb"),
+    ),
+    sa.Column(
+        "contradiction_refs",
+        postgresql.JSONB(),
+        nullable=False,
+        server_default=sa.text("'{}'::jsonb"),
+    ),
+    sa.Column(
+        "derivation",
+        postgresql.JSONB(),
+        nullable=False,
+        server_default=sa.text("'{}'::jsonb"),
+    ),
+    sa.Column("active", sa.Boolean(), nullable=False, server_default=sa.text("true")),
+    sa.Column("superseded_by_seq", sa.BigInteger(), nullable=True),
+    sa.Column("superseded_by_fact", postgresql.UUID(as_uuid=True), nullable=True),
+    sa.Column("ledger_seq", sa.BigInteger(), nullable=False),
+    sa.Column(
+        "updated_at", sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.func.now()
+    ),
+    sa.PrimaryKeyConstraint("fact_id", name="pk_active_semantic_edge"),
+    schema="public",
+)
+
+
 #: Kind labels for search/query results (DD §API: result kind).
 RESULT_KIND_SOURCE_EVIDENCE = "SOURCE_EVIDENCE"
 RESULT_KIND_INTERPRETATION = "INTERPRETATION"
@@ -150,6 +199,7 @@ __all__ = [
     "search_document",
     "search_document_in",
     "projection_generation",
+    "active_semantic_edge",
     "add_fulltext_columns",
     "RESULT_KIND_SOURCE_EVIDENCE",
     "RESULT_KIND_INTERPRETATION",

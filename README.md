@@ -87,12 +87,32 @@ make migrate          # apply Alembic migrations
 The complete PostgreSQL-backed validation run in this workspace is:
 
 ```text
-469 passed, 4 skipped, 0 failed
+746 passed, 17 skipped, 0 failed
 ```
 
-The four skips are conditional environment checks for Docker, Kubernetes, and
-Tesseract. They are not silently counted as passing container or OCR runtime
-validation.
+(The count reflects the current suite, including the semantic-capability Phase 3
+production dispatch re-execution and the Plan O edge/freshness reconciliation
+tests: 746 passed as measured here with `UMD_TEST_POSTGRES=true`.)
+
+The 17 skips are all *conditional environment* gates for optional live runtimes
+and binaries that are not present in this workspace; each is skipped explicitly
+and none is silently counted as passing. They break down as:
+
+- 5 × live Hatchet cluster not running (`test_hatchet_live.py`): require
+  `UMD_HATCHET_SERVER_URL` / `UMD_HATCHET_TOKEN` (live scheduler/worker).
+- 4 × live UMD API not reachable (`test_api_boundary_e2e.py`): the named local
+  gate `http://127.0.0.1:8080` is only up when the compose stack runs; these run
+  fully on the `docker-e2e` CI job.
+- 3 × faster-whisper ASR runtime / model cache absent
+  (`test_asr_faster_whisper.py`, `test_capability_transitions.py`,
+  `test_production_media_branches.py`): require `UMD_ASR_MODEL_CACHE`.
+- 3 × Tesseract OCR binary absent (`test_capability_transitions.py`,
+  `test_phase3_integration.py`, `test_raster_units.py`).
+- 1 × Docker daemon unavailable (`test_deployment_phaseE.py`).
+- 1 × kubectl / `KUBECONFIG` unavailable (`test_deployment_phaseE.py`).
+
+These are gate-skips, not silent passes: the container/OCR/ASR/live-Hatchet
+runtime validation is genuinely not exercised here.
 
 ## Repository map
 
@@ -110,14 +130,15 @@ src/umd/
   video/           stream inventory, PTS-native anchors, scene baselines
   subtitle/        independent track parsing and timestamp normalization
   resolution/      reversible entity resolution
+  reconciliation/  deterministic semantic reconciliation (typed relationship matrix)
   alignment/       many-to-many cross-source alignment
   jobs/            durable job records, DAG contracts, invalidation, recovery
-  projections/     replay-built current, search, and vector projections
+  projections/     replay-built current, search, active-semantic-edge, and vector projections
   models/          provider interfaces and adapters
   security/        sandbox policies and bounded execution
   observability/   logs, metrics, traces, and operational records
 
-migrations/        Alembic migrations 0001–0006
+migrations/        Alembic migrations 0001–0008
 schemas/           versioned event and API schemas
 tests/             unit, integration, migration, ownership, API, and E2E tests
   docs/              API, architecture, deployment, providers, observability, and limits

@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from sqlalchemy import func
 
 from resolution_helpers import insert_source, mention
-from umd.resolution.mentions import MentionService, PostgresMentionRepository
+from umd.resolution.mentions import MentionService, PostgresMentionRepository, SourceMention
 from umd.storage.postgres.ledger import SemanticLedger
 from umd.storage.postgres.tables import metadata as db_meta
 
@@ -134,3 +134,122 @@ def test_unknown_candidate_remains_unresolved_but_retained(umd_db):
     got = repo.get(str(m.id))
     assert got is not None and got.entity_id is None
     assert got.candidates[0].entity_ref == "ent-a"
+
+
+def test_mention_service_record_is_idempotent_across_retries(umd_db):
+    """P1-S3: recording the same deterministic mention converges (no dup row/event)."""
+    source_id = insert_source(umd_db)
+    svc = MentionService(
+        ledger=SemanticLedger(umd_db), repository=PostgresMentionRepository(umd_db)
+    )
+
+    m = SourceMention(
+        source_id=source_id, entity_id=None, mention_text="Alexander", segment_id=None
+    )
+    c1, mid1 = svc.record(m)
+    c2, mid2 = svc.record(m)  # retry with the identical deterministic mention
+
+    # same deterministic id -> same event seq (ledger dedup), no second completion
+    assert mid1 == mid2
+    assert c2.seq == c1.seq
+
+    with umd_db.connect() as conn:
+        rows = conn.execute(
+            sa.select(func.count()).select_from(_mention_t).where(_mention_t.c.id == mid1)
+        ).scalar()
+        events = conn.execute(
+            sa.select(func.count())
+            .select_from(_event_t)
+            .where(_event_t.c.event_type == "EntityMentioned")
+        ).scalar()
+    assert rows == 1  # never a duplicate mention row
+    assert events == 1  # never a second EntityMentioned completion
+
+
+# ---------------------------------------------------------------------------
+# Plan N Phase 3 (P3-S2) — normalized forms, idempotent reruns, preserved
+# existing assignments. Pure service tests (no DB): the service is a projection.
+# ---------------------------------------------------------------------------
+
+
+def test_normalized_forms_resolve_variants_into_one_canonical():
+    """Different case / lowercase / transliteration forms resolve together."""
+    import uuid
+
+    from umd.resolution.candidates import normalize_name
+    from umd.resolution.mentions import SourceMention
+    from umd.resolution.service import EntityResolutionService
+
+    def m(text: str, mid: str, forms: list[str] | None = None) -> SourceMention:
+        return SourceMention(
+            id=uuid.UUID(mid),
+            source_id="s1",
+            mention_text=text,
+            normalized_forms=forms or [normalize_name(text)],
+            metadata_={"entity_type": "character"},
+            confidence=0.6,
+        )
+
+    mentions = [
+        m("Alice", "10000000-0000-0000-0000-000000000000"),
+        m("ALICE", "20000000-0000-0000-0000-000000000000"),  # case variant
+        m("alice", "30000000-0000-0000-0000-000000000000"),  # lowercase
+        m(
+            "\u30a2\u30ea\u30b9", "40000000-0000-0000-0000-000000000000", forms=["alice"]
+        ),  # translit
+    ]
+    batch = EntityResolutionService(resolve_floor=0.4).resolve_mentions(mentions)
+    assert len(batch.canonical_entities) == 1
+    assert len(batch.canonical_entities[0].member_mention_ids) == 4
+
+
+def test_resolution_rerun_is_idempotent_and_preserves_assignments():
+    """A rerun converges to the same canonical refs/mappings/unresolved, and an
+    existing canonical assignment is reused (hard seed), never refabricated."""
+    import uuid
+
+    from umd.resolution.candidates import normalize_name
+    from umd.resolution.mentions import SourceMention
+    from umd.resolution.service import EntityResolutionService
+
+    def m(
+        text: str, mid: str, entity_id: str | None = None, forms: list[str] | None = None
+    ) -> SourceMention:
+        return SourceMention(
+            id=uuid.UUID(mid),
+            source_id="s1",
+            entity_id=entity_id,
+            mention_text=text,
+            normalized_forms=forms or [normalize_name(text)],
+            metadata_={"entity_type": "character"},
+            confidence=0.6,
+        )
+
+    mentions = [
+        m("Alice", "10000000-0000-0000-0000-000000000000", entity_id="ent:alice"),
+        m("Alice", "20000000-0000-0000-0000-000000000000", entity_id="ent:alice"),
+        m("Bob", "40000000-0000-0000-0000-000000000000"),
+        m("Bobby", "50000000-0000-0000-0000-000000000000", forms=["bob"]),
+        m("Ghost", "60000000-0000-0000-0000-000000000000"),
+    ]
+    # Ghost is a reviewable singleton (no strong link), stays its own cluster.
+    svc = EntityResolutionService(resolve_floor=0.4)
+    b1 = svc.resolve_mentions(mentions)
+    b2 = svc.resolve_mentions(mentions)
+
+    assert [e.ref for e in b1.canonical_entities] == [e.ref for e in b2.canonical_entities]
+    assert b1.assignments == b2.assignments
+    assert [(a.alias_ref, a.canonical_ref) for a in b1.alias_mappings] == [
+        (a.alias_ref, a.canonical_ref) for a in b2.alias_mappings
+    ]
+    assert sorted((u.mention_id, u.reason) for u in b1.unresolved) == sorted(
+        (u.mention_id, u.reason) for u in b2.unresolved
+    )
+    # The seeded canonical is REUSED on the rerun, not replaced by a new ref.
+    assert "ent:alice" in {e.ref for e in b2.canonical_entities}
+    # The unseeded Bob cluster derives a NEW deterministic ref that is stable
+    # across reruns; the Bobby alias maps to it in both runs.
+    bob_ref_1 = b1.assignments["50000000-0000-0000-0000-000000000000"]
+    bob_ref_2 = b2.assignments["50000000-0000-0000-0000-000000000000"]
+    assert bob_ref_1 == bob_ref_2
+    assert bob_ref_1 != "ent:alice"  # distinct cluster, never collapsed into Alice

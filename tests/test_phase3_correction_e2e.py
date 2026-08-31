@@ -643,3 +643,154 @@ def test_e2e_selective_rerun_tier0_tier1_cross_equivalent_no_stale_distinct_lag(
     seg1, _n1 = _segment_checksum(umd_db)
     low1, _l1 = _evidence_checksum(umd_db, _LOW_LEVEL)
     assert seg1 == seg0 and low1 == low0
+
+
+# ---------------------------------------------------------------------------
+# P3-S3: 'The Lantern Keeper' book fixture — correction/override + selective
+# descendant-rerun over the REAL production StageWork. Proves unaffected
+# extraction/evidence survives, USER_OVERRIDE outranks a machine re-run, active
+# relationship edges update (force_resume), and historical events stay queryable.
+# ---------------------------------------------------------------------------
+
+
+def test_book_fixture_correction_override_survives_rerun_and_edges_update(
+    umd_db: sa.Engine, source_store: Any
+) -> None:
+    """Adapt the mandatory correction/override E2E pattern to the book fixture,
+    driven through the real production StageWork composition (hermetic app)."""
+    from fastapi.testclient import TestClient
+
+    from fixtures import semantic_book_bytes
+    from umd.api.app import create_app
+    from umd.jobs.manifest import StageManifest
+    from umd.projections.edges import ActiveSemanticEdgeProjectionBuilder
+    from umd.projections.search import SearchProjectionBuilder
+
+    settings = Settings(
+        auth=AuthSettings(api_keys=["write-key", "read-key"], write_keys=["write-key"]),
+        rate_limit=RateLimitSettings(
+            enabled=False, requests_per_window=0, window_seconds=60.0, burst=0
+        ),
+        consistency=ConsistencySettings(lag_wait_multiplier=1, max_waiters=16),
+        lag_budget_seconds=0.05,
+    )
+    app = create_app(engine=umd_db, source_store=source_store, settings=settings, runner="hermetic")
+    ctx = app.state.ctx
+    auth_w = {"Authorization": "Bearer write-key"}
+    auth_r = {"Authorization": "Bearer read-key"}
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/sources",
+            files={"file": ("lantern.txt", semantic_book_bytes("txt"), "text/plain")},
+            data={"media_kind": "txt"},
+            headers=auth_w,
+        )
+        assert r.status_code == 201, r.text
+        sid = r.json()["source_id"]
+        work_id = r.json()["work_id"]
+        job_id = f"job-{sid[:12]}"
+        status = "running"
+        for _ in range(40):
+            status = client.get(f"/v1/jobs/{job_id}", headers=auth_r).json()["status"]
+            if status in ("complete", "failed", "cancelled"):
+                break
+        assert status == "complete", f"book job did not reach complete (got {status})"
+
+    query = QueryService(umd_db)
+    utt = query.structured({"kind": "UTTERANCE", "limit": 50})
+    speaks = [h for h in utt.results if h.predicate == "SPEAKS"]
+    assert speaks, "deterministic run must assert at least one SPEAKS utterance"
+    speaker = speaks[0].ref
+    machine_utterance = speaks[0].value
+
+    # --- unaffected extraction/evidence baseline (before any correction) -----
+    seg0, _s0 = _segment_checksum(umd_db)
+    ev0, _e0 = _evidence_checksum(umd_db, ("text_span", "metadata"))
+
+    # --- apply a user override on the SPEAKS attribution (relationship) -------
+    corrected = "The warden speaks (user-corrected book attribution)"
+    ctx.commands.record_override(
+        subject_ref=speaker,
+        predicate="SPEAKS",
+        object_ref=corrected,
+        actor="reviewer@example",
+        evidence=[f"source://{sid}/text/1"],
+        reason="book speaker attribution correction",
+        confidence=1.0,
+    )
+    _tail(umd_db)
+
+    # audit causation: current is the override, prior the machine value
+    ex = AuditService(umd_db).explain(f"{speaker}#SPEAKS")
+    assert ex.current["object_ref"] == corrected
+    assert ex.current["authority"] == USER_OVERRIDE
+    assert ex.prior["object_ref"] == machine_utterance
+
+    # --- selective descendant-rerun: planner schedules ONLY affected descendants
+    targets = InvalidationPlanner().plan(
+        "correction", scope=f"work:{work_id}", stage="ENTITY_RESOLUTION", lineage=STAGE_DEPENDENTS
+    )
+    planned = {t.stage for t in targets.targets}
+    assert planned == {
+        "CROSS_SOURCE_ALIGNMENT",
+        "SEMANTIC_RECONCILIATION",
+        "CURRENT_SEARCH_PROJECTION",
+    }
+    assert not (planned & {"BASIC_SEGMENTATION", "LOW_LEVEL_EXTRACTION"})
+
+    # --- re-run the semantic descendant (reconciliation) via the real StageWork:
+    #     machine re-derivation must NOT downgrade the USER_OVERRIDE.
+    manifest = StageManifest(
+        job_id=job_id,
+        stage_name="SEMANTIC_RECONCILIATION",
+        source_id=sid,
+        dag_universe="v1-dag:base",
+        evidence_refs=[],
+        input_manifest={"source_id": sid},
+    )
+    ctx.extra["work_registry"]["SEMANTIC_RECONCILIATION"](manifest)
+
+    # atomic Tier-0 read still reflects the corrected answer (override survives)
+    t0 = QueryService(umd_db).structured({"kind": "UTTERANCE", "limit": 50})
+    corr = [h for h in t0.results if h.predicate == "SPEAKS"]
+    assert any(h.value == corrected for h in corr)
+    assert not any(h.value == machine_utterance for h in corr)
+    corr_hit = next(h for h in corr if h.value == corrected)
+    assert corr_hit.data["authority"] == USER_OVERRIDE
+
+    # unaffected extraction/evidence still byte-stable after the rerun
+    seg1, _s1 = _segment_checksum(umd_db)
+    ev1, _e1 = _evidence_checksum(umd_db, ("text_span", "metadata"))
+    assert (seg1,) == (seg0,) and (ev1,) == (ev0,)
+
+    # --- active relationship edges update (force_resume authority replay) -----
+    pstore = ProjectionCheckpointStore(umd_db)
+    ReplayDriver(umd_db, pstore).run(CurrentTierOneBuilder(), wipe=True)
+    ReplayDriver(umd_db, pstore).run(
+        ActiveSemanticEdgeProjectionBuilder(), wipe=True, force_resume=True
+    )
+    ReplayDriver(umd_db, pstore).run(SearchProjectionBuilder(), wipe=True, force_resume=True)
+    edges = QueryService(umd_db).structured({"kind": "RELATIONSHIP_EDGES", "limit": 100})
+    corrected_edges = [h for h in edges.results if h.value == corrected]
+    assert corrected_edges, "active relationship edge must reflect the corrected SPEAKS"
+    assert corrected_edges[0].data["authority"] == USER_OVERRIDE
+
+    # --- historical events remain queryable (append-only ledger; the original
+    #     machine assertion is retained, never deleted).
+    with umd_db.connect() as c:
+        n_machine = c.execute(
+            sa.text(
+                "SELECT count(*) FROM semantic_event WHERE event_type='SemanticAsserted' "
+                "AND payload->>'object_ref'=:o"
+            ),
+            {"o": machine_utterance},
+        ).scalar()
+        n_override = c.execute(
+            sa.text(
+                "SELECT count(*) FROM semantic_event WHERE event_type='OverrideApplied' "
+                "AND payload->>'object_ref'=:o"
+            ),
+            {"o": corrected},
+        ).scalar()
+    assert n_machine >= 1, "original machine SPEAKS assertion must remain queryable"
+    assert n_override >= 1, "correction must be appended as an authority event"

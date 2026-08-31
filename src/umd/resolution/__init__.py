@@ -58,6 +58,7 @@ from umd.resolution.mentions import (
     PostgresMentionRepository,
     RecordedMention,
     SourceMention,
+    mentions_from_semantic,
 )
 from umd.resolution.resolution import (
     PostgresSplitEnumerator,
@@ -71,12 +72,26 @@ from umd.resolution.resolution import (
     rebound_event,
     resolved_event,
 )
+from umd.resolution.service import (
+    AliasMapping,
+    CanonicalEntity,
+    Contradiction,
+    EntityResolutionService,
+    ResolutionBatch,
+    ResolutionCommand,
+    ResolutionInput,
+    UnresolvedMention,
+)
 
 __all__ = [
+    "AliasMapping",
     "BenchmarkResult",
     "CandidateHits",
     "CandidatePolicy",
+    "CanonicalEntity",
+    "Contradiction",
     "DUCKDB_REGRESSION_FACTOR",
+    "EntityResolutionService",
     "DEFAULT_LINKAGE_SEED",
     "LinkRecord",
     "LinkScore",
@@ -97,6 +112,9 @@ __all__ = [
     "REFERENCE_PROVIDER",
     "ReboundRecord",
     "RecordedMention",
+    "ResolutionBatch",
+    "ResolutionCommand",
+    "ResolutionInput",
     "ResolutionKind",
     "ResolutionRejected",
     "Resolver",
@@ -106,11 +124,13 @@ __all__ = [
     "SplitPlan",
     "SourceMention",
     "TrainedLinkageModel",
+    "UnresolvedMention",
     "benchmark_linkage",
     "cluster_key",
     "jaccard_similarity",
     "linkage_capability_report",
     "lsh_bands",
+    "mentions_from_semantic",
     "minhash_signature",
     "normalize_name",
     "predict_reference",

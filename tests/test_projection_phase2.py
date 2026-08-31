@@ -29,10 +29,22 @@ import pytest
 import sqlalchemy as sa
 
 from resolution_helpers import insert_source
+from umd.analysis.semantic import (
+    DescriptiveTrait,
+    EmotionObservation,
+    EntityMention,
+    GeneratedBy,
+    Presence,
+    RelationshipCandidate,
+    SegmentEvidenceRef,
+    SemanticAnalysisResult,
+    Utterance,
+)
 from umd.domain.events import SemanticEvent
 from umd.projections.base import ReplayDriver
 from umd.projections.checkpoint import ProjectionCheckpointStore
 from umd.projections.current import CurrentTierOneBuilder, tier0_checksum
+from umd.projections.edges import ActiveSemanticEdgeProjectionBuilder
 from umd.projections.embedder import embed_text
 from umd.projections.publish import ProjectionPublishManager
 from umd.projections.query import QueryService, StructuredQuery
@@ -44,6 +56,8 @@ from umd.projections.vector import (
     VectorIndexUnavailable,
     VectorSearchService,
 )
+from umd.reconciliation.reconciler import ReconciliationInput, SemanticReconciler
+from umd.resolution.service import CanonicalEntity, ResolutionBatch
 from umd.storage.postgres.ledger import SemanticLedger
 from umd.storage.postgres.reducer import USER_OVERRIDE
 from umd.storage.postgres.tables import metadata as db_meta
@@ -499,3 +513,103 @@ def test_structured_query_bounded_results(umd_db: sa.Engine) -> None:
     traversal = qsvc.structured(StructuredQuery(kind="TRAVERSAL", ref="e:1", max_depth=2))
     assert traversal.bound_report.max_depth_cap <= 2
     assert traversal.bound_report.bounded is True
+
+
+# ---------------------------------------------------------------------------
+# P3-S1: reconciler full row matrix replays into the edge projection
+# ---------------------------------------------------------------------------
+
+
+def _reconciler_full_analysis() -> SemanticAnalysisResult:
+    seg = SegmentEvidenceRef(locator="source://s/1", evidence_ref="ev:1")
+    gb = GeneratedBy(path="deterministic", config_digest="cfg@1")
+    return SemanticAnalysisResult(
+        source_id="s1",
+        generated_by=gb,
+        entity_mentions=[
+            EntityMention(mention="Alice", confidence=0.6, segment=seg, generated_by=gb),
+            EntityMention(mention="Bob", confidence=0.6, segment=seg, generated_by=gb),
+        ],
+        presence=[
+            Presence(
+                entity="Alice", present_in="scene:1", confidence=0.6, segment=seg, generated_by=gb
+            )
+        ],
+        utterances=[
+            Utterance(
+                utterance_text="hello",
+                speaker="Alice",
+                confidence=0.9,
+                segment=seg,
+                generated_by=gb,
+            )
+        ],
+        traits=[
+            DescriptiveTrait(
+                entity="Alice", trait="brave", confidence=0.6, segment=seg, generated_by=gb
+            )
+        ],
+        relationships=[
+            RelationshipCandidate(
+                subject_ref="Alice",
+                predicate="CO_OCCURS",
+                object_ref="Bob",
+                confidence=0.55,
+                segment=seg,
+                generated_by=gb,
+            )
+        ],
+        emotions=[
+            EmotionObservation(
+                entity="Alice", emotion="happy", confidence=0.55, segment=seg, generated_by=gb
+            )
+        ],
+    )
+
+
+def test_reconciler_full_row_matrix_replays_into_edges(umd_db: sa.Engine) -> None:
+    """P3-S1: reconciler rows across categories materialize and the replay-built
+    edge projection surfaces the relationship edges as active, provenance-bearing rows."""
+    res = ResolutionBatch(
+        source_id="s1",
+        canonical_entities=[
+            CanonicalEntity(
+                ref="entity:canonical:s1:aaa",
+                label="Alice",
+                source_id="s1",
+                confidence=0.9,
+                state="CONFIRMED",
+            ),
+            CanonicalEntity(
+                ref="entity:canonical:s1:bbb",
+                label="Bob",
+                source_id="s1",
+                confidence=0.9,
+                state="CONFIRMED",
+            ),
+        ],
+    )
+    events = SemanticReconciler().reconcile(
+        ReconciliationInput(source_id="s1", analysis=_reconciler_full_analysis(), resolution=res)
+    )
+    SemanticLedger(umd_db).append(events)
+
+    builder = ActiveSemanticEdgeProjectionBuilder()
+    ReplayDriver(umd_db, ProjectionCheckpointStore(umd_db)).run(builder, wipe=True)
+    with umd_db.connect() as c:
+        rows = c.execute(
+            sa.text(
+                "SELECT predicate, authority, confidence, state, scope, active, derivation "
+                "FROM active_semantic_edge WHERE active"
+            )
+        ).fetchall()
+    by_pred = {r.predicate for r in rows}
+    assert {"CO_OCCURS", "HAS_EMOTION", "HAS_TRAIT", "PRESENT_IN", "SPEAKS"} <= by_pred
+    for r in rows:
+        assert r.authority == "machine"
+        assert r.active is True
+        assert 0.0 <= r.confidence <= 1.0
+        assert r.state in {"CONFIRMED", "PROBABLE", "UNKNOWN", "AMBIGUOUS", "CONFLICTING"}
+        assert r.scope == "SOURCE"
+        assert r.derivation["generated_by"]["path"] == "deterministic"
+        assert r.derivation["source_refs"]

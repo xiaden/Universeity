@@ -27,6 +27,9 @@ from umd.projections.tables import (
     RESULT_KIND_INTERPRETATION,
     RESULT_KIND_SOURCE_EVIDENCE,
 )
+from umd.projections.tables import (
+    active_semantic_edge as _edge,
+)
 from umd.storage.postgres.tables import metadata as db_meta
 
 _cs = db_meta.tables["current_state"]
@@ -38,6 +41,7 @@ _seg = db_meta.tables["segment"]
 _ev = db_meta.tables["evidence"]
 _assert = db_meta.tables["semantic_assertion"]
 _src = db_meta.tables["source"]
+_se = db_meta.tables["semantic_event"]
 
 #: Predicates treated as natural-language utterances.
 UTTERANCE_PREDICATES = frozenset({"SPEAKS", "SAYS", "UTTERANCE", "PRONUNCIATION"})
@@ -149,6 +153,7 @@ class QueryService:
             "CONTRADICTIONS": self.contradictions,
             "UNRESOLVED_ALIASES": self.unresolved_aliases,
             "TRAVERSAL": self.traverse,
+            "RELATIONSHIP_EDGES": self.relationship_edges,
         }
         handler = dispatcher.get(q.kind)
         if handler is None:
@@ -382,8 +387,22 @@ class QueryService:
     # -- unresolved aliases ----------------------------------------------------
 
     def unresolved_aliases(self, q: StructuredQuery) -> ProvenanceBearingPage:
+        """Genuinely ambiguous mentions with no canonical resolution event.
+
+        Returns ``entity_mention`` rows whose ``entity_id`` IS NULL and that no
+        canonical ``EntityMentioned``/ALIAS ``EntityResolved`` ledger event has
+        resolved — such mention ids are excluded (they are not truly ambiguous),
+        so only reviewable unresolved mentions are returned.
+        """
         self._scope(q, continuity=True)
         conds: list[Any] = [_mention.c.entity_id.is_(None)]
+        # Option B (P4-S5): exclude mention ids that ARE resolved by canonical
+        # MENTION/ALIAS ledger events (their typed rows keep entity_id=NULL, so
+        # they are not genuinely ambiguous) while retaining genuinely ambiguous
+        # mentions that no event resolved.
+        resolved = self._resolved_mention_ids()
+        if resolved:
+            conds.append(~_mention.c.id.in_(resolved))
         if q.filters.get("source_id"):
             conds.append(_mention.c.source_id == q.filters["source_id"])
         conds.extend(self._continuity_pred(_mention.c.source_id, q))
@@ -424,11 +443,92 @@ class QueryService:
         )
 
     def _alias_entity_ids(self, alias: str) -> list[str]:
+        """Resolve an alias surface to candidate canonical entity refs (P4-S5).
+
+        Supports BOTH the legacy UUID-backed ``current_entity_map`` rows and the
+        Option B ledger-first string refs (reducer ``current_state``
+        ``CANONICAL_ENTITY`` rows keyed by the alias mention id, plus ALIAS
+        ``EntityResolved`` events).
+        """
+        out: list[str] = []
         with self._engine.connect() as conn:
             rows = conn.execute(
                 sa.select(_map.c.entity_id, _map.c.canonical_entity_id).where(_map.c.alias == alias)
             ).fetchall()
-        return [str(r.entity_id) for r in rows] or [str(r.canonical_entity_id) for r in rows]
+            for r in rows:
+                if r.entity_id:
+                    out.append(str(r.entity_id))
+                if r.canonical_entity_id:
+                    out.append(str(r.canonical_entity_id))
+            # Option B: string aliases live in current_state CANONICAL_ENTITY rows
+            # (entity_ref == alias mention id, object_ref == canonical).
+            for r in conn.execute(
+                sa.select(_cs.c.object_ref).where(
+                    (_cs.c.predicate == "CANONICAL_ENTITY") & (_cs.c.entity_ref == alias)
+                )
+            ).fetchall():
+                if r.object_ref:
+                    out.append(str(r.object_ref))
+            # ... and in ALIAS EntityResolved events (ledger-first authority).
+            # Bounded: filter to the target ALIAS events server-side instead of
+            # scanning every EntityResolved payload into Python. There is no
+            # entity_mention row anchor (targets are STRING canonical refs).
+            for r in conn.execute(
+                sa.select(_se.c.payload["target_entity_id"].astext).where(
+                    (_se.c.event_type == "EntityResolved")
+                    & (_se.c.payload["kind"].astext == "ALIAS")
+                    & (_se.c.payload["entity_id"].astext == alias)
+                )
+            ).fetchall():
+                if r[0]:
+                    out.append(r[0])
+        seen: set[str] = set()
+        result: list[str] = []
+        for v in out:
+            if v not in seen:
+                seen.add(v)
+                result.append(v)
+        return result
+
+    def _resolved_mention_ids(self) -> set[str]:
+        """Mention ids resolved by canonical MENTION/ALIAS ledger events.
+
+        Under Option B these mentions carry ``entity_mention.entity_id`` NULL,
+        so the row alone cannot distinguish them from genuinely ambiguous ones;
+        the immutable ledger event is the authoritative resolution signal.
+
+        Bounded: the caller only applies the result as
+        ``~entity_mention.id.in_(...)``, so any id absent from
+        ``entity_mention.id`` cannot affect the outcome. Semijoin the ledger
+        scan against ``entity_mention.id`` to keep the read bounded by corpus
+        size instead of a full-ledger scan.
+        """
+        id_expr = sa.case(
+            (
+                (_se.c.event_type == "EntityMentioned")
+                & (_se.c.payload["entity_id"].astext.is_not(None))
+                & (_se.c.payload["mention_id"].astext.is_not(None)),
+                _se.c.payload["mention_id"].astext,
+            ),
+            (
+                (_se.c.event_type == "EntityResolved")
+                & (_se.c.payload["kind"].astext == "ALIAS")
+                & (_se.c.payload["entity_id"].astext.is_not(None)),
+                _se.c.payload["entity_id"].astext,
+            ),
+            else_=None,
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(id_expr)
+                .join(
+                    _mention,
+                    sa.cast(_mention.c.id, sa.Text) == id_expr,
+                )
+                .where(_se.c.event_type.in_(("EntityMentioned", "EntityResolved")))
+                .distinct()
+            ).fetchall()
+        return {str(r[0]) for r in rows if r[0] is not None}
 
     # -- bounded traversal ------------------------------------------------------
 
@@ -501,8 +601,100 @@ class QueryService:
             bound_report=report,
         )
 
-    # -- scope filters (P4-S1..S3) ----------------------------------------------
+    # -- relationship edges (P2-S4) -------------------------------------------
 
+    def relationship_edges(self, q: StructuredQuery) -> ProvenanceBearingPage:
+        """Bounded structured read over ACTIVE relationship edges (multi-edge).
+
+        Returns every currently-active relationship edge (assertion/override/correction)
+        with its confidence, authority, semantic state, scope, and provenance. Multiple
+        distinct active edges may share ``(subject_ref, predicate)`` with different
+        objects (multi-edge). Superseded edges (``active=false``) are excluded — they
+        remain in the store as immutable history, never surfaced as active.
+        """
+        self._scope(q, temporal=True, spatial=True)
+        conds: list[Any] = [_edge.c.active.is_(sa.true())]
+        if q.confidence_min is not None:
+            conds.append(_edge.c.confidence >= q.confidence_min)
+        if q.filters.get("subject"):
+            conds.append(_edge.c.subject_ref == q.filters["subject"])
+        if q.filters.get("ref"):
+            ref = q.filters["ref"]
+            conds.append(sa.or_(_edge.c.subject_ref == ref, _edge.c.object_ref == ref))
+        if q.filters.get("predicate"):
+            conds.append(_edge.c.predicate == q.filters["predicate"])
+        if q.filters.get("object"):
+            conds.append(_edge.c.object_ref == q.filters["object"])
+        if q.filters.get("scope"):
+            conds.append(_edge.c.scope == q.filters["scope"])
+        conds.extend(self._edge_temporal_pred(q))
+        conds.extend(self._edge_spatial_pred(q))
+        if q.result_kind == _SE:
+            conds.append(_edge.c.authority != "USER_OVERRIDE")
+        elif q.result_kind == _I:
+            conds.append(_edge.c.authority == "USER_OVERRIDE")
+        page = self._run(
+            q,
+            _edge,
+            [
+                (_edge.c.subject_ref, "subject_ref"),
+                (_edge.c.predicate, "predicate"),
+                (_edge.c.object_ref, "object_ref"),
+                (_edge.c.confidence, "confidence"),
+                (_edge.c.authority, "authority"),
+                (_edge.c.state, "state"),
+                (_edge.c.scope, "scope"),
+                (_edge.c.ledger_seq, "seq"),
+                (_edge.c.fact_id, "fact_id"),
+            ],
+            conds,
+            lambda r: QueryResultHit(
+                ref=str(r.subject_ref),
+                kind=(_I if r.authority == "USER_OVERRIDE" else _SE),
+                label="relationship edge",
+                predicate=r.predicate,
+                value=r.object_ref,
+                confidence=r.confidence,
+                provenance={
+                    "fact_id": str(r.fact_id),
+                    "state": r.state,
+                    "scope": r.scope,
+                    "seq": r.seq,
+                },
+                generated_by={},
+                capabilities={"edge": True},
+                data={"authority": r.authority, "state": r.state, "scope": r.scope},
+            ),
+        )
+        page.result_kinds = [_SE, _I]
+        return page
+
+    def _edge_temporal_pred(self, q: StructuredQuery) -> list[Any]:
+        """Bounded temporal predicate over the edge's narrative-time range."""
+        if not (q.temporal_from or q.temporal_to):
+            return []
+        f = _parse_dt(q.temporal_from) if q.temporal_from else None
+        t = _parse_dt(q.temporal_to) if q.temporal_to else None
+        if q.temporal_from and f is None:
+            raise ScopeUnmappableError("temporal_from is not a valid ISO-8601 datetime")
+        if q.temporal_to and t is None:
+            raise ScopeUnmappableError("temporal_to is not a valid ISO-8601 datetime")
+        conds: list[Any] = []
+        nt = _edge.c.derivation["narrative_time"]
+        if f is not None:
+            conds.append(sa.cast(nt["to"].astext, sa.TIMESTAMP(timezone=True)) >= f)
+        if t is not None:
+            conds.append(sa.cast(nt["from"].astext, sa.TIMESTAMP(timezone=True)) <= t)
+        return conds
+
+    def _edge_spatial_pred(self, q: StructuredQuery) -> list[Any]:
+        """Bounded JSONB-containment spatial predicate over the edge's spatial payload."""
+        if not q.spatial:
+            return []
+        payload = sa.cast(sa.literal(json.dumps({"spatial": q.spatial})), postgresql.JSONB())
+        return [_edge.c.derivation.op("@>")(payload)]
+
+    # -- scope filters (P4-S1..S3) ----------------------------------------------
     def _scope(
         self,
         q: StructuredQuery,

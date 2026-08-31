@@ -15,6 +15,15 @@ the same per-paragraph CFI locators. The container is validated (required
 ``mimetype``/``container.xml``/``OPF``) and an invalid/unsupported container is
 reported as a deterministic parse failure so the caller quarantines it while
 retaining the raw bytes.
+
+Decompression bound (Plan L P2-S4): this extractor runs both sandboxed (via
+:func:`umd.extractors.dispatch.parse_document`) and **in-process** (the
+production dispatch seam), so it enforces the existing
+``SandboxLimits.max_decompressed_bytes`` ceiling (512 MiB) on the *total declared
+uncompressed member size* before any member is read — matching
+:mod:`umd.security.archive`'s declared-size convention — so a zip-bomb EPUB is
+rejected deterministically before an unbounded read, regardless of which call
+path reaches it. Traversal/entity/DOCTYPE protections are retained.
 """
 
 from __future__ import annotations
@@ -25,6 +34,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
+
+from umd.security.sandbox import SandboxLimits
 
 #: XHTML namespace used by EPUB content documents.
 _XHTML_NS = "http://www.w3.org/1999/xhtml"
@@ -119,12 +130,36 @@ class EpubParseError(ValueError):
     """Deterministic EPUB parse failure (invalid/unsupported container)."""
 
 
+def _enforce_decompressed_limit(zf: zipfile.ZipFile, limit: int) -> None:
+    """Reject a container whose total *declared* uncompressed member size exceeds
+    ``limit`` BEFORE any member read (Plan L P2-S4 zip-bomb guard).
+
+    Matches :mod:`umd.security.archive`'s declared-size convention: the bound is
+    the sum of each non-directory member's declared ``info.file_size`` (not the
+    compressed size), so rejection is deterministic and happens before an
+    unbounded ``read()``/decompression can occur. Traversal/entity/DOCTYPE
+    protections are retained by the existing container/XML validation.
+    """
+    total = 0
+    for info in zf.infolist():
+        if info.filename.endswith("/"):
+            continue  # directory entries carry no payload; not counted
+        total += info.file_size
+        if total > limit:
+            raise EpubParseError(
+                f"EPUB total declared decompressed size exceeds max_decompressed_bytes={limit}"
+            )
+
+
 def extract_epub(epub_path: Path) -> EpubDocument:
     """Extract a deterministic normalized view of an EPUB container."""
     try:
         with zipfile.ZipFile(epub_path) as zf:
             names = set(zf.namelist())
             _validate_container(names)
+            # Bound total declared decompressed member size before any member
+            # read (in-process dispatch path has no outer sandbox; P2-S4).
+            _enforce_decompressed_limit(zf, SandboxLimits().max_decompressed_bytes)
             opf_path = _find_opf(zf, names)
             opf_xml = zf.read(opf_path)
             doc = _parse_opf(opf_xml)

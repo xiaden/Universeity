@@ -25,6 +25,7 @@ evidence and claims.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -33,7 +34,11 @@ from typing import Any, Protocol
 import sqlalchemy as sa
 
 from umd.domain.events import SemanticEvent
-from umd.resolution.mentions import PostgresMentionRepository, SourceMention
+from umd.resolution.mentions import (
+    PostgresMentionRepository,
+    SourceMention,
+    uuid_ref_or_none,
+)
 from umd.storage.postgres.ledger import CommitResult, SemanticLedger
 from umd.storage.postgres.tables import metadata as db_meta
 
@@ -44,6 +49,15 @@ _assertion_t = db_meta.tables["semantic_assertion"]
 _event_t = db_meta.tables["semantic_event"]
 
 pg_insert = sa.dialects.postgresql.insert
+
+
+#: Stable alias idempotency namespace: (alias_entity, canonical) -> deterministic
+#: ledger idempotency key so a repeated ALIAS application is a no-op (P4-S2).
+_ALIAS_IDEM = uuid.NAMESPACE_URL
+
+
+def _alias_idempotency_key(alias_entity: str, canonical: str) -> uuid.UUID:
+    return uuid.uuid5(_ALIAS_IDEM, f"umd-alias:{alias_entity}\x1f{canonical}")
 
 
 class ResolutionKind(StrEnum):
@@ -168,7 +182,23 @@ class PostgresSplitEnumerator:
         mention_hits: list[tuple[str, str]] = []
 
         # --- mentions ----------------------------------------------------
-        for m in self._mentions.mentions_for_entity(entity_ref):
+        mention_sources = list(self._mentions.mentions_for_entity(entity_ref))
+        # Option B (P4-S4): split-time enumeration must ALSO discover string-
+        # resolved mention ids attached to ``entity_ref`` by immutable ledger
+        # events (EntityMentioned with entity_id==entity_ref / ALIAS resolved to
+        # it). Their typed rows store entity_id=NULL, so the row query above
+        # finds nothing — the ledger event is the authoritative attachment.
+        seen_ids: set[str] = set()
+        for m in mention_sources:
+            seen_ids.add(m.mention_id)
+        for mid in self._event_resolved_mention_ids(entity_ref):
+            if mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+            loaded = self._mentions.get(mid)
+            if loaded is not None:
+                mention_sources.append(loaded)
+        for m in mention_sources:
             hit = self._decide_mention(m, sorted_targets)
             if hit is None:
                 quarantined.append(m.mention_id)
@@ -206,6 +236,49 @@ class PostgresSplitEnumerator:
         highest = max(in_targets.values(), key=lambda c: c.confidence)
         ties = [c for c in in_targets.values() if c.confidence == highest.confidence]
         return highest.entity_ref if len(ties) == 1 else None
+
+    def _event_resolved_mention_ids(self, entity_ref: str) -> list[str]:
+        """Mention ids attached to ``entity_ref`` via ledger events (Option B).
+
+        String-resolved mentions keep ``entity_mention.entity_id`` NULL; their
+        resolution is authoritative only in the immutable ledger. Collect the
+        mention ids whose ``EntityMentioned`` payload carries ``entity_id`` ==
+        ``entity_ref`` and whose ``EntityResolved`` ALIAS event resolves them to
+        it (``target_entity_id`` == ``entity_ref``).
+
+        Bounded: the split enumerator only keeps ids that load from the mention
+        store (``self._mentions.get(mid)``), so an id absent from
+        ``entity_mention.id`` is skipped regardless. Semijoin the ledger scan
+        against ``entity_mention.id`` to keep the read bounded by corpus size
+        instead of a full-ledger scan.
+        """
+        id_expr = sa.case(
+            (
+                (_event_t.c.event_type == "EntityMentioned")
+                & (_event_t.c.payload["entity_id"].astext == entity_ref)
+                & (_event_t.c.payload["mention_id"].astext.is_not(None)),
+                _event_t.c.payload["mention_id"].astext,
+            ),
+            (
+                (_event_t.c.event_type == "EntityResolved")
+                & (_event_t.c.payload["kind"].astext == "ALIAS")
+                & (_event_t.c.payload["target_entity_id"].astext == entity_ref)
+                & (_event_t.c.payload["entity_id"].astext.is_not(None)),
+                _event_t.c.payload["entity_id"].astext,
+            ),
+            else_=None,
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(id_expr)
+                .join(
+                    _mention_t,
+                    sa.cast(_mention_t.c.id, sa.Text) == id_expr,
+                )
+                .where(_event_t.c.event_type.in_(("EntityMentioned", "EntityResolved")))
+                .distinct()
+            ).fetchall()
+        return [str(r[0]) for r in rows if r[0] is not None]
 
     def _alignment_refs(self, entity_ref: str) -> list[str]:
         with self._engine.connect() as conn:
@@ -318,7 +391,16 @@ class Resolver:
         canonical: str,
         reason: str | None = None,
     ) -> CommitResult:
-        """ALIAS: explicit alias assertion (source mentions remain intact)."""
+        """ALIAS: explicit alias assertion (source mentions remain intact).
+
+        Option B (P4-S2): the deterministic mention id is the ``alias_entity``
+        (``EntityResolved.entity_id``) and the deterministic/seeded STRING is the
+        ``canonical`` (``target_entity_id``). Application is idempotent via a
+        stable ``(alias_entity, canonical)`` ledger idempotency key. The
+        ``current_entity_map`` projection (UUID-only) is written ONLY when both
+        refs are UUID-compatible (legacy UUID-backed paths); for text-resolution
+        string refs the ALIAS event + reducer current_state are the authority.
+        """
         event = resolved_event(
             kind="ALIAS",
             entity_id=alias_entity,
@@ -327,6 +409,13 @@ class Resolver:
             assignments={alias_entity: canonical},
             reason=reason or "resolution alias",
         )
+        idem = _alias_idempotency_key(alias_entity, canonical)
+        alias_uuid = uuid_ref_or_none(alias_entity)
+        canonical_uuid = uuid_ref_or_none(canonical)
+        if alias_uuid is None or canonical_uuid is None:
+            # string canonical/alias refs -> ledger-first representation; the
+            # ALIAS event + reducer current_state hold the decision.
+            return self._ledger.append([event], idempotency_key=idem)
 
         def _record_alias(conn: sa.Connection) -> None:
             # derive the origin seq within the same transaction so the map row is
@@ -337,9 +426,9 @@ class Resolver:
             conn.execute(
                 pg_insert(_map_t)
                 .values(
-                    entity_id=alias_entity,
+                    entity_id=alias_uuid,
                     alias=alias_entity,
-                    canonical_entity_id=canonical,
+                    canonical_entity_id=canonical_uuid,
                     origin_seq=nxt,
                 )
                 .on_conflict_do_nothing(
@@ -348,7 +437,7 @@ class Resolver:
             )
 
         return self._ledger.complete_and_append(
-            events=[event], idempotency_key=None, side_effects=_record_alias
+            events=[event], idempotency_key=idem, side_effects=_record_alias
         )
 
     def split(
@@ -382,13 +471,22 @@ class Resolver:
             )
 
         def _apply(conn: sa.Connection) -> None:
-            for ref, tgt in plan.reassignments():
-                conn.execute(
-                    _mention_t.update()
-                    .where(_mention_t.c.id == ref)
-                    .where(_mention_t.c.entity_id == entity)
-                    .values(entity_id=tgt)
-                )
+            # Option B (P4-S4): the typed ``entity_mention.entity_id`` FK is a
+            # UUID. A split of a string canonical entity (rows store NULL) or a
+            # reassignment to a non-UUID target is skipped — the resolution lives
+            # in the ledger events, never materialized into a second authority.
+            entity_uuid = uuid_ref_or_none(entity)
+            if entity_uuid is not None:
+                for ref, tgt in plan.reassignments():
+                    tgt_uuid = uuid_ref_or_none(tgt)
+                    if tgt_uuid is None:
+                        continue  # non-UUID target -> ledger owns the resolution
+                    conn.execute(
+                        _mention_t.update()
+                        .where(_mention_t.c.id == ref)
+                        .where(_mention_t.c.entity_id == entity_uuid)
+                        .values(entity_id=tgt_uuid)
+                    )
             for ref in plan.quarantined_refs:
                 self._quarantine_ref(ref, reason or "split ambiguity")
 

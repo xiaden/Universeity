@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from fixtures import FIXTURE_TXT, markdown_bytes
+from fixtures import FIXTURE_TXT, markdown_bytes, multi_chapter_epub_bytes, pdf_image_only_bytes
 from umd.analysis.text_structural import analyze_text, classify_dialogue
+from umd.extractors.dispatch import dispatch_text
 from umd.extractors.txt import normalize_txt
 from umd.segmentation.registry import InMemorySegmentStore, SegmentRegistry
 from umd.segmentation.segmenters import (
@@ -130,6 +131,84 @@ def test_markdown_fenced_code_never_leaks_as_prose_segments() -> None:
     assert not any(
         "sentence" in s.structural_path or "token" in s.structural_path for s in r.batch.created
     )
+
+
+class TestDispatchSegmentation:
+    """Plan L P3-S1: ``TextDispatchResult.segment`` runs the format-appropriate
+    segmenter and records canonical structural locators / deterministic segment
+    IDs (TXT→``segment_txt``, Markdown→``segment_markdown``, EPUB→``segment_epub``,
+    text PDF→the extracted text via ``segment_txt``).
+    """
+
+    def test_txt_dispatch_segments_full_hierarchy(self) -> None:
+        reg, _store = _reg()
+        raw = normalize_txt(FIXTURE_TXT.encode("utf-8")).text.encode("utf-8")
+        res = dispatch_text(raw, format="txt")
+        seg = res.segment(reg, source_id=SID, source_sha512=SHA)
+        types = {s.segment_type for s in seg.batch.created}
+        assert {"document", "chapter", "section", "paragraph", "sentence", "token"} <= types
+        # structural locators + segment ids recorded on the dispatch result
+        assert res.locators and res.segment_ids
+        assert all(loc.startswith("source://") for loc in res.locators.values())
+        assert "document/1" in res.locators
+        assert "chapter/1" in res.locators
+        assert "chapter/1/section/1" in res.locators
+        assert any(p.startswith("chapter/1/section/1/paragraph/") for p in res.locators)
+
+    def test_markdown_dispatch_segments_use_headings(self) -> None:
+        reg, _store = _reg()
+        res = dispatch_text(markdown_bytes(), format="markdown")
+        seg = res.segment(reg, source_id=SID, source_sha512=SHA)
+        types = {s.segment_type for s in seg.batch.created}
+        assert {"chapter", "section", "paragraph"} <= types
+        # FIXTURE_MARKDOWN has one H1 (# The Garden) + two H2 sections.
+        assert "chapter/1" in res.locators
+        assert "chapter/1/section/1" in res.locators
+        assert "chapter/1/section/2" in res.locators
+
+    def test_epub_dispatch_segments_per_chapter_paragraph(self) -> None:
+        reg, _store = _reg()
+        res = dispatch_text(multi_chapter_epub_bytes(), format="epub")
+        seg = res.segment(reg, source_id=SID, source_sha512=SHA)
+        types = {s.segment_type for s in seg.batch.created}
+        assert {"chapter", "paragraph"} <= types
+        # two spine chapters, each with paragraph segments
+        assert "chapter/1" in res.locators and "chapter/2" in res.locators
+        for path in (
+            "chapter/1/paragraph/1",
+            "chapter/1/paragraph/2",
+            "chapter/2/paragraph/1",
+            "chapter/2/paragraph/2",
+        ):
+            assert path in res.locators, f"missing paragraph locator {path}"
+
+    def test_text_pdf_dispatch_segments_extracted_text(self) -> None:
+        from fixtures import pdf_text_bytes
+
+        reg, _store = _reg()
+        res = dispatch_text(pdf_text_bytes(), format="pdf")
+        seg = res.segment(reg, source_id=SID, source_sha512=SHA)
+        types = {s.segment_type for s in seg.batch.created}
+        # the extracted PDF text is segmented as plain text (never raw bytes)
+        assert "paragraph" in types
+        assert "document/1" in res.locators
+
+    def test_dispatch_segment_ids_deterministic_across_runs(self) -> None:
+        raw = multi_chapter_epub_bytes()
+        reg1, _store1 = _reg()
+        reg2, _store2 = _reg()
+        r1 = dispatch_text(raw, format="epub").segment(reg1, source_id=SID, source_sha512=SHA)
+        r2 = dispatch_text(raw, format="epub").segment(reg2, source_id=SID, source_sha512=SHA)
+        keys1 = sorted(s.deterministic_key for s in r1.batch.created)
+        keys2 = sorted(s.deterministic_key for s in r2.batch.created)
+        assert keys1 == keys2 and keys1  # identical deterministic keys across runs
+
+    def test_non_text_dispatch_segment_returns_none(self) -> None:
+        # An image-only PDF never segments binary bytes as plain text.
+        reg, _store = _reg()
+        res = dispatch_text(pdf_image_only_bytes(), format="pdf")
+        assert res.non_text
+        assert res.segment(reg, source_id=SID, source_sha512=SHA) is None
 
 
 class TestDialogueNarration:

@@ -11,6 +11,7 @@ reporting for unavailable/gated providers (Ollama server absent; vLLM gated).
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 import pytest
 
@@ -159,3 +160,118 @@ class TestUnavailableGating:
 
         with pytest.raises(ModelProviderUnavailable):
             OpenAICompatProvider(base_url=None)
+
+
+class _SemanticProvider:
+    """A minimal contract-compliant provider returning configurable semantic JSON."""
+
+    name = "sem_provider"
+
+    def __init__(self, output: object) -> None:
+        self._output = output
+        self.calls: list[ModelRequest] = []
+
+    def invoke(self, request: ModelRequest) -> StructuredModelResult:
+        self.calls.append(request)
+        return StructuredModelResult(
+            mode=ModelMode.COMPLETION,
+            model=request.model,
+            model_version="1.0.0",
+            provider=self.name,
+            prompt_version=request.prompt_version,
+            output=self._output,
+            confidence=0.9,
+            input_refs=request.input_refs,
+            stage=request.stage,
+        )
+
+
+class TestSemanticProvenanceAndAuthority:
+    """Plan M P3-S2: model-call provenance is durable metadata and semantic
+    authority stays on the ledger/command path (providers never write it)."""
+
+    @staticmethod
+    def _segments() -> list[Any]:
+        from umd.analysis.text_structural import ParagraphSegment
+
+        return [
+            ParagraphSegment(
+                text="Alice spoke.",
+                paragraph_index=1,
+                chapter=1,
+                locator="chapter/1/paragraph/1",
+                structural_path="chapter/1/paragraph/1",
+            )
+        ]
+
+    def test_semantic_call_provenance_is_durable_metadata(self) -> None:
+        from umd.analysis.semantic_analyzer import SemanticAnalysisInput, SemanticTextAnalyzer
+
+        registry = ProviderRegistry([FakeLocalProvider()])
+        analyzer = SemanticTextAnalyzer(registry, provider="fake_local", model="local-qwen")
+        result = analyzer.analyze(
+            SemanticAnalysisInput(
+                source_id=str(uuid.uuid4()),
+                segments=self._segments(),
+            )
+        )
+        meta = [e for e in result.evidence if e.evidence_kind == EvidenceKind.METADATA]
+        assert meta, "provider call must be recorded as METADATA evidence"
+        row = meta[0]
+        # durable provenance metadata (never a semantic assertion)
+        assert row.quality["provider"] == "fake_local"
+        assert row.quality["model"] == "local-qwen"
+        assert row.quality["mode"] == "completion"
+        assert row.quality["input_refs"]
+        assert row.config_digest, "provider digest must be set so evidence identity dedups"
+
+    def test_semantic_authority_remains_ledger_command_path(self) -> None:
+        from umd.analysis.semantic_analyzer import SemanticAnalysisInput, SemanticTextAnalyzer
+
+        provider = _SemanticProvider(
+            {
+                "entities": [
+                    {
+                        "mention": "Alice",
+                        "entity_type": "character",
+                        "confidence": 0.9,
+                        "segment": {"locator": "chapter/1/paragraph/1"},
+                    }
+                ]
+            }
+        )
+        analyzer = SemanticTextAnalyzer(
+            ProviderRegistry([provider]), provider="sem_provider", model="m"
+        )
+        result = analyzer.analyze(
+            SemanticAnalysisInput(
+                source_id=str(uuid.uuid4()),
+                segments=self._segments(),
+            )
+        )
+        # validated observations route ONLY as candidate evidence, explicitly
+        # marked non-promotable (promotion_ban) so they can never silently become
+        # semantic authority — authority is the downstream command/reconciliation path.
+        obs = [e for e in result.evidence if e.quality.get("kind") == "semantic_observations"]
+        assert obs, "validated observations must be recorded as evidence"
+        assert obs[0].quality["can_auto_promote"] is False
+        assert obs[0].quality["promotion_ban"]
+        # every evidence row is METADATA (the call) or TEXT_SPAN (observations) —
+        # never a semantic_assertion/current_state authority write.
+        kinds = {e.evidence_kind for e in result.evidence}
+        assert kinds <= {EvidenceKind.METADATA, EvidenceKind.TEXT_SPAN}
+
+    def test_provider_config_change_alters_evidence_digest(self) -> None:
+        from umd.analysis.semantic_prompt import semantic_config_digest
+
+        base = semantic_config_digest()
+        # Use a version distinct from the current default (semantic-analysis@2)
+        # so the assertion genuinely proves a changed prompt yields a new digest.
+        changed = semantic_config_digest(prompt_version="semantic-analysis@3")
+        assert base != changed, "a changed prompt/parser/analyzer must yield a distinct digest"
+        # Two model-call records with distinct config digests are distinguishable
+        # evidence identities (uq_evidence_identity keys on config_digest).
+        result = StructuredModelResult(mode=ModelMode.COMPLETION, model="m", provider="p")
+        e1 = ModelCallRecord.from_result(result, config_digest=base).to_evidence(uuid.uuid4())
+        e2 = ModelCallRecord.from_result(result, config_digest=changed).to_evidence(uuid.uuid4())
+        assert e1.config_digest != e2.config_digest

@@ -27,6 +27,7 @@ from umd.config import AuthSettings, ConsistencySettings, RateLimitSettings, Set
 from umd.projections.base import ReplayDriver
 from umd.projections.checkpoint import ProjectionCheckpoint, ProjectionCheckpointStore
 from umd.projections.current import CurrentTierOneBuilder
+from umd.projections.edges import ActiveSemanticEdgeProjectionBuilder
 from umd.projections.search import SearchProjectionBuilder
 
 pytestmark = pytest.mark.postgres
@@ -59,8 +60,12 @@ def _client_settings() -> Settings:
 
 
 def _build(engine: sa.Engine, *, force_search_resume: bool = True) -> None:
+    # P5-S1: the search projection reconciles the ``assert:%`` utterance family from the
+    # ACTIVE edge store on finalize, so build semantic_edges BEFORE search for the
+    # utterance term in the docs example to be searchable.
     store = ProjectionCheckpointStore(engine)
     ReplayDriver(engine, store).run(CurrentTierOneBuilder(), wipe=True)
+    ReplayDriver(engine, store).run(ActiveSemanticEdgeProjectionBuilder(), wipe=True)
     ReplayDriver(engine, store).run(
         SearchProjectionBuilder(), wipe=True, force_resume=force_search_resume
     )

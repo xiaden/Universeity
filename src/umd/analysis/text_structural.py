@@ -1,27 +1,56 @@
-"""Structural text analysis: dialogue/narration + candidate evidence (P2-S2).
+"""Deterministic/reference structural text analysis (Plan M P1-S2).
 
-Deterministic structural findings over the segmented text baseline:
+Builds a typed :class:`SemanticAnalysisResult` (CONTRACTS.md:75) from the
+deterministic baseline, consuming Plan L's **chapter-aware segment records**
+(paragraph segment text + structural path + canonical locator + registered
+segment id) so evidence is tied to exact segments — never reconstructed from
+OCFL bytes.
+
+The deterministic path:
 
   * **dialogue / narration** — a paragraph is classified as *dialogue* when it
     contains a quoted span or a speaker-directive dash; otherwise *narration*.
-    This is a structural finding, recorded as evidence with the paragraph's
-    source locator (never promotes itself into canonical identity).
+    This structural finding is recorded as evidence with the paragraph's exact
+    segment ref and exposed as a typed :class:`Utterance` + optional
+    :class:`SpeakerCandidate`.
   * **candidate mentions** — deterministic, low-confidence candidate
-    observations for entities, aliases, speaker candidates, events, locations and
-    relationships, each pinned to its source locator and marked as a candidate
-    (``quality.candidate_kind``), NOT promoted to semantic truth.
+    observations for entities (capitalized repeating runs) and relationships
+    (co-occurring entities), each pinned to its exact segment ref and marked as
+    a candidate (:class:`EntityMention` / :class:`Presence` /
+    :class:`RelationshipCandidate`), NOT promoted to semantic truth.
+  * **scene boundaries** — deterministic structural approximations derived from
+    chapter transitions in the segment records (a chapter start is a low-
+    confidence :class:`SceneBoundary` tied to the exact chapter segment).
 
-Everything here is *evidence* (``EvidenceRepository.record``), not semantic
-assertions; the source/evidence/interpretation separation is preserved. Stage
-name ``STRUCTURAL_ANALYSIS`` aligns with :mod:`umd.jobs.dag`.
+Observations the deterministic path cannot honestly support (aliases, traits,
+emotions, states, context) are left **ABSENT** — never inferred/fabricated. The
+same typed shape is what the optional provider path (Phase 2) returns, so both
+paths degrade to one validated contract.
+
+Everything here is *evidence* (:class:`EvidenceRepository` records), not
+semantic assertions; the source/evidence/interpretation separation is preserved.
+Stage name ``STRUCTURAL_ANALYSIS`` aligns with :mod:`umd.jobs.dag`.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-from umd.domain.models import Evidence, EvidenceKind
+from umd.analysis.semantic import (
+    DialogueSpan,
+    EntityMention,
+    GeneratedBy,
+    Presence,
+    RelationshipCandidate,
+    SceneBoundary,
+    SegmentEvidenceRef,
+    SemanticAnalysisResult,
+    SemanticPath,
+    SpeakerCandidate,
+    Utterance,
+)
+from umd.domain.models import ConfidenceState, Evidence, EvidenceKind
 
 #: A quoted span — dialogue marker.
 _QUOTE_RE = re.compile(r'"[^"]*"|\u201c[^\u201d]*\u201d|\'[^\']*\'|\u2018[^\u2019]*\u2019')
@@ -32,17 +61,25 @@ _ATTRIB_RE = re.compile(r"^\s*([A-Z][A-Za-z']+):\s*(.+)")
 #: Capitalized run used as a candidate named-entity mention.
 _CAP_RE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b")
 
+#: Deterministic analyzer provenance tag.
+_ANALYZER = "umd-text-structural@2"
 
-@dataclass
-class DialogueSpan:
-    """A dialogue span and optional deterministic speaker candidate."""
 
-    paragraph_index: int
-    locator: str
+@dataclass(frozen=True)
+class ParagraphSegment:
+    """A chapter-aware paragraph segment record (Plan L) for deterministic analysis.
+
+    ``segments`` in :func:`analyze_segments` carry the exact structural path,
+    canonical locator and registered segment id so evidence is pinned to the
+    actual registered segment — never a hard-coded ``chapter/1`` path.
+    """
+
     text: str
-    is_dialogue: bool
-    quotes: list[str] = field(default_factory=list)
-    speaker_candidate: str | None = None
+    paragraph_index: int
+    chapter: int
+    locator: str
+    structural_path: str = ""
+    segment_id: str | None = None
 
 
 def classify_dialogue(paragraph: str) -> bool:
@@ -78,16 +115,6 @@ def _locator_for(chapter: int, para: int) -> str:
     return f"chapter/{chapter}/paragraph/{para}"
 
 
-@dataclass
-class StructuralTextResult:
-    """Evidence-bearing structural findings for one source."""
-
-    source_id: str
-    dialogue_spans: list[DialogueSpan] = field(default_factory=list)
-    evidence: list[Evidence] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
-
-
 def analyze_text(
     *,
     source_id: str,
@@ -96,31 +123,75 @@ def analyze_text(
     language: str | None = None,
     extraction_stage: str = "STRUCTURAL_ANALYSIS",
     config_digest: str | None = None,
-) -> StructuralTextResult:
-    """Run deterministic dialogue/narration + candidate analysis over paragraphs.
+) -> SemanticAnalysisResult:
+    """Run deterministic analysis over a flat paragraph list (reference baseline).
 
-    ``paragraphs`` are the normalized source paragraphs (in reading order) with
-    their chapter/paragraph structural positions implied by list order (assumed
-    single-chapter here; multi-chapter callers pass flattened paragraphs from one
-    source and keep positions via ``locator_prefix`` is not needed for the
-    baseline).
+    Backward-compatible entry point: ``paragraphs`` are treated as one chapter
+    (chapter 1) with deterministic ``chapter/1/paragraph/N`` locators, matching
+    the historical baseline. Callers with Plan L chapter-aware segment records
+    should use :func:`analyze_segments` instead for exact segment evidence.
     """
-    result = StructuralTextResult(source_id=source_id)
+    segments = [
+        ParagraphSegment(
+            text=para,
+            paragraph_index=idx,
+            chapter=1,
+            locator=_locator_for(1, idx),
+            structural_path=f"chapter/1/paragraph/{idx}",
+        )
+        for idx, para in enumerate(paragraphs, start=1)
+    ]
+    return analyze_segments(
+        source_id=source_id,
+        segments=segments,
+        tool_versions=tool_versions,
+        language=language,
+        extraction_stage=extraction_stage,
+        config_digest=config_digest,
+    )
+
+
+def analyze_segments(
+    *,
+    source_id: str,
+    segments: list[ParagraphSegment],
+    tool_versions: dict[str, str] | None = None,
+    language: str | None = None,
+    extraction_stage: str = "STRUCTURAL_ANALYSIS",
+    config_digest: str | None = None,
+) -> SemanticAnalysisResult:
+    """Run deterministic analysis over Plan L chapter-aware segment records.
+
+    ``segments`` are paragraph records carrying their exact structural path,
+    canonical locator and registered segment id (Plan L). Each paragraph is
+    classified for dialogue/narration and emits evidence + typed observations
+    tied to its exact segment. Scene boundaries are derived from chapter
+    transitions (deterministic structural approximation). Unsupported categories
+    (aliases/traits/emotions/states/context) are left ABSENT.
+    """
     tools = {
         "segmenter": "umd-text",
         "decoder": "umd-stdlib",
-        "analyzer": "umd-text-structural@1",
+        "analyzer": _ANALYZER,
         **(tool_versions or {}),
     }
+    generated_by = GeneratedBy(
+        path=SemanticPath.DETERMINISTIC,
+        analyzer=tools["analyzer"],
+        config_digest=config_digest,
+    )
+    result = SemanticAnalysisResult(source_id=source_id, generated_by=generated_by)
+    prev_chapter: int | None = None
 
-    for idx, para in enumerate(paragraphs, start=1):
-        locator = _locator_for(1, idx)
+    for seg in segments:
+        para = seg.text
+        locator = seg.locator
         is_dialogue = classify_dialogue(para)
         quotes = extract_quotes(para)
         speaker = candidate_speaker(para) if is_dialogue else None
         result.dialogue_spans.append(
             DialogueSpan(
-                paragraph_index=idx,
+                paragraph_index=seg.paragraph_index,
                 locator=locator,
                 text=para,
                 is_dialogue=is_dialogue,
@@ -130,39 +201,90 @@ def analyze_text(
         )
 
         # Dialogue/narration structural finding (evidence row, not semantic).
-        result.evidence.append(
-            _ev(
-                source_id=source_id,
-                locator=locator,
-                kind=EvidenceKind.TEXT_SPAN,
-                stage=extraction_stage,
-                tools=tools,
-                config_digest=config_digest,
-                language=language,
-                confidence=0.9,
-                quality={
-                    "finding": "dialogue" if is_dialogue else "narration",
-                    "quotes": quotes,
-                    "speaker_candidate": speaker,
-                },
-            )
+        ev = _ev(
+            source_id=source_id,
+            locator=locator,
+            segment_id=seg.segment_id,
+            kind=EvidenceKind.TEXT_SPAN,
+            stage=extraction_stage,
+            tools=tools,
+            config_digest=config_digest,
+            language=language,
+            confidence=0.9,
+            quality={
+                "finding": "dialogue" if is_dialogue else "narration",
+                "quotes": quotes,
+                "speaker_candidate": speaker,
+            },
+        )
+        result.evidence.append(ev)
+        seg_ref = SegmentEvidenceRef(
+            locator=locator,
+            segment_id=seg.segment_id,
+            evidence_ref=str(ev.id),
+            chapter=seg.chapter,
+            paragraph=seg.paragraph_index,
         )
 
-        _record_candidates(result, para, locator, idx, tools, config_digest, language)
+        # Scene boundary at a chapter start (deterministic structural
+        # approximation from Plan L chapter-aware segments, low confidence).
+        if prev_chapter is None or seg.chapter != prev_chapter:
+            result.scene_boundaries.append(
+                SceneBoundary(
+                    scene_ref=f"scene/{seg.chapter}",
+                    boundary="start",
+                    label=f"chapter {seg.chapter}",
+                    confidence=0.5,
+                    state=ConfidenceState.PROBABLE,
+                    segment=seg_ref,
+                    generated_by=generated_by,
+                )
+            )
+        prev_chapter = seg.chapter
+
+        if is_dialogue:
+            result.utterances.append(
+                Utterance(
+                    utterance_text=para,
+                    speaker=speaker,
+                    confidence=0.9,
+                    state=ConfidenceState.PROBABLE,
+                    segment=seg_ref,
+                    generated_by=generated_by,
+                )
+            )
+            if speaker:
+                result.speaker_candidates.append(
+                    SpeakerCandidate(
+                        speaker_label=speaker,
+                        utterance_ref=seg_ref.evidence_ref,
+                        confidence=0.5,
+                        state=ConfidenceState.PROBABLE,
+                        segment=seg_ref,
+                        generated_by=generated_by,
+                    )
+                )
+
+        _record_candidates(result, para, seg_ref, generated_by, tools, config_digest, language)
 
     return result
 
 
 def _record_candidates(
-    result: StructuralTextResult,
+    result: SemanticAnalysisResult,
     paragraph: str,
-    locator: str,
-    _para_idx: int,
+    seg_ref: SegmentEvidenceRef,
+    generated_by: GeneratedBy,
     tools: dict[str, str],
     config_digest: str | None,
     language: str | None,
 ) -> None:
-    """Deterministic low-confidence candidate observations for named mentions."""
+    """Deterministic low-confidence candidate observations for named mentions.
+
+    Emits entity-mention + presence + relationship candidates (and their
+    evidence rows) tied to the exact ``seg_ref``. Unsupported observations are
+    left absent — no fabricated claims.
+    """
     seen: set[tuple[str, str]] = set()
     # candidate person/place entities from capitalized runs
     for m in _CAP_RE.finditer(paragraph):
@@ -177,40 +299,73 @@ def _record_candidates(
             continue
         seen.add(key)
         if _CAP_RE.fullmatch(run) and run.split() and _repeats(paragraph, run):
-            result.evidence.append(
-                _ev(
-                    source_id=result.source_id,
-                    locator=locator,
-                    kind=EvidenceKind.TEXT_SPAN,
-                    stage="STRUCTURAL_ANALYSIS",
-                    tools=tools,
-                    config_digest=config_digest,
-                    language=language,
-                    confidence=0.3,
-                    quality={
-                        "candidate_kind": "entity",
-                        "mention_text": run,
-                        "sentence_offset": token_offset,
-                    },
-                )
-            )
-    # relationships: co-occurring capitalized entities in one paragraph
-    entities = [m for m in seen if m[0] == "entity"]
-    if len(entities) >= 2:
-        result.evidence.append(
-            _ev(
+            ev = _ev(
                 source_id=result.source_id,
-                locator=locator,
+                locator=seg_ref.locator,
+                segment_id=seg_ref.segment_id,
                 kind=EvidenceKind.TEXT_SPAN,
                 stage="STRUCTURAL_ANALYSIS",
                 tools=tools,
                 config_digest=config_digest,
                 language=language,
-                confidence=0.2,
+                confidence=0.3,
                 quality={
-                    "candidate_kind": "relationship",
-                    "co_occurring": [m[1] for m in entities],
+                    "candidate_kind": "entity",
+                    "mention_text": run,
+                    "sentence_offset": token_offset,
                 },
+            )
+            result.evidence.append(ev)
+            candidate_ref = seg_ref.model_copy(update={"evidence_ref": str(ev.id)})
+            result.entity_mentions.append(
+                EntityMention(
+                    mention=run,
+                    entity_type="character",
+                    confidence=0.3,
+                    state=ConfidenceState.PROBABLE,
+                    segment=candidate_ref,
+                    generated_by=generated_by,
+                )
+            )
+            result.presence.append(
+                Presence(
+                    entity=run,
+                    present_in=seg_ref.locator,
+                    confidence=0.3,
+                    state=ConfidenceState.PROBABLE,
+                    segment=candidate_ref,
+                    generated_by=generated_by,
+                )
+            )
+    # relationships: co-occurring capitalized entities in one paragraph
+    entities = [m for m in seen if m[0] == "entity"]
+    if len(entities) >= 2:
+        ev = _ev(
+            source_id=result.source_id,
+            locator=seg_ref.locator,
+            segment_id=seg_ref.segment_id,
+            kind=EvidenceKind.TEXT_SPAN,
+            stage="STRUCTURAL_ANALYSIS",
+            tools=tools,
+            config_digest=config_digest,
+            language=language,
+            confidence=0.2,
+            quality={
+                "candidate_kind": "relationship",
+                "co_occurring": [m[1] for m in entities],
+            },
+        )
+        result.evidence.append(ev)
+        candidate_ref = seg_ref.model_copy(update={"evidence_ref": str(ev.id)})
+        result.relationships.append(
+            RelationshipCandidate(
+                subject_ref=entities[0][1],
+                predicate="CO_OCCURS",
+                object_ref=entities[1][1],
+                confidence=0.2,
+                state=ConfidenceState.PROBABLE,
+                segment=candidate_ref,
+                generated_by=generated_by,
             )
         )
 
@@ -224,6 +379,7 @@ def _ev(
     *,
     source_id: str,
     locator: str,
+    segment_id: str | None,
     kind: EvidenceKind,
     stage: str,
     tools: dict[str, str],
@@ -234,6 +390,7 @@ def _ev(
 ) -> Evidence:
     return Evidence(
         source_id=source_id,
+        segment_id=segment_id,
         evidence_kind=kind,
         locator=locator,
         language=language,
@@ -243,3 +400,16 @@ def _ev(
         confidence=confidence,
         quality=quality,
     )
+
+
+__all__ = [
+    "DialogueSpan",
+    "ParagraphSegment",
+    "SemanticAnalysisResult",
+    "analyze_segments",
+    "analyze_text",
+    "candidate_speaker",
+    "classify_dialogue",
+    "extract_quotes",
+    "strip_quotes",
+]

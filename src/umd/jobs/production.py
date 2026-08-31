@@ -27,21 +27,35 @@ callable without a live sandbox/ML runtime, while still degrading honestly
 
 The real bindings (activated when the runtime supplies the processors):
 
-  * ``FORMAT_ANALYSIS`` — reads the committed OCFL bytes (bounded range),
-    normalizes the plain-text baseline, and records a durable format_analysis
-    evidence row.
-  * ``BASIC_SEGMENTATION`` — runs :func:`segment_txt` and registers the full
-    text segment hierarchy through :class:`SegmentRegistry`/``PostgresSegmentStore``.
-  * ``LOW_LEVEL_EXTRACTION`` — emits per-segment ``text_span`` evidence rows with
-    ``segment_id`` pinned to the committed ``segment`` rows (per-segment query).
-  * ``STRUCTURAL_ANALYSIS`` — runs :func:`analyze_text` over the paragraphs and
-    records its dialogue/narration + candidate evidence.
+  * ``FORMAT_ANALYSIS`` — reads the committed OCFL bytes (bounded range), routes
+    them through ONE format-aware dispatch (:class:`umd.extractors.dispatch`
+    ``dispatch_text``: TXT → ``normalize_txt``, Markdown → ``parse_markdown``,
+    EPUB → the safe stdlib ``extract_epub``, PDF → the existing PDF text-layer
+    path), and records a durable format_analysis evidence row carrying the
+    dispatched parser/route + source fixity.
+  * ``BASIC_SEGMENTATION`` — reuses the SAME dispatched result and runs the
+    format-appropriate segmenter (``segment_txt`` / ``segment_markdown`` /
+    ``segment_epub``; text PDFs segment via ``segment_txt`` over the extracted
+    text), registering the native segment hierarchy through
+    :class:`SegmentRegistry`/``PostgresSegmentStore``.
+  * ``LOW_LEVEL_EXTRACTION`` — emits per-segment ``text_span`` evidence rows from
+    the dispatched document's structural paths, with ``segment_id`` pinned to the
+    committed ``segment`` rows and the segment's canonical ``source://`` locator.
+  * ``STRUCTURAL_ANALYSIS`` — consumes the SAME dispatched document (one result
+    per source shared across the text stages), runs :func:`analyze_text` over its
+    paragraphs, and records dialogue/narration + candidate evidence. For
+    image-only (route=``image_raster``), degraded, or unsupported inputs it emits
+    an explicit warning and NO fabricated text evidence.
   * ``ENTITY_RESOLUTION`` — derives candidate mentions from committed structural
-    evidence and routes a reversible ALIAS resolution through the command path.
+    evidence and routes reversible MENTION/ALIAS/MERGE resolution through the
+    command path.
   * ``CROSS_SOURCE_ALIGNMENT`` — single-source runs are a deterministic no-op
     that still records a source-continuity ``Aligned`` event when commands exist.
-  * ``SEMANTIC_RECONCILIATION`` — asserts the reconciled source state through the
-    ledger command path (the shared reducer folds it into Tier-0 current state).
+  * ``SEMANTIC_RECONCILIATION`` — drives the deterministic
+    :class:`umd.reconciliation.reconciler.SemanticReconciler` over the committed
+    typed observations + resolved entities and routes every assertion through the
+    ledger command path (each ``SemanticAsserted`` is also materialized into the
+    read-side ``semantic_assertion`` table in the same transaction).
   * ``CURRENT_SEARCH_PROJECTION`` — replay-only: schedules the sanctioned
     Tier-1 builder through the :class:`ReplayDriver` (never writes projection
     tables directly).
@@ -62,17 +76,36 @@ from __future__ import annotations
 
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
 import sqlalchemy as sa
+from pydantic import ValidationError
 
-from umd.analysis.text_structural import analyze_text
+from umd.analysis.semantic import (
+    ContextObservation,
+    DescriptiveTrait,
+    EmotionObservation,
+    EntityMention,
+    NormalizedAlias,
+    Presence,
+    RelationshipCandidate,
+    SceneBoundary,
+    SemanticCandidate,
+    SpeakerCandidate,
+    StateObservation,
+    Utterance,
+)
+from umd.analysis.semantic_analyzer import SemanticAnalysisInput, SemanticTextAnalyzer
+from umd.analysis.text_structural import ParagraphSegment
 from umd.domain.evidence import EvidenceBatch
-from umd.domain.models import Evidence, EvidenceKind, register_predicate
-from umd.extractors.txt import normalize_txt
+from umd.domain.models import (
+    ConfidenceState,
+    Evidence,
+    EvidenceKind,
+)
 from umd.jobs.dag import STAGE_ORDER
 from umd.jobs.manifest import StageManifest
 from umd.jobs.runner import StageWorkRegistry
@@ -81,9 +114,10 @@ from umd.jobs.stage_execution import (
     StageOutcome,
     StageWork,
 )
+from umd.models.registry import ProviderRegistry
 from umd.projections.current import CurrentTierOneBuilder
+from umd.resolution.mentions import SourceMention
 from umd.segmentation.registry import SegmentRegistry
-from umd.segmentation.segmenters import segment_txt
 from umd.storage.postgres.repositories import (
     PostgresEvidenceRepository,
     PostgresSegmentStore,
@@ -102,6 +136,9 @@ _segment_t = db_meta.tables["segment"]
 #: materially affects the evidence it emits.
 _TEXT_EVIDENCE_CONFIG_DIGEST = "umd-txt@1"  # plain-text normalization/evidence bindings
 _MEDIA_FORMAT_EVIDENCE_CONFIG_DIGEST = "umd-format@1"  # non-text media format analysis
+#: Stable per-binding config digest for the entity-resolution stage decisions
+#: (carried as ``generated_by`` on every ResolutionBatch output; never NULL).
+_ENTITY_RESOLUTION_CONFIG_DIGEST = "umd-entity-resolution@1"
 #: Base prefix for the video-stage audio-ASR branch evidence config digest. Unlike
 #: the other static per-binding digests, the video audio-ASR digest MUST encode the
 #: ASR engine + model id (see ``_video_audio_config_digest``): `uq_evidence_identity`
@@ -111,9 +148,37 @@ _MEDIA_FORMAT_EVIDENCE_CONFIG_DIGEST = "umd-format@1"  # non-text media format a
 #: quadruple differs across engines/models.
 _VIDEO_AUDIO_EVIDENCE_CONFIG_DIGEST_PREFIX = "umd-video-audio"
 
-#: Open-vocabulary predicate for the reconciled-source state assertion emitted by
-#: SEMANTIC_RECONCILIATION (data addition, not a schema migration).
-register_predicate("RECONCILED_SOURCE", "The reconciled semantic state derived for a source.")
+#: Base prefix for the per-dispatch evidence config digest when the dispatch result
+#: does not itself carry a config digest (the dispatch seam always sets one, so this
+#: only guards direct recorder calls in tests).
+_DISPATCH_BASE_DIGEST = "umd-dispatch"
+
+
+def _dispatch_evidence_config_digest(result: Any) -> str:
+    """Deterministic evidence config digest derived from a dispatch result (P2-S2).
+
+    Encodes the base dispatch config digest PLUS the dispatched parser and decoder
+    versions so ``uq_evidence_identity`` ``(source_id, locator, evidence_kind,
+    config_digest)`` satisfies the Plan-L P2-S2 identity contract:
+
+      * identical source/parser/config reruns derive the SAME digest -> the re-record
+        dedups against the unique index (no duplicate rows);
+      * a changed parser/config/decoder version derives a DIFFERENT digest -> a
+        distinct evidence row is produced WITHOUT mutating historical rows (the old
+        rows keep their original digest and are never UPDATE'd).
+    """
+    base = getattr(result, "config_digest", None) or _DISPATCH_BASE_DIGEST
+    parser = getattr(result, "parser_version", None) or "umd-txt@1"
+    decoder = getattr(result, "decoder_version", None) or "umd-stdlib-decode@1"
+    return f"{base}:{parser}:{decoder}"
+
+
+def _dispatch_versions(result: Any) -> tuple[str, str]:
+    """(parser_version, decoder_version) from a dispatch result, defaulting to the
+    plain-text baseline when none is carried (direct recorder calls in tests)."""
+    parser = getattr(result, "parser_version", None) or "umd-txt@1"
+    decoder = getattr(result, "decoder_version", None) or "umd-stdlib-decode@1"
+    return parser, decoder
 
 
 def _video_audio_config_digest(asr: Any | None) -> str:
@@ -165,6 +230,33 @@ def _paragraphs(text: str) -> list[str]:
     """Deterministic blank-line paragraph split (matches the txt segmenter)."""
     blocks = [b.strip() for b in re.split(r"\n\s*\n", text)]
     return [b for b in blocks if b]
+
+
+def _structural_path_key(path: str) -> tuple[tuple[int, str | int], ...]:
+    """Deterministic document-order sort key for a structural path (Plan L P2-S1).
+
+    Splits a path like ``chapter/1/section/1/paragraph/2`` into positional
+    components — numeric segments as ``(1, int)`` and named segments as
+    ``(0, str)`` — so sorting by this key reproduces reading order for the
+    txt/markdown/epub hierarchies. The type-tagged tuples always compare safely
+    (same-tag components share a value type). Used to pair low-level paragraph
+    evidence with its registered segment by ``structural_path`` instead of
+    positionally, so a partial-batch crash/retry that interleaves created and
+    existing rows can never pin paragraph text to the wrong segment id.
+    """
+    return tuple((1, int(part)) if part.isdigit() else (0, part) for part in path.split("/"))
+
+
+def _chapter_number(path: str) -> int:
+    """Chapter index from a structural path like ``chapter/2/paragraph/3`` (default 1)."""
+    m = re.search(r"(?:^|/)chapter/(\d+)(?:/|$)", path)
+    return int(m.group(1)) if m else 1
+
+
+def _paragraph_number(path: str) -> int:
+    """Paragraph index from a structural path like ``chapter/2/paragraph/3`` (default 0)."""
+    m = re.search(r"(?:^|/)paragraph/(\d+)(?:/|$)", path)
+    return int(m.group(1)) if m else 0
 
 
 @dataclass
@@ -268,6 +360,103 @@ def build_runtime(
     )
 
 
+#: Plan R P1-S2 category dispatch for rehydrating committed
+#: ``semantic_observations`` evidence. Each entry is ``(SemanticAnalysisResult
+#: bucket attr, candidate class, category-discriminating key)``. The
+#: discriminator key is the category-specific required field, unique across the
+#: typed contract, so a serialized observation payload classifies unambiguously.
+_PROVIDER_OBSERVATION_DISPATCH: tuple[tuple[str, type[SemanticCandidate], str], ...] = (
+    ("scene_boundaries", SceneBoundary, "scene_ref"),
+    ("entity_mentions", EntityMention, "mention"),
+    ("aliases", NormalizedAlias, "canonical_name"),
+    ("presence", Presence, "present_in"),
+    ("utterances", Utterance, "utterance_text"),
+    ("speaker_candidates", SpeakerCandidate, "speaker_label"),
+    ("traits", DescriptiveTrait, "trait"),
+    ("relationships", RelationshipCandidate, "predicate"),
+    ("emotions", EmotionObservation, "emotion"),
+    ("states", StateObservation, "observed_state"),
+    ("context", ContextObservation, "context_type"),
+)
+
+
+def _classify_provider_observation(
+    payload: dict[str, Any],
+) -> tuple[str | None, type[SemanticCandidate] | None]:
+    """Explicit category/type discrimination for one serialized observation.
+
+    Returns ``(result-bucket attr, candidate class)`` when exactly one category
+    key is present, else ``(None, None)`` — an unknown category or an ambiguous
+    payload (more than one category key) is rejected rather than guessed.
+    """
+    matches = [(attr, cls) for attr, cls, key in _PROVIDER_OBSERVATION_DISPATCH if key in payload]
+    if len(matches) == 1:
+        return matches[0]
+    return None, None
+
+
+def _hydrate_provider_observations(
+    evidence_rows: Sequence[Evidence], locators: set[str]
+) -> tuple[dict[str, list[SemanticCandidate]], list[str]]:
+    """Rehydrate committed, validated ``semantic_observations`` evidence (Plan R).
+
+    Purely a projection over committed evidence — it never invokes a provider,
+    constructs a second analyzer, or reads raw/unvalidated model output. Only
+    known-category, well-formed payloads whose exact segment locator is a member
+    of ``locators`` are rehydrated into typed candidate buckets. Unknown or
+    ambiguous categories, malformed payloads, and invented segment support are
+    rejected with a truthful warning (never repaired, never promoted). No refs
+    are fabricated: each candidate is re-validated through its existing typed
+    Pydantic model, preserving its serialized ``SegmentEvidenceRef``, evidence
+    reference, confidence, semantic state, and ``GeneratedBy`` provenance.
+    """
+    buckets: dict[str, list[SemanticCandidate]] = {
+        attr: [] for attr, _, _ in _PROVIDER_OBSERVATION_DISPATCH
+    }
+    warnings: list[str] = []
+    for ev in evidence_rows:
+        quality = ev.quality or {}
+        if quality.get("kind") != "semantic_observations":
+            continue
+        raw = quality.get("observations")
+        if not isinstance(raw, list):
+            warnings.append(
+                f"semantic_observations evidence {ev.id}: 'observations' is not a list; "
+                "provider observations not rehydrated"
+            )
+            continue
+        for i, payload in enumerate(raw):
+            if not isinstance(payload, dict):
+                warnings.append(
+                    f"semantic_observations evidence {ev.id}: observation[{i}] is not an "
+                    "object; rejected (not promoted)"
+                )
+                continue
+            attr, cls = _classify_provider_observation(payload)
+            if cls is None or attr is None:
+                warnings.append(
+                    f"semantic_observations evidence {ev.id}: observation[{i}] has an "
+                    "unknown or ambiguous category; rejected (not promoted)"
+                )
+                continue
+            try:
+                obs = cls.model_validate(payload)
+            except ValidationError as exc:
+                warnings.append(
+                    f"semantic_observations evidence {ev.id}: malformed "
+                    f"{cls.__name__} observation[{i}]: {exc}; rejected (not promoted)"
+                )
+                continue
+            if obs.segment.locator not in locators:
+                warnings.append(
+                    f"semantic_observations evidence {ev.id}: {cls.__name__} observation[{i}] "
+                    f"lacks exact input-segment support ({obs.segment.locator!r}); not promoted"
+                )
+                continue
+            buckets[attr].append(obs)
+    return buckets, warnings
+
+
 class _Composer:
     """Composes the nine canonical stages into real work over committed state."""
 
@@ -276,6 +465,13 @@ class _Composer:
         self._runtime = runtime
         self._segments = PostgresSegmentStore(engine)
         self._evidence = PostgresEvidenceRepository(engine)
+        #: Per-source memo of the ONE format-aware dispatch result (Plan L P1-S3).
+        #: All four text stages (FORMAT_ANALYSIS / BASIC_SEGMENTATION /
+        #: LOW_LEVEL_EXTRACTION / STRUCTURAL_ANALYSIS) share this so a full DAG run
+        #: dispatches each source exactly once and every stage observes the SAME
+        #: parser/document/hierarchy. Keyed by (source id, content sha512, format) —
+        #: a changed source/format derives a fresh dispatch.
+        self._dispatch_cache: dict[str, Any] = {}
 
     def _opt(self, key: str) -> Any:
         return getattr(self._runtime, key)
@@ -310,18 +506,60 @@ class _Composer:
         except Exception:  # noqa: BLE001 - degrade to committed-state refs
             return None
 
-    def _parsed_text(self, src: dict[str, Any]) -> tuple[bytes, str] | None:
+    def _dispatch_text(self, src: dict[str, Any]) -> Any | None:
+        """ONE format-aware text dispatch for a committed source (Plan L P1-S2).
+
+        Reads the committed OCFL bytes and routes them through the shared
+        ``umd.extractors.dispatch`` seam by format (TXT → ``normalize_txt``/
+        ``segment_txt``, Markdown → ``parse_markdown``/``segment_markdown``,
+        EPUB → the safe stdlib ``extract_epub``/``segment_epub``, PDF → the
+        existing PDF text-layer path). Returns a ``TextDispatchResult``, or None
+        when the source bytes are unavailable (no ``source_store`` / unreadable)
+        so the caller degrades to a committed-state ref. Non-text routes
+        (image-only PDF) and degraded routes carry explicit status on the result
+        — raw binary is never surfaced as normalized text.
+
+        The result is **memoized per source** (Plan L P1-S3): all four text
+        stages — FORMAT_ANALYSIS, BASIC_SEGMENTATION, LOW_LEVEL_EXTRACTION and
+        STRUCTURAL_ANALYSIS — consume the SAME dispatched document for one
+        source, so a full-DAG run dispatches once and every stage observes the
+        same parser/document/hierarchy (never an independent re-dispatch that
+        re-normalizes raw EPUB/PDF bytes through TXT). A changed source content
+        (sha512) or format derives a fresh dispatch.
+
+        ``umd.extractors.*`` is the sandbox-owned decoder root, so the dispatch
+        module is imported lazily (in-method), mirroring how the raster/video/
+        audio/subtitle branches lazily import their decoder roots
+        (``test_production_modules_do_not_import_decoders_in_process``).
+        ``runtime.dispatch`` (if supplied) overrides the default dispatcher so
+        later phases can bind an equivalent ``TextDispatch`` implementation.
+        """
+        cache_key = f"{src['id']}:{src.get('sha512')}:{src.get('format') or 'txt'}"
+        cached = self._dispatch_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        store = self._runtime.source_store
+        if store is None:
+            self._dispatch_cache[cache_key] = None
+            return None
         raw = self._raw_bytes(src)
         if raw is None:
+            self._dispatch_cache[cache_key] = None
             return None
-        return raw, normalize_txt(raw).text
+        fmt = src.get("format") or "txt"
+        dispatcher = self._runtime.dispatch
+        result: Any | None = None
+        if dispatcher is not None:
+            if hasattr(dispatcher, "dispatch"):
+                result = dispatcher.dispatch(src, raw)
+            elif callable(dispatcher):
+                result = dispatcher(raw, format=fmt, source_sha512=src.get("sha512"))
+        else:
+            from umd.extractors.dispatch import dispatch_text
 
-    def _parser_for(self, fmt: str) -> str:
-        if fmt == "markdown":
-            return "markdown"
-        if fmt in ("epub", "pdf"):
-            return fmt
-        return "txt"
+            result = dispatch_text(raw, format=fmt, source_sha512=src.get("sha512"))
+        self._dispatch_cache[cache_key] = result
+        return result
 
     # -- durable evidence helpers -----------------------------------------
 
@@ -350,8 +588,46 @@ class _Composer:
             out[path] = str(row.id)
         return out
 
-    def _record_format_evidence(self, src: dict[str, Any], text: str) -> str | None:
+    def _record_format_evidence(
+        self,
+        src: dict[str, Any],
+        text: str,
+        *,
+        format: str | None = None,
+        parser: str | None = None,
+        result: Any = None,
+    ) -> str | None:
+        """Record a durable format_analysis evidence row for a TEXT source.
+
+        ``format``/``parser`` default to the plain-text baseline so callers (and
+        the recorder-level test) that pass only text keep the txt tagging;
+        FORMAT_ANALYSIS passes the dispatched format/parser so the evidence
+        records the real route (Markdown/EPUB/PDF), never a TXT mislabel.
+
+        When the dispatched ``result`` is supplied (Plan L P2-S1/S2) the row also
+        carries the dispatched parser/decoder versions in ``tool_versions``, a
+        config digest that encodes those versions (so changed parser/config remains
+        distinguishable without mutating historical rows), the raw OCFL reference
+        (``raw_ref``), and the source content sha512 in ``quality``.
+        """
         locator = f"format_analysis:{src['id']}"
+        fmt = format or "text/plain"
+        route_parser = parser or (result.parser if result is not None else "txt") or "txt"
+        if result is not None:
+            parser_v, decoder_v = _dispatch_versions(result)
+            tool_versions = {"format_analyzer": parser_v, "decoder": decoder_v}
+            config_digest = _dispatch_evidence_config_digest(result)
+        else:
+            tool_versions = {"format_analyzer": f"umd-{route_parser}@1"}
+            config_digest = _TEXT_EVIDENCE_CONFIG_DIGEST
+        quality: dict[str, Any] = {
+            "format": fmt,
+            "route": "text",
+            "parser": route_parser,
+            "chars": len(text),
+        }
+        if src.get("sha512"):
+            quality["source_sha512"] = src["sha512"]
         batch = EvidenceBatch(
             records=[
                 Evidence(
@@ -359,10 +635,11 @@ class _Composer:
                     evidence_kind=EvidenceKind.METADATA,
                     locator=locator,
                     extraction_stage="FORMAT_ANALYSIS",
-                    tool_versions={"format_analyzer": "umd-txt@1"},
-                    config_digest=_TEXT_EVIDENCE_CONFIG_DIGEST,
+                    tool_versions=tool_versions,
+                    config_digest=config_digest,
                     confidence=0.99,
-                    quality={"format": "text/plain", "route": "text", "chars": len(text)},
+                    quality=quality,
+                    raw_ref=src.get("ocfl_ref"),
                 )
             ]
         )
@@ -378,60 +655,342 @@ class _Composer:
         text: str,
         *,
         stage: str,
+        result: Any = None,
     ) -> Evidence:
+        """Build a ``text_span`` evidence row linked to a registered segment.
+
+        ``segment_id`` is the DB ``segment`` row id (FK) and ``locator`` is the
+        segment's canonical ``source://`` locator (Plan L P2-S1) — never a bare
+        structural path. When ``result`` is supplied the row carries the dispatched
+        parser/decoder versions, a version-encoding config digest, the raw OCFL
+        reference, and the source content sha512 in ``quality`` (P2-S1/S2).
+        """
+        if result is not None:
+            parser_v, decoder_v = _dispatch_versions(result)
+            tool_versions = {"extractor": parser_v, "decoder": decoder_v}
+            config_digest = _dispatch_evidence_config_digest(result)
+        else:
+            tool_versions = {"extractor": "umd-txt@1"}
+            config_digest = _TEXT_EVIDENCE_CONFIG_DIGEST
+        quality: dict[str, Any] = {"text": text}
+        if src.get("sha512"):
+            quality["source_sha512"] = src["sha512"]
         return Evidence(
             source_id=uuid.UUID(src["id"]),
             segment_id=uuid.UUID(segment_id),
             evidence_kind=EvidenceKind.TEXT_SPAN,
             locator=locator,
             extraction_stage=stage,
-            tool_versions={"extractor": "umd-txt@1"},
-            config_digest=_TEXT_EVIDENCE_CONFIG_DIGEST,
+            tool_versions=tool_versions,
+            config_digest=config_digest,
             confidence=confidence,
-            quality={"text": text},
+            quality=quality,
+            raw_ref=src.get("ocfl_ref"),
         )
 
-    def _emit_low_level_text_evidence(self, src: dict[str, Any], text: str) -> list[str]:
-        """Emit per-segment ``text_span`` evidence with ``segment_id`` pinned."""
+    def _emit_low_level_text_evidence(self, src: dict[str, Any], result: Any) -> list[str]:
+        """Emit per-segment ``text_span`` evidence pinned to the ACTUAL registered
+        paragraph segment paths (Plan L P1-S3) — never hard-coded chapter/1.
+
+        ``result.segment`` (idempotent re-registration) supplies the format-aware
+        segment hierarchy so the evidence rows pin the same paths the
+        BASIC_SEGMENTATION stage registered.
+        """
+        seg_result = result.segment(
+            SegmentRegistry(self._segments),
+            source_id=src["id"],
+            source_sha512=src["sha512"],
+            work_id=None,
+        )
+        if seg_result is None:
+            return []
         ids = self._segment_row_ids(src)
         if not ids:
             return []
         records: list[Evidence] = []
-        doc_id = ids.get("document/1")
-        if doc_id is not None:
+        # Both newly-registered and idempotently-existing segments carry the exact
+        # structural hierarchy, so a rerun emits the SAME set of evidence (deduped by
+        # uq_evidence_identity) rather than only the doc row (Plan L P2-S2 determinism).
+        all_segs = list(seg_result.batch.created) + list(seg_result.batch.existing)
+        doc_seg = next((s for s in all_segs if s.structural_path == "document/1"), None)
+        if doc_seg is not None:
+            doc_id = ids.get("document/1")
+            if doc_id is not None:
+                records.append(
+                    self._span_evidence(
+                        src,
+                        doc_id,
+                        doc_seg.locator,
+                        1.0,
+                        result.text,
+                        stage="LOW_LEVEL_EXTRACTION",
+                        result=result,
+                    )
+                )
+        # Pair paragraph evidence by structural_path (document order), NEVER
+        # positionally against the created+existing concatenation: on a
+        # partial-batch crash + retry those interleave non-contiguously, so a
+        # positional zip would pin paragraph text to the WRONG segment id
+        # (Plan L P2-S1/FINDING 2 provenance misattribution). Both sides are in
+        # reading order, so sorting the segments by their path key aligns them
+        # with ``seg_result.paragraphs`` regardless of the created/existing split.
+        para_segs = sorted(
+            (s for s in all_segs if s.segment_type == "paragraph"),
+            key=lambda s: _structural_path_key(s.structural_path),
+        )
+        for seg, para in zip(para_segs, seg_result.paragraphs, strict=False):
+            seg_id = ids.get(seg.structural_path)
+            if seg_id is None:
+                continue
+            # Canonical source:// locator (seg.locator), never the bare structural
+            # path (Plan L P2-S1): evidence links the exact registered segment.
             records.append(
                 self._span_evidence(
                     src,
-                    doc_id,
-                    "document/1",
-                    1.0,
-                    text,
+                    seg_id,
+                    seg.locator,
+                    0.9,
+                    para,
                     stage="LOW_LEVEL_EXTRACTION",
+                    result=result,
                 )
             )
-        for idx, para in enumerate(_paragraphs(text), start=1):
-            path = f"chapter/1/section/1/paragraph/{idx}"
-            seg_id = ids.get(path)
-            if seg_id is not None:
-                records.append(
-                    self._span_evidence(src, seg_id, path, 0.9, para, stage="LOW_LEVEL_EXTRACTION")
-                )
         if not records:
             return []
         self._evidence.record(EvidenceBatch(records=records))
         return [r.locator for r in records if r.locator]
 
-    def _candidate_mentions(self, src: dict[str, Any]) -> list[str]:
+    def _resolution_mentions(self, src: dict[str, Any]) -> list[SourceMention]:
+        """Build deterministic :class:`SourceMention` records from committed evidence.
+
+        Reads the committed structural candidate-evidence stream (the same
+        ``candidate_kind == "entity"`` rows the legacy stage consumed), but
+        constructs typed mentions keyed by source/segment/span identity (the
+        deterministic sha256 mention id), so
+        the resolution stage has the candidate/linkage inputs it needs and a
+        rerun converges to the same mention rows. Purely a projection over
+        committed evidence — it writes nothing.
+        """
+        from umd.resolution.candidates import normalize_name
+        from umd.resolution.mentions import SourceMention, _deterministic_mention_id
+
         committed = self._evidence.get_by_source(src["id"])
-        out: list[str] = []
+        out: list[SourceMention] = []
+        seen: set[str] = set()
         for ev in committed:
             quality = ev.quality or {}
             if quality.get("candidate_kind") != "entity":
                 continue
-            mention = quality.get("mention_text")
-            if mention and mention not in out:
-                out.append(mention)
+            mention_text = quality.get("mention_text")
+            if not mention_text:
+                continue
+            mid = _deterministic_mention_id(
+                src["id"],
+                str(ev.locator),
+                str(ev.segment_id) if ev.segment_id else None,
+                mention_text,
+            )
+            if mid in seen:
+                continue
+            seen.add(mid)
+            meta: dict[str, Any] = {}
+            if quality.get("entity_type"):
+                meta["entity_type"] = str(quality["entity_type"])
+            if quality.get("co_occurring"):
+                meta["co_occurring"] = list(quality["co_occurring"])
+            forms = quality.get("normalized_forms")
+            if isinstance(forms, list) and forms:
+                normalized_forms = [f for f in (normalize_name(f) for f in forms) if f]
+            else:
+                single = normalize_name(mention_text)
+                normalized_forms = [single] if single else []
+            out.append(
+                SourceMention(
+                    id=uuid.UUID(mid),
+                    source_id=src["id"],
+                    segment_id=ev.segment_id,
+                    mention_text=mention_text,
+                    mention_kind="name",
+                    normalized_forms=normalized_forms,
+                    confidence=quality.get("confidence"),
+                    # AMBIGUOUS confidence_state from evidence keeps an uncertain
+                    # alias unresolved/reviewable (no guessed target).
+                    confidence_state=str(quality["confidence_state"])
+                    if quality.get("confidence_state")
+                    else ConfidenceState.UNKNOWN.value,
+                    provenance={
+                        "locator": str(ev.locator),
+                        "evidence_ref": str(ev.id),
+                        "generated_by": {
+                            "stage": "ENTITY_RESOLUTION",
+                            "analyzer": "umd-entity-resolution@1",
+                            "config_digest": _ENTITY_RESOLUTION_CONFIG_DIGEST,
+                        },
+                    },
+                    metadata_=meta,
+                )
+            )
         return out
+
+    def _apply_resolution(self, batch: Any, mentions: list[Any] | None = None) -> None:
+        """Apply a resolution batch through the existing command path (P2-S2).
+
+        Every decision routes through the ledger command path — never a parallel
+        authority. ``MENTION`` commands are recorded via :class:`MentionService`
+        (idempotent ``EntityMentioned`` + mention row); ``ALIAS``/``MERGE`` are
+        applied through the reversible :class:`Resolver`. Locks and
+        ``USER_OVERRIDE`` precedence are enforced by the shared reducer, and a
+        human confirmation always outranks any machine rerun.
+
+        Option B (P4-S6): genuinely-ambiguous/unresolved mentions (no assignment)
+        are persisted as reviewable mention rows with ``entity_id`` NULL and NO
+        canonical event, so they stay discoverable through the
+        ``UNRESOLVED_ALIASES`` query seam until a human confirms/overrides them.
+        """
+        from umd.resolution.mentions import MentionService, PostgresMentionRepository
+
+        ledger = self._opt("ledger")
+        commands = self._opt("commands")
+        if ledger is None or commands is None:
+            return
+        resolver = self._resolver()
+        repo = PostgresMentionRepository(self._engine)
+        mention_svc = MentionService(ledger=ledger, repository=repo)
+        resolved_ids = set(batch.assignments)
+        # Persist unresolved mentions as reviewable rows first (idempotent via
+        # on-conflict-do-nothing), then apply the resolved commands.
+        for m in mentions or []:
+            if m.mention_id not in resolved_ids:
+                repo.record(m)
+        for cmd in batch.commands:
+            if cmd.kind == "MENTION" and cmd.mention is not None:
+                mention_svc.record(cmd.mention)
+            elif cmd.kind == "ALIAS" and resolver is not None:
+                resolver.alias(
+                    alias_entity=cmd.entity_id,
+                    canonical=cmd.target_entity_id or cmd.entity_id,
+                    reason=cmd.reason or "entity resolution",
+                )
+            elif cmd.kind == "MERGE" and resolver is not None:
+                resolver.merge(
+                    target_entity=cmd.entity_id,
+                    merged_refs=cmd.refs or [cmd.entity_id],
+                    assignments=cmd.assignments or {},
+                    reason=cmd.reason or "entity resolution",
+                )
+
+    def _resolver(self) -> Any:
+        """Build the Phase-1 reversible :class:`Resolver` over the shared ledger."""
+        from umd.resolution.mentions import PostgresMentionRepository
+        from umd.resolution.resolution import PostgresSplitEnumerator, Resolver
+
+        ledger = self._opt("ledger")
+        if ledger is None:
+            return None
+        mentions = PostgresMentionRepository(self._engine)
+        return Resolver(
+            ledger=ledger,
+            enumerator=PostgresSplitEnumerator(self._engine, mentions),
+            mentions=mentions,
+            engine=self._engine,
+        )
+
+    def _paragraph_segments(self, result: Any, src: dict[str, Any]) -> list[ParagraphSegment]:
+        """Plan-L chapter-aware paragraph segment records for the dispatched result.
+
+        Reuses the dispatch result's ``segment()`` seam (idempotent re-registration)
+        to pair each registered paragraph segment with its text in reading order, so
+        STRUCTURAL_ANALYSIS consumes the SAME registered hierarchy the earlier text
+        stages did. Returns [] when no segment seam exists (e.g. a test double), so
+        the caller falls back to the deterministic chapter-1 baseline.
+
+        The structural-path locator (NOT the registered ``source://...?frag=``
+        locator) is used for the evidence rows, and ``segment_id`` is deliberately
+        left unset: LOW_LEVEL_EXTRACTION already emits the exact segment-id-linked
+        text_span evidence, and the deterministic structural findings are a SEPARATE
+        evidence stream (structural-path locators, no segment FK) so the two never
+        collide (uq_evidence_identity) nor double-count a source's evidence.
+        """
+        if not callable(getattr(result, "segment", None)):
+            return []
+        try:
+            seg_result = result.segment(
+                SegmentRegistry(self._segments),
+                source_id=src["id"],
+                source_sha512=src["sha512"],
+                work_id=None,
+            )
+        except Exception:  # noqa: BLE001 - degrade to the deterministic baseline
+            return []
+        if seg_result is None:
+            return []
+        all_segs = list(seg_result.batch.created) + list(seg_result.batch.existing)
+        para_segs = sorted(
+            (s for s in all_segs if s.segment_type == "paragraph"),
+            key=lambda s: _structural_path_key(s.structural_path),
+        )
+        # strict=True: a registered-paragraph / dispatch-paragraphs count OR order
+        # mismatch must NOT silently truncate the analysis input (Plan M P3-S2 QA
+        # Round 1 fix). On mismatch we raise so the caller falls back to the
+        # chapter-1 baseline with a truthful warning instead of analyzing a
+        # silently-shortened segment set.
+        try:
+            pairs = zip(para_segs, seg_result.paragraphs, strict=True)
+            return [
+                ParagraphSegment(
+                    text=para,
+                    paragraph_index=_paragraph_number(seg.structural_path),
+                    chapter=_chapter_number(seg.structural_path),
+                    locator=seg.structural_path,
+                    structural_path=seg.structural_path,
+                    segment_id=None,
+                )
+                for seg, para in pairs
+            ]
+        except ValueError as exc:
+            raise ValueError(
+                "registered paragraph segments do not align with dispatch paragraphs "
+                f"({para_segs!r} vs {seg_result.paragraphs!r}); refusing to truncate "
+                "analysis input"
+            ) from exc
+
+    def _semantic_provider(self) -> str | None:
+        """The configured semantic-analysis provider (``reference`` is the default)."""
+        settings = self._runtime.settings
+        if settings is not None:
+            semantic = getattr(settings, "semantic", None)
+            provider = getattr(semantic, "provider", None) if semantic is not None else None
+            if provider:
+                return str(provider)
+        return None
+
+    def _semantic_model(self) -> str | None:
+        """The configured semantic-analysis model, if any."""
+        settings = self._runtime.settings
+        if settings is not None:
+            semantic = getattr(settings, "semantic", None)
+            model = getattr(semantic, "model", None) if semantic is not None else None
+            if model:
+                return str(model)
+        return None
+
+    def _semantic_analyzer(self, config_digest: str) -> SemanticTextAnalyzer:
+        """Build the semantic analyzer over the runtime's provider registry + config.
+
+        When the runtime carries no ``providers`` (or the configured provider is
+        ``reference``/None) the analyzer degrades to the deterministic/reference
+        baseline with a truthful warning — never a fabricated provider result.
+        """
+        registry = self._runtime.providers
+        if not isinstance(registry, ProviderRegistry):
+            registry = None
+        return SemanticTextAnalyzer(
+            registry,
+            provider=self._semantic_provider(),
+            model=self._semantic_model(),
+            stage="STRUCTURAL_ANALYSIS",
+            config_digest=config_digest,
+        )
 
     # -- modality helpers (P3-S1/S2 real raster + video branches) -----------
 
@@ -912,13 +1471,14 @@ class _Composer:
                 warnings=warnings,
                 metrics={"media_kind": media_kind, "format": fmt, "parser": media_kind},
             )
-        # REAL binding: read the committed OCFL bytes, normalize the plain-text
-        # baseline, and record a durable format_analysis evidence row.
-        parsed = self._parsed_text(src)
-        if parsed is not None:
-            _raw, text = parsed
-            parser = self._parser_for(fmt)
-            locator = self._record_format_evidence(src, text)
+        # REAL binding: ONE format-aware text dispatch (Plan L P1-S1/P1-S2).
+        result = self._dispatch_text(src)
+        if result is not None and result.route == "text":
+            parser = result.parser
+            warnings.extend(result.warnings)
+            locator = self._record_format_evidence(
+                src, result.text, format=fmt, parser=parser, result=result
+            )
             ref = locator or f"format_analysis:{src['id']}:{parser}"
             return StageOutcome(
                 artifact_refs=[ref],
@@ -926,10 +1486,33 @@ class _Composer:
                 warnings=warnings,
                 metrics={"media_kind": media_kind, "format": fmt, "parser": parser},
             )
-        # Degraded (engine-only / unreadable source): deterministic ref from the
-        # committed source row, never fabricated bytes.
+        if result is not None and result.route == "image_raster":
+            # Image-only PDF: a MEDIA (raster) route — record non-text format
+            # evidence, never text normalization of binary page bytes.
+            warnings.extend(result.warnings)
+            locator = self._record_media_format_evidence(src)
+            return StageOutcome(
+                artifact_refs=[locator],
+                evidence_refs=[locator],
+                warnings=warnings,
+                metrics={
+                    "media_kind": media_kind,
+                    "format": fmt,
+                    "parser": "pdf",
+                    "route": "image_raster",
+                },
+            )
+        # Degraded / unsupported / unreadable (or no source_store): deterministic
+        # committed ref + explicit warning — never fabricated text.
+        if result is not None:
+            warnings.extend(result.warnings)
+            warnings.append(
+                f"text dispatch {result.parser} degraded/unsupported for {fmt}; "
+                "recorded deterministic format ref"
+            )
+        else:
+            warnings.append("no source_store wired; recorded deterministic format ref")
         ref = f"format_analysis:{src['id']}:{media_kind}:{fmt}"
-        warnings.append("no source_store wired; recorded deterministic format ref")
         return StageOutcome(
             artifact_refs=[ref],
             evidence_refs=[ref],
@@ -950,17 +1533,25 @@ class _Composer:
             )
         segments = self._segments.segments_for_source(src["id"])
         if not segments:
-            parsed = self._parsed_text(src)
-            if parsed is not None:
-                _raw, text = parsed
-                segment_txt(
+            result = self._dispatch_text(src)
+            if result is not None and result.route == "text":
+                # ONE dispatch call routes to the format-appropriate segmenter
+                # (Plan L P1-S2/P1-S3) — never re-normalizing bytes through TXT.
+                result.segment(
                     SegmentRegistry(self._segments),
                     source_id=src["id"],
                     source_sha512=src["sha512"],
                     work_id=None,
-                    text=text,
                 )
                 segments = self._segments.segments_for_source(src["id"])
+            elif result is not None and result.non_text:
+                # Image-only PDF / degraded: never plain-text segment binary bytes.
+                return StageOutcome(
+                    artifact_refs=[f"segments:{src['id']}:root"],
+                    evidence_refs=[f"segments:{src['id']}"],
+                    warnings=list(result.warnings),
+                    metrics={"segment_count": 0},
+                )
         refs = [s.locator for s in segments] if segments else [f"segments:{src['id']}:root"]
         return StageOutcome(
             artifact_refs=refs,
@@ -988,13 +1579,16 @@ class _Composer:
             # segments (independent evidence stream, never flattened).
             refs = self._subtitle_branch(src, warnings)
         elif self._is_text_media(src):
-            # Text route: per-segment text_span evidence (Phase-2 binding).
-            parsed = self._parsed_text(src)
-            if parsed is not None:
-                _raw, text = parsed
-                produced = self._emit_low_level_text_evidence(src, text)
+            # Text route: per-segment text_span evidence from the dispatched
+            # document's structural paths (Plan L P1-S3), never hard-coded.
+            result = self._dispatch_text(src)
+            if result is not None and result.route == "text":
+                produced = self._emit_low_level_text_evidence(src, result)
                 if produced:
                     refs = produced
+            elif result is not None and result.non_text:
+                # Image-only PDF / degraded: explicit warning, NO fabricated text.
+                warnings.extend(result.warnings)
         if not refs:
             committed = self._evidence.get_by_source(src["id"])
             refs = (
@@ -1057,57 +1651,121 @@ class _Composer:
                 metrics={"block_count": 0, "mode": "media"},
             )
         refs: list[str] = []
-        parsed = self._parsed_text(src)
-        if parsed is not None:
-            _raw, text = parsed
-            result = analyze_text(
-                source_id=src["id"],
-                paragraphs=_paragraphs(text),
-                tool_versions={"analyzer": "umd-text-structural@1"},
-                # Text-path structural evidence: tag with the stable text digest so
-                # uq_evidence_identity (source_id, locator, evidence_kind,
-                # config_digest) dedups a crash-retry re-record instead of treating
-                # NULL digests as distinct and duplicating STRUCTURAL evidence rows.
-                config_digest=_TEXT_EVIDENCE_CONFIG_DIGEST,
+        warnings: list[str] = []
+        # Reuse the SAME dispatched document the earlier text stages consumed (Plan
+        # L P1-S3): STRUCTURAL_ANALYSIS observes the identical parser/document/
+        # hierarchy a rerun does — never re-normalizing raw EPUB/PDF bytes through
+        # TXT. ``_dispatch_text`` is memoized per source, so a full DAG run makes
+        # ONE dispatch shared by FORMAT_ANALYSIS / BASIC_SEGMENTATION /
+        # LOW_LEVEL_EXTRACTION / STRUCTURAL_ANALYSIS.
+        result = self._dispatch_text(src)
+        if result is not None and result.route == "text":
+            # Deterministic/reference baseline PLUS an optional provider-backed
+            # semantic path (Plan M P2). The analyzer consumes the Plan-L
+            # chapter-aware segment records (exact segment refs) and composes the
+            # optional provider invocation on top; it never changes the stage's
+            # completion semantics — it returns the same typed SemanticAnalysisResult
+            # the deterministic baseline produced, recorded as evidence below.
+            config_digest = _dispatch_evidence_config_digest(result)
+            analyzer = self._semantic_analyzer(config_digest)
+            try:
+                segments = self._paragraph_segments(result, src)
+            except ValueError as exc:
+                # Registered/dispatch paragraph misalignment -> fall back to the
+                # chapter-1 deterministic baseline with a truthful warning rather
+                # than analyzing a silently-truncated segment set (Plan M P3-S2 QA
+                # Round 1 fix).
+                segments = []
+                warnings.append(f"structural analysis degraded to chapter-1 baseline: {exc}")
+            if segments:
+                analysis = analyzer.analyze(
+                    SemanticAnalysisInput(
+                        source_id=src["id"],
+                        segments=segments,
+                        language=None,
+                    )
+                )
+            else:
+                # No registered segment records (non-DAG caller / no segment seam):
+                # fall back to the deterministic chapter-1 paragraph baseline so the
+                # stage stays fully callable and provenance-bearing.
+                analysis = analyzer.analyze(
+                    SemanticAnalysisInput(
+                        source_id=src["id"],
+                        segments=[
+                            ParagraphSegment(
+                                text=para,
+                                paragraph_index=idx,
+                                chapter=1,
+                                locator=f"chapter/1/paragraph/{idx}",
+                                structural_path=f"chapter/1/paragraph/{idx}",
+                            )
+                            for idx, para in enumerate(_paragraphs(result.text), start=1)
+                        ],
+                        language=None,
+                    )
+                )
+            warnings.extend(analysis.warnings)
+            if analysis.evidence:
+                self._evidence.record(EvidenceBatch(records=analysis.evidence))
+                refs = [e.locator for e in analysis.evidence if e.locator]
+        elif result is not None and result.non_text:
+            # Image-only PDF (route=image_raster) / degraded / unsupported: emit NO
+            # fabricated dialogue/narration or other text evidence from binary or
+            # non-text bytes (Plan L P1-S4) — an explicit warning and a
+            # deterministic reconciled ref only.
+            warnings.extend(result.warnings)
+            warnings.append(
+                f"structural analysis skipped: {result.parser} non-text/degraded "
+                f"(route={result.route}); no fabricated text evidence"
             )
-            if result.evidence:
-                self._evidence.record(EvidenceBatch(records=result.evidence))
-                refs = [e.locator for e in result.evidence if e.locator]
         if not refs:
             refs = [f"structural_assertions:{src['id']}:reconciled"]
         return StageOutcome(
             artifact_refs=refs,
             evidence_refs=refs,
+            warnings=warnings,
             metrics={"input_evidence_refs": len(manifest.evidence_refs)},
         )
 
     def _entity_resolution(self, manifest: StageManifest) -> StageOutcome:
+        """Real multi-entity resolution over committed candidate mentions.
+
+        Replaces the old source-level synthetic canonical placeholder: the stage
+        builds deterministic :class:`SourceMention` records from committed
+        structural evidence, runs them through :class:`EntityResolutionService`
+        (bounded, deterministic multi-entity clustering), and routes every
+        decision through the existing command path — ``MentionService.record``
+        for ``EntityMentioned`` and ``Resolver.alias/merge`` for the reversible
+        ``ALIAS``/``MERGE`` entity-resolved events. Ambiguous / conflicting
+        mentions stay unresolved and reviewable; the service never guesses a
+        target and a rerun over the same mentions converges to the same refs.
+        """
         src = self._require_source(manifest)
-        refs = [f"resolved_entities:{src['id']}:canonical"]
         commands = self._opt("commands")
-        if commands is not None:
-            # REAL binding: derive candidate mentions from committed structural
-            # evidence and route a reversible ALIAS resolution through the ledger
-            # command path (the executor's StageCompleted is the atomic completion).
-            mentions = self._candidate_mentions(src)
-            if mentions:
-                canonical = f"entity:canonical:{src['id']}"
-                commands.entity_resolve(
-                    kind="ALIAS",
-                    entity_id=canonical,
-                    refs=mentions,
-                    correlation_id=self._corr(manifest.job_id),
+        mentions = self._resolution_mentions(src)
+        if commands is not None and mentions:
+            from umd.resolution.service import EntityResolutionService, ResolutionInput
+
+            service = EntityResolutionService()
+            batch = service.resolve_mentions(
+                ResolutionInput(
+                    source_id=src["id"],
+                    mentions=mentions,
+                    generated_by={
+                        "stage": "ENTITY_RESOLUTION",
+                        "analyzer": "umd-entity-resolution@1",
+                        "config_digest": _ENTITY_RESOLUTION_CONFIG_DIGEST,
+                    },
                 )
-                refs = [canonical]
-            else:
-                # Empty-candidate single-source run: deterministic no-op that
-                # still routes a real ALIAS through the command path.
-                commands.entity_resolve(
-                    kind="ALIAS",
-                    entity_id=refs[0],
-                    refs=list(manifest.evidence_refs),
-                    correlation_id=self._corr(manifest.job_id),
-                )
+            )
+            self._apply_resolution(batch, mentions)
+            refs = [f"resolved_entities:{src['id']}"] + [e.ref for e in batch.canonical_entities]
+            return StageOutcome(artifact_refs=refs, evidence_refs=refs)
+        # No commands or no candidate mentions: deterministic no-op with a
+        # provenance-bearing ref. Never emits the old ``entity:canonical:<src>``
+        # placeholder.
+        refs = [f"resolved_entities:{src['id']}:none"]
         return StageOutcome(artifact_refs=refs, evidence_refs=refs)
 
     def _cross_source_alignment(self, manifest: StageManifest) -> StageOutcome:
@@ -1127,24 +1785,166 @@ class _Composer:
         return StageOutcome(artifact_refs=refs, evidence_refs=refs)
 
     def _semantic_reconciliation(self, manifest: StageManifest) -> StageOutcome:
+        """Drive the semantic reconciler (Plan O P1-S2 / Plan R P1).
+
+        Replaces the single ``RECONCILED_SOURCE`` placeholder with rich typed
+        assertions routed through the command path. The stage reconstructs the
+        deterministic typed observations (re-running the deterministic analyzer
+        over the SAME memoized dispatch the text stages consumed — never a
+        provider re-invocation) and hydrates the already-validated, committed
+        provider observations into the typed input (Plan R P1), feeds them to the
+        pure :class:`SemanticReconciler`, and routes every returned assertion
+        through ``SemanticCommandService.assert_semantic`` (the existing command
+        path). Provider observations are never re-invoked here — only their
+        committed, validated evidence is rehydrated — keeping the stage
+        deterministic and idempotent.
+        """
         src = self._require_source(manifest)
         refs = [f"reconciled_state:{src['id']}:current"]
         commands = self._opt("commands")
-        if commands is not None:
-            # Assert the reconciled source state through the ledger command path;
-            # the shared reducer folds it into Tier-0 current_state (equivalence
-            # with the Tier-1 projection replay).
+        if commands is None or not self._is_text_media(src):
+            return StageOutcome(artifact_refs=refs, evidence_refs=refs)
+        try:
+            input_ = self._reconciliation_input(src)
+        except Exception as exc:  # noqa: BLE001 - quarantine containment
+            return StageOutcome(
+                artifact_refs=refs,
+                evidence_refs=refs,
+                warnings=[f"semantic reconciliation degraded: {exc}"],
+            )
+        if input_ is None:
+            return StageOutcome(artifact_refs=refs, evidence_refs=refs)
+        from umd.reconciliation.reconciler import SemanticReconciler
+
+        events = SemanticReconciler().reconcile(input_)
+        for ev in events:
+            p = ev.payload
             commands.assert_semantic(
-                predicate_code="RECONCILED_SOURCE",
-                subject_ref=refs[0],
-                object_ref=src["ocfl_ref"],
-                confidence=0.95,
-                state="PROBABLE",
-                support_refs=list(manifest.evidence_refs),
-                generated_by={"stage": "SEMANTIC_RECONCILIATION"},
+                predicate_code=p["predicate_code"],
+                subject_ref=p["subject_ref"],
+                object_ref=p.get("object_ref"),
+                confidence=p.get("confidence"),
+                state=p.get("state", "PROBABLE"),
+                authority=p.get("authority", "machine"),
+                scope=p.get("scope", "SOURCE"),
+                support_refs=p.get("support_refs") or [],
+                contradiction_refs=p.get("contradiction_refs") or [],
+                derived_from=p.get("derived_from") or [],
+                generated_by=p.get("generated_by") or {},
                 correlation_id=self._corr(manifest.job_id),
             )
-        return StageOutcome(artifact_refs=refs, evidence_refs=refs)
+        refs = [f"reconciled_state:{src['id']}:current", f"reconciled:{src['id']}:{len(events)}"]
+        return StageOutcome(
+            artifact_refs=refs,
+            evidence_refs=refs,
+            metrics={"assertion_count": len(events)},
+        )
+
+    def _reconciliation_input(self, src: dict[str, Any]) -> Any | None:
+        """Deterministic + validated provider observations and resolution (Plan R).
+
+        Re-runs the deterministic text analyzer over the same memoized dispatch
+        the text stages consumed, then hydrates ONLY the already-validated,
+        committed ``semantic_observations`` evidence the provider-aware
+        STRUCTURAL_ANALYSIS recorded (:func:`_hydrate_provider_observations`) into
+        the typed buckets — a deterministic union of the baseline and the
+        committed provider candidates. It never re-invokes a provider, constructs
+        a second provider analyzer, or reads raw/unvalidated model output.
+
+        The resolution bridge unions the deterministic committed-evidence
+        mentions with the provider entity/alias mentions via
+        :func:`~umd.resolution.mentions.mentions_from_semantic`, deduplicating by
+        mention id so the deterministic baseline resolution is preserved exactly
+        while provider aliases/entities become resolvable. Idempotent rerun
+        convergence is retained: the same committed evidence yields the same
+        typed input.
+        """
+        from umd.reconciliation.reconciler import ReconciliationInput
+        from umd.resolution.mentions import mentions_from_semantic
+        from umd.resolution.service import EntityResolutionService, ResolutionInput
+
+        result = self._dispatch_text(src)
+        if result is None or result.route != "text":
+            return None
+        config_digest = _dispatch_evidence_config_digest(result)
+        analyzer = SemanticTextAnalyzer(
+            None,
+            provider=None,
+            model=None,
+            stage="STRUCTURAL_ANALYSIS",
+            config_digest=config_digest,
+        )
+        try:
+            segments = self._paragraph_segments(result, src)
+        except ValueError:
+            segments = []
+        if not segments:
+            return None
+        analysis = analyzer.analyze(
+            SemanticAnalysisInput(
+                source_id=src["id"],
+                segments=segments,
+                language=None,
+            )
+        )
+        # P1-S1..S3: hydrate committed semantic_observations evidence (the exact
+        # source is the durable evidence returned by get_by_source; the structural
+        # analyzer is the only provider invocation site). Require exact input-segment
+        # locator membership and reject malformed/unknown/ambiguous payloads rather
+        # than repairing or fabricating them. Deterministic baseline always retained.
+        locators = {s.locator for s in segments}
+        buckets, hydrate_warnings = _hydrate_provider_observations(
+            self._evidence.get_by_source(src["id"]), locators
+        )
+        for attr, candidates in buckets.items():
+            if candidates:
+                getattr(analysis, attr).extend(candidates)
+        analysis.warnings.extend(hydrate_warnings)
+        # Truthful degradation: a configured semantic provider that left no
+        # rehydratable committed observations is reported rather than silently
+        # presenting a provider-less result as provider-backed. Deterministic-only
+        # runs (no provider configured) emit no such warning.
+        if self._semantic_provider() and not any(buckets.values()):
+            analysis.warnings.append(
+                "semantic provider configured but no committed semantic-observation "
+                "evidence rehydrated; reconciliation uses the deterministic baseline"
+            )
+        # P1-S4: resolution bridge = deterministic committed-evidence mentions
+        # (preserved exactly) unioned with provider entity/alias mentions from the
+        # hydrated analysis, deduplicated by deterministic mention id. Provider
+        # mentions whose id already exists (same surface at the same segment) stay
+        # on the deterministic baseline row; genuinely new provider aliases/entities
+        # become resolvable without fabricating mention rows or canonical refs.
+        mentions = self._resolution_mentions(src)
+        seen_ids = {m.mention_id for m in mentions}
+        for m in mentions_from_semantic(analysis):
+            if m.mention_id not in seen_ids:
+                seen_ids.add(m.mention_id)
+                mentions.append(m)
+        batch = None
+        if mentions:
+            batch = EntityResolutionService().resolve_mentions(
+                ResolutionInput(
+                    source_id=src["id"],
+                    mentions=mentions,
+                    generated_by={
+                        "stage": "ENTITY_RESOLUTION",
+                        "analyzer": "umd-entity-resolution@1",
+                        "config_digest": _ENTITY_RESOLUTION_CONFIG_DIGEST,
+                    },
+                )
+            )
+        return ReconciliationInput(
+            source_id=src["id"],
+            analysis=analysis,
+            resolution=batch,
+            generated_by={
+                "stage": "SEMANTIC_RECONCILIATION",
+                "reconciler": "umd-semantic-reconciler@1",
+                "config_digest": "umd-semantic-reconciliation@1",
+                "path": "deterministic",
+            },
+        )
 
     def _current_search_projection(self, manifest: StageManifest) -> StageOutcome:
         src = self._require_source(manifest)

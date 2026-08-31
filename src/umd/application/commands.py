@@ -79,26 +79,45 @@ class SemanticCommandService:
         authority: str = "machine",
         scope: str = "GLOBAL",
         support_refs: list[str] | None = None,
+        contradiction_refs: list[str] | None = None,
+        derived_from: list[str] | None = None,
+        subject_entity_id: Any | None = None,
+        object_entity_id: Any | None = None,
+        continuity_id: Any | None = None,
+        narrative_time: dict[str, Any] | None = None,
+        spatial: dict[str, Any] | None = None,
         generated_by: dict[str, Any] | None = None,
         actor: str | None = None,
         correlation_id: Any | None = None,
         causation_id: int | None = None,
     ) -> CommitResult:
+        payload: dict[str, Any] = {
+            "predicate_code": predicate_code,
+            "subject_ref": subject_ref,
+            "object_ref": object_ref,
+            "subject_entity_id": subject_entity_id,
+            "object_entity_id": object_entity_id,
+            "authority": authority,
+            "confidence": confidence,
+            "state": state,
+            "scope": scope,
+            "continuity_id": continuity_id,
+            "support_refs": support_refs or [],
+            "contradiction_refs": contradiction_refs or [],
+            "derived_from": derived_from or [],
+            "generated_by": generated_by or {},
+        }
+        # narrative_time/spatial are object-typed (not nullable) in the schema —
+        # only include them when actually provided.
+        if narrative_time is not None:
+            payload["narrative_time"] = narrative_time
+        if spatial is not None:
+            payload["spatial"] = spatial
         return self._ledger.append(
             [
                 SemanticEvent(
                     event_type=EventType.SEMANTIC_ASSERTED,
-                    payload={
-                        "predicate_code": predicate_code,
-                        "subject_ref": subject_ref,
-                        "object_ref": object_ref,
-                        "authority": authority,
-                        "confidence": confidence,
-                        "state": state,
-                        "scope": scope,
-                        "support_refs": support_refs or [],
-                        "generated_by": generated_by or {},
-                    },
+                    payload=payload,
                     authority=authority,
                     confidence=confidence,
                     generated_by=generated_by or {},

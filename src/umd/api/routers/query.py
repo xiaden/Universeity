@@ -42,6 +42,22 @@ def _bounded(body: StructuredQueryRequest, ctx: AppContext) -> tuple[int, int, i
     return depth, limit, offset
 
 
+def _freshness_guard(ctx: AppContext, edge_derived: bool) -> Any:
+    """Select the consistency guard for a read.
+
+    Edge-derived reads (``RELATIONSHIP_EDGES`` structured queries and relationship
+    semantic questions) read the ``active_semantic_edge`` store, so their token-bearing
+    bounded-freshness wait and 503 behavior must be gated on the ``semantic_edges``
+    ``edge_guard`` rather than only the scalar ``current_tier1`` ``query_guard``
+    (P4-S1). Non-edge reads keep the scalar ``query_guard``.
+    """
+    if edge_derived:
+        eg = ctx.extra.get("edge_guard")
+        if eg is not None:
+            return eg
+    return ctx.consistency
+
+
 def _hit(h: QueryResultHit) -> dict[str, Any]:
     return {
         "ref": h.ref,
@@ -67,7 +83,8 @@ def structured_query(
     _p: Any = Depends(get_principal),
 ) -> StructuredQueryResponse:
     depth, limit, offset = _bounded(body, ctx)
-    snap = ctx.consistency.ensure_read(body.consistency_token)
+    guard = _freshness_guard(ctx, edge_derived=body.kind == "RELATIONSHIP_EDGES")
+    snap = guard.ensure_read(body.consistency_token)
     try:
         page = ctx.query.structured(
             StructuredQuery(
@@ -110,7 +127,8 @@ def semantic_query(
     ctx: AppContext = Depends(get_context),
     _p: Any = Depends(get_principal),
 ) -> SemanticQueryResponse:
-    snap = ctx.consistency.ensure_read(body.consistency_token)
+    guard = _freshness_guard(ctx, edge_derived=ctx.question.requires_edge_guard(body.question))
+    snap = guard.ensure_read(body.consistency_token)
     answer = ctx.question.answer(body.question, body.constraints)
     return SemanticQueryResponse(
         question=answer.question,

@@ -17,6 +17,7 @@ import sqlalchemy as sa
 
 from umd.domain.events import SemanticEvent
 from umd.projections.base import ReplayDriver
+from umd.projections.edges import EDGE_PROJECTION_NAME
 from umd.projections.embedder import embed_text
 from umd.projections.tables import (
     RESULT_KIND_CANONICAL_ENTITY,
@@ -25,11 +26,39 @@ from umd.projections.tables import (
     add_fulltext_columns,
     search_document_in,
 )
+from umd.projections.tables import (
+    active_semantic_edge as _active_edge,
+)
 
 #: Predicates whose ``object_ref`` is natural utterance/pronunciation text worth indexing.
 _UTTERANCE_PREDICATES = frozenset({"SPEAKS", "SAYS", "UTTERANCE", "PRONUNCIATION"})
 
+#: The ``ref`` prefix under which relationship-edge docs are indexed. The whole
+#: ``edge:%`` family is reconciled deterministically on every incremental finalize
+#: (P4-S2): superseded/corrected/overridden edges can never remain searchable.
+_EDGE_DOC_PREFIX = "edge:"
+
+#: The ``ref`` prefix under which utterance-predicate docs are indexed. In Phase 5
+#: the immutable assertion event stream is NO LONGER a search-doc source for
+#: utterances: ``apply`` no longer writes ``assert:{seq}`` docs. Instead the whole
+#: ``assert:%`` family is rebuilt on every finalize from the ACTIVE edge store (the
+#: single read-side source) as ``assert:{fact_id}``, so a corrected/overridden/
+#: invalidated utterance can never stay searchable under its superseded value and
+#: the corrected value is always indexed once the edge store is current.
+_ASSERT_DOC_PREFIX = "assert:"
+
 _NAMESPACE = b"umd.search_doc"
+
+
+class EdgeProjectionLagError(RuntimeError):
+    """The ``semantic_edges`` projection trailed the search replay target.
+
+    Raised from :meth:`SearchProjectionBuilder._index_active_edges` when the edge
+    checkpoint has not reached the search replay target. It propagates through the
+    :class:`ReplayDriver` transaction so the whole search rebuild rolls back — no
+    edge-derived documents are written and the search checkpoint is never advanced
+    (a search must not publish a checkpoint after reading a lagging edge store).
+    """
 
 
 def _doc_id(kind: str, ref: str) -> str:
@@ -67,21 +96,13 @@ class SearchProjectionBuilder:
                 seq=event.seq or 0,
             )
             return
-        if event.event_type == "SemanticAsserted":
-            pred = event.payload.get("predicate") or event.payload.get("predicate_code")
-            obj = event.payload.get("object_ref")
-            if pred in _UTTERANCE_PREDICATES and isinstance(obj, str) and obj.strip():
-                self._upsert(
-                    conn,
-                    ref=f"assert:{event.seq or 0}",
-                    kind=RESULT_KIND_INTERPRETATION,
-                    text=obj,
-                    source_id=None,
-                    segment_id=None,
-                    entity_ref=event.payload.get("subject_ref"),
-                    predicate=str(pred),
-                    seq=event.seq or 0,
-                )
+        # NOTE (P5-S1): utterance predicates are NO LONGER indexed here from the
+        # immutable assertion stream (previously ``assert:{seq}`` docs). The immutable
+        # event stream is not a search-doc source for utterances anymore — the ACTIVE
+        # edge store is the single read-side source, reconciled on every finalize in
+        # ``_index_active_edges`` as ``assert:{fact_id}``. This is what lets a
+        # correction/override/invalidation supersede an utterance on the public search
+        # surface (a stale ``assert:{seq}`` doc would otherwise survive it).
 
     def on_skip(self, conn: sa.Connection, driver: ReplayDriver, event: SemanticEvent) -> None:
         return None
@@ -105,6 +126,89 @@ class SearchProjectionBuilder:
                     predicate=predicate,
                     seq=row.seq,
                 )
+        # Surfacing (P2-S4/P5-S1): index ACTIVE relationship edges from the edge store as
+        # typed INTERPRETATION hits. The edge builder is the sole WRITER of the edge store;
+        # this builder only READS it. Every finalize deterministically reconciles BOTH the
+        # ``edge:%`` and ``assert:%`` document families against the current active edge
+        # store: non-utterance predicates (e.g. HAS_EMOTION, CO_OCCURS) are indexed as
+        # ``edge:{fact_id}`` and utterance predicates (SPEAKS|SAYS|UTTERANCE|PRONUNCIATION)
+        # as ``assert:{fact_id}``. Only ``active=true`` edges are indexed — superseded
+        # edges never surface in search.
+        # P4-S1/P4-S2/P5-S1: gated on the semantic_edges freshness, and every finalize
+        # deterministically reconciles the whole ``edge:%`` + ``assert:%`` document
+        # families.
+        self._index_active_edges(conn, driver)
+
+    def _index_active_edges(self, conn: sa.Connection, driver: ReplayDriver) -> None:
+        # P4-S1 — cross-projection freshness protocol. Serialize this finalize against the
+        # semantic_edges projection rebuild lock (same advisory key the edge builder's
+        # ReplayDriver acquires), then require the edge checkpoint to have reached THIS
+        # search replay target before reading active_semantic_edge. A lagging edge store
+        # would yield stale/partial edge docs; aborting (raising) rolls the whole search
+        # transaction back so the search checkpoint is never advanced and no edge-derived
+        # document is written from a lagging dependency. When the search projection is
+        # paused it publishes a paused checkpoint (never fresh), so the gate is skipped.
+        if conn.dialect.name == "postgresql":
+            conn.execute(
+                sa.select(sa.func.pg_advisory_xact_lock(sa.func.hashtext(EDGE_PROJECTION_NAME)))
+            )
+        edge_cp = driver.store.get(EDGE_PROJECTION_NAME, conn=conn)
+        if (
+            not getattr(driver, "paused", False)
+            and edge_cp is not None
+            and edge_cp.applied_seq < driver.applied_seq
+        ):
+            raise EdgeProjectionLagError(
+                f"semantic_edges checkpoint ({edge_cp.applied_seq}) trails search replay "
+                f"target ({driver.applied_seq}); refusing to index stale edges or advance "
+                "the search checkpoint"
+            )
+
+        # P4-S2 / P5-S1 — deterministic reconciliation. Delete the complete ``edge:%`` AND
+        # ``assert:%`` document families, then reindex EXACTLY the currently active edges
+        # from the active edge store. Non-utterance predicates are indexed as
+        # ``edge:{fact_id}``; utterance predicates (SPEAKS|SAYS|UTTERANCE|PRONUNCIATION) as
+        # ``assert:{fact_id}``. Corrections / overrides / invalidations can no longer leave
+        # a superseded utterance or edge hit searchable, and the corrected value (from the
+        # active edge store) is always indexed; the ledger + active-edge history are
+        # untouched. The immutable event stream is no longer a search-doc source for
+        # utterances — active edges are the single read-side source.
+        conn.execute(self._table.delete().where(self._table.c.ref.like(f"{_EDGE_DOC_PREFIX}%")))
+        conn.execute(self._table.delete().where(self._table.c.ref.like(f"{_ASSERT_DOC_PREFIX}%")))
+
+        edge = _active_edge
+        rows = conn.execute(
+            sa.select(
+                edge.c.fact_id,
+                edge.c.subject_ref,
+                edge.c.object_ref,
+                edge.c.predicate,
+                edge.c.confidence,
+                edge.c.ledger_seq,
+            ).where(edge.c.active.is_(sa.true()))
+        ).fetchall()
+        for r in rows:
+            pred = r.predicate or ""
+            obj = r.object_ref
+            text = obj if isinstance(obj, str) and obj.strip() else (r.subject_ref or "")
+            if not text:
+                continue
+            ref = (
+                f"{_ASSERT_DOC_PREFIX}{str(r.fact_id)}"
+                if pred in _UTTERANCE_PREDICATES
+                else f"{_EDGE_DOC_PREFIX}{str(r.fact_id)}"
+            )
+            self._upsert(
+                conn,
+                ref=ref,
+                kind=RESULT_KIND_INTERPRETATION,
+                text=text,
+                source_id=None,
+                segment_id=None,
+                entity_ref=r.subject_ref,
+                predicate=pred,
+                seq=int(r.ledger_seq or 0),
+            )
 
     # -- store writer ------------------------------------------------------
 

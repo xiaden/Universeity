@@ -18,14 +18,19 @@ Invariants enforced here:
 
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
 import sqlalchemy as sa
 
-from umd.domain.events import EventSchemaError, SemanticEvent
+from umd.domain.events import EventSchemaError, EventType, SemanticEvent
+from umd.domain.models import PREDICATE_VOCABULARY
 from umd.storage.postgres.reducer import (
+    LOCK_PREDICATE,
+    STATE_LOCKED,
     STATE_UNLOCKED,
+    USER_OVERRIDE,
     CurrentReducedState,
     CurrentStateReducer,
 )
@@ -33,9 +38,54 @@ from umd.storage.postgres.tables import metadata as db_meta
 
 _event_t = db_meta.tables["semantic_event"]
 _state_t = db_meta.tables["current_state"]
+_assertion_t = db_meta.tables["semantic_assertion"]
+_pred_t = db_meta.tables["predicate"]
 
 #: PostgreSQL-dialect insert so ``on_conflict_do_nothing`` type-checks cleanly.
 pg_insert = sa.dialects.postgresql.insert
+
+
+def _uuid_or_none(value: Any) -> uuid.UUID | None:
+    """Coerce a payload ref to a UUID FK value, or None when it is not UUID-shaped.
+
+    The reconciler/observation refs are deterministic STRINGS (canonical refs,
+    segment locators), never entity-table UUIDs, so ``subject_entity_id`` /
+    ``object_entity_id`` / ``continuity_id`` stay NULL for those; a UUID-shaped
+    value is honored when a caller supplies one.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, TypeError):
+        return None
+
+
+def _assertion_fact_id(payload: dict[str, Any], event_version: int) -> uuid.UUID:
+    """Deterministic content-addressable id for one semantic fact.
+
+    Derived ONLY from the stable semantic identity (predicate, subject/object
+    refs + entity ids, scope) — never from random evidence ids or seqs — so a
+    rerun asserting the same fact maps to the SAME row (idempotency +
+    wipe-and-replay stability). Distinct facts map to distinct ids.
+    """
+    key = json.dumps(
+        {
+            "predicate_code": payload.get("predicate_code"),
+            "subject_ref": payload.get("subject_ref"),
+            "object_ref": payload.get("object_ref"),
+            "subject_entity_id": str(payload["subject_entity_id"])
+            if payload.get("subject_entity_id")
+            else None,
+            "object_entity_id": str(payload["object_entity_id"])
+            if payload.get("object_entity_id")
+            else None,
+            "scope": payload.get("scope"),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"{event_version}:{key}")
 
 
 class LedgerConflictError(RuntimeError):
@@ -210,6 +260,10 @@ class SemanticLedger:
         # -- Tier-0 reducer delta, committed in the SAME transaction ----.
         self._apply_tier0(conn, events, seqs)
 
+        # -- materialize SemanticAsserted events into the read-side
+        #    semantic_assertion table, in the SAME transaction (P1-S3). ----
+        self._materialize_assertions(conn, prepared, seqs)
+
         return CommitResult(seq=first_seq, read_your_writes_token=first_seq)
 
     # -- Tier-0 -----------------------------------------------------------
@@ -240,6 +294,113 @@ class SemanticLedger:
             self._reducer.reduce(state, ev.model_copy(update={"seq": s}))
 
         self._persist_delta(conn, state)
+
+    def _materialize_assertions(
+        self,
+        conn: sa.Connection,
+        prepared: list[Any],
+        seqs: list[int],
+    ) -> None:
+        """Materialize every ``SemanticAsserted`` event into ``semantic_assertion``.
+
+        Runs inside the SAME transaction as the event append (P1-S3) so a crash
+        can never commit an event without its read-side mirror (and vice versa).
+        Each distinct semantic fact (predicate + subject/object refs + scope) gets
+        ONE deterministic row: the id is content-addressed so retries/reruns never
+        duplicate and wipe-and-replay is stable, and ``on_conflict_do_update``
+        keeps the row reflecting the latest assertion for that fact.
+
+        The FK-safe ``predicate`` row is seeded idempotently from the registered
+        vocabulary (data, not a migration) so materialization never invents a
+        predicate. Provenance that has no dedicated column (``generated_by``,
+        ``scope``, ``derived_from``) is preserved in the ``derivation`` JSONB;
+        ``support_refs``/``contradiction_refs`` stay as their own source-evidence
+        columns, distinct from machine interpretation.
+
+        Precedence guards (P4-S3): the mirror must never let a machine reassertion
+        downgrade a ``USER_OVERRIDE`` mirror row or write a locked entity. The lock
+        markers are read from the Tier-0 ``current_state`` (already folded in this
+        transaction) so a locked entity's machine assertions never materialize, and a
+        ``USER_OVERRIDE`` row with the same deterministic fact identity is preserved.
+        """
+        # First pass: collect the subject refs to check for entity locks.
+        subject_refs: set[str] = set()
+        for pe, _s in zip(prepared, seqs, strict=True):
+            if pe.event_type != EventType.SEMANTIC_ASSERTED.value:
+                continue
+            sr = pe.payload.get("subject_ref")
+            if sr:
+                subject_refs.add(sr)
+        locked_entities: set[str] = set()
+        if subject_refs:
+            locked_entities = set(
+                conn.execute(
+                    sa.select(_state_t.c.entity_ref).where(
+                        _state_t.c.predicate == LOCK_PREDICATE,
+                        _state_t.c.state == STATE_LOCKED,
+                        _state_t.c.entity_ref.in_(tuple(subject_refs)),
+                    )
+                ).scalars()
+            )
+
+        for pe, s in zip(prepared, seqs, strict=True):
+            if pe.event_type != EventType.SEMANTIC_ASSERTED.value:
+                continue
+            payload = pe.payload
+            code = payload.get("predicate_code")
+            if not code:
+                continue
+            description = PREDICATE_VOCABULARY.get(code) or code
+            conn.execute(
+                pg_insert(_pred_t)
+                .values(code=code, description=description)
+                .on_conflict_do_nothing(index_elements=["code"])
+            )
+            fact_id = _assertion_fact_id(payload, pe.event_version)
+            # P4-S3: a locked entity's machine assertion never materializes to the mirror
+            # (mirrors the reducer + edge-builder lock guard).
+            if payload.get("subject_ref") in locked_entities:
+                continue
+            # P4-S3: a machine reassertion must never downgrade an existing USER_OVERRIDE
+            # mirror row with the same deterministic fact identity.
+            existing_authority = conn.execute(
+                sa.select(_assertion_t.c.authority).where(_assertion_t.c.id == fact_id)
+            ).scalar()
+            incoming_authority = payload.get("authority") or pe.authority
+            if existing_authority == USER_OVERRIDE and incoming_authority != USER_OVERRIDE:
+                continue
+            values: dict[str, Any] = {
+                "id": fact_id,
+                "predicate_code": code,
+                "subject_ref": payload.get("subject_ref"),
+                "object_ref": payload.get("object_ref"),
+                "subject_entity_id": _uuid_or_none(payload.get("subject_entity_id")),
+                "object_entity_id": _uuid_or_none(payload.get("object_entity_id")),
+                "authority": payload.get("authority") or pe.authority,
+                "confidence": (
+                    payload.get("confidence")
+                    if payload.get("confidence") is not None
+                    else pe.confidence
+                ),
+                "state": payload.get("state") or "UNKNOWN",
+                "continuity_id": _uuid_or_none(payload.get("continuity_id")),
+                "valid_time": pe.valid_time,
+                "support_refs": payload.get("support_refs") or [],
+                "contradiction_refs": payload.get("contradiction_refs") or [],
+                "schema_ref": pe.schema_url,
+                "derivation": {
+                    "generated_by": pe.generated_by or {},
+                    "scope": payload.get("scope"),
+                    "derived_from": payload.get("derived_from") or [],
+                    "source_seq": int(s),
+                },
+            }
+            set_ = {k: v for k, v in values.items() if k != "id"}
+            conn.execute(
+                pg_insert(_assertion_t)
+                .values(**values)
+                .on_conflict_do_update(index_elements=["id"], set_=set_)
+            )
 
     def _load_affected_state(
         self, conn: sa.Connection, events: list[SemanticEvent]

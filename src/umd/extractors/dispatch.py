@@ -153,6 +153,297 @@ class SandboxParseError(RuntimeError):
         self.result = result
 
 
+# =============================================================================
+# Plan L P1-S1: shared production text-dispatch result
+#
+# One format-aware route for the production FORMAT_ANALYSIS / BASIC_SEGMENTATION
+# / LOW_LEVEL_EXTRACTION stages (CONTRACTS.md:74 ``TextDispatch``). It records
+# the format, parser, route, normalized document structure, structural
+# locators/segment IDs and warnings WITHOUT exposing raw binary as normalized
+# text — non-text/degraded routes carry an explicit status and no fabricated
+# text. Later phases depend on this shape.
+# =============================================================================
+
+#: Stable configuration digest for the production text dispatch (evidence
+#: ``uq_evidence_identity`` dedup and rerun determinism need a non-null digest).
+_TEXT_DISPATCH_CONFIG_DIGEST = "umd-dispatch@1"
+
+#: Deterministic parser/decoder version tags per dispatched format (provenance).
+_PARSER_VERSIONS: dict[str, str] = {
+    "txt": "umd-txt@1",
+    "markdown": "umd-markdown@1",
+    "epub": "umd-epub-stdlib@1",
+    "pdf": "umd-pdf-pypdf@1",
+}
+_DECODER_VERSIONS: dict[str, str] = {
+    "txt": "umd-stdlib-decode@1",
+    "markdown": "umd-stdlib-decode@1",
+    "epub": "umd-zip-xml@1",
+    "pdf": "umd-pypdf@1",
+}
+
+#: Formats that have a dedicated text parser. Anything else (empty/unknown) keeps
+#: the deterministic plain-text baseline with an explicit warning.
+_KNOWN_TEXT_FORMATS = {"txt", "markdown", "epub", "pdf"}
+
+
+@dataclass
+class TextDispatchResult:
+    """Shared production text-dispatch result (Plan L P1-S1).
+
+    One format-aware route that records the parser, route, normalized document
+    structure, warnings, provenance and source fixity for a text/book source
+    without ever surfacing raw binary as normalized text. Non-text/degraded
+    routes carry an explicit status (``route``/``non_text``/``degraded``) and an
+    empty ``text`` so the caller never fabricates prose from binary bytes.
+
+    :meth:`segment` runs the format-appropriate segmenter (the pairing the plan
+    requires: TXT→``segment_txt``, Markdown→``segment_markdown``, EPUB→
+    ``segment_epub``, text PDF→the extracted text via ``segment_txt``) and
+    records the registered structural locators/segment IDs for downstream
+    evidence linking. It returns None on non-text/degraded routes (never
+    segments binary as plain text).
+    """
+
+    format: str
+    parser: str
+    route: str  # "text" | "image_raster" | "unsupported" | "degraded"
+    document: Any  # NormalizedText | MarkdownDocument | EpubDocument | PdfTextResult | None
+    text: str = ""
+    warnings: list[str] = field(default_factory=list)
+    degraded: bool = False
+    non_text: bool = False
+    parser_version: str = _PARSER_VERSIONS["txt"]
+    decoder_version: str = _DECODER_VERSIONS["txt"]
+    config_digest: str = _TEXT_DISPATCH_CONFIG_DIGEST
+    source_sha512: str | None = None
+    #: structural path -> canonical locator / segment id (populated by segment()).
+    locators: dict[str, str] = field(default_factory=dict)
+    segment_ids: dict[str, str] = field(default_factory=dict)
+
+    def segment(
+        self,
+        registry: Any,
+        *,
+        source_id: str,
+        source_sha512: str,
+        work_id: str | None = None,
+    ) -> Any:
+        """Run the format-appropriate segmenter and record structural locators.
+
+        Returns a :class:`~umd.segmentation.segmenters.SegmentationResult`, or
+        None when this is a non-text/degraded route (never segments binary bytes
+        as plain text).
+        """
+        if self.route != "text" or self.document is None:
+            return None
+        from umd.segmentation.segmenters import segment_epub, segment_markdown, segment_txt
+
+        if self.parser == "markdown":
+            out = segment_markdown(
+                registry,
+                source_id=source_id,
+                source_sha512=source_sha512,
+                work_id=work_id,
+                doc=self.document,
+            )
+        elif self.parser == "epub":
+            out = segment_epub(
+                registry,
+                source_id=source_id,
+                source_sha512=source_sha512,
+                work_id=work_id,
+                doc=self.document,
+            )
+        else:  # txt (and text PDFs — the extracted text, never raw bytes)
+            out = segment_txt(
+                registry,
+                source_id=source_id,
+                source_sha512=source_sha512,
+                work_id=work_id,
+                text=self.text,
+            )
+        for seg in out.batch.created:
+            self.locators[seg.structural_path] = seg.locator
+            self.segment_ids[seg.structural_path] = seg.segment_id
+        return out
+
+
+def _epub_text(doc: Any) -> str:
+    """Flatten an extracted EPUB's spine paragraphs into normalized text."""
+    return "\n\n".join("\n\n".join(p.text for p in item.paragraphs) for item in doc.spine)
+
+
+def _pdf_text(result: Any) -> str:
+    """Flatten a text PDF's per-page text layer into normalized text."""
+    return "\n\n".join(p.text for p in result.pages if p.text)
+
+
+def dispatch_text(
+    raw: bytes,
+    *,
+    format: str | None,
+    source_sha512: str | None = None,
+) -> TextDispatchResult:
+    """Format-aware production text dispatch (Plan L P1-S1).
+
+    Routes one source's bytes to its parser/segmenter pair: TXT →
+    ``normalize_txt``, Markdown → ``parse_markdown``, EPUB → the safe stdlib
+    ``extract_epub``, PDF → the existing PDF text-layer path. Unknown/unsupported
+    text formats keep the deterministic plain-text baseline with an explicit
+    warning. Unreadable / image-only / unsupported routes carry an explicit
+    non-text/degraded status and NO fabricated text.
+    """
+    fmt = (format or "").lower()
+    warnings: list[str] = []
+
+    if fmt not in _KNOWN_TEXT_FORMATS:
+        if fmt:
+            warnings.append(
+                f"unsupported/unknown text format {format!r}; using plain-text baseline"
+            )
+        fmt = "txt"
+
+    if fmt == "markdown":
+        normalized = normalize_txt(raw)
+        md_doc = parse_markdown(normalized.text)
+        return TextDispatchResult(
+            format="markdown",
+            parser="markdown",
+            route="text",
+            document=md_doc,
+            text=normalized.text,
+            warnings=warnings + list(normalized.warnings),
+            parser_version=_PARSER_VERSIONS["markdown"],
+            decoder_version=_DECODER_VERSIONS["markdown"],
+            source_sha512=source_sha512,
+        )
+
+    if fmt == "epub":
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".epub", delete=False) as tf:
+                tf.write(raw)
+                tf_path = Path(tf.name)
+            try:
+                epub_doc = extract_epub(tf_path)
+            finally:
+                tf_path.unlink(missing_ok=True)
+        except EpubParseError as exc:
+            return TextDispatchResult(
+                format="epub",
+                parser="epub",
+                route="degraded",
+                document=None,
+                text="",
+                warnings=warnings + [f"epub parse failed: {exc}"],
+                degraded=True,
+                non_text=True,
+                parser_version=_PARSER_VERSIONS["epub"],
+                decoder_version=_DECODER_VERSIONS["epub"],
+                source_sha512=source_sha512,
+            )
+        return TextDispatchResult(
+            format="epub",
+            parser="epub",
+            route="text",
+            document=epub_doc,
+            text=_epub_text(epub_doc),
+            warnings=warnings + list(epub_doc.warnings),
+            parser_version=_PARSER_VERSIONS["epub"],
+            decoder_version=_DECODER_VERSIONS["epub"],
+            source_sha512=source_sha512,
+        )
+
+    if fmt == "pdf":
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+                tf.write(raw)
+                tf_path = Path(tf.name)
+            try:
+                result = detect_pdf_text(tf_path)
+            finally:
+                tf_path.unlink(missing_ok=True)
+        except PdfParseError as exc:
+            return TextDispatchResult(
+                format="pdf",
+                parser="pdf",
+                route="degraded",
+                document=None,
+                text="",
+                warnings=warnings + [f"pdf parse failed: {exc}"],
+                degraded=True,
+                non_text=True,
+                parser_version=_PARSER_VERSIONS["pdf"],
+                decoder_version=_DECODER_VERSIONS["pdf"],
+                source_sha512=source_sha512,
+            )
+        if not result.has_any_text:
+            return TextDispatchResult(
+                format="pdf",
+                parser="pdf",
+                route="image_raster",
+                document=result,
+                text="",
+                warnings=warnings
+                + list(result.warnings)
+                + ["pdf has no usable text layer; routed to raster/OCR"],
+                non_text=True,
+                parser_version=_PARSER_VERSIONS["pdf"],
+                decoder_version=_DECODER_VERSIONS["pdf"],
+                source_sha512=source_sha512,
+            )
+        return TextDispatchResult(
+            format="pdf",
+            parser="pdf",
+            route="text",
+            document=result,
+            text=_pdf_text(result),
+            warnings=warnings + list(result.warnings),
+            parser_version=_PARSER_VERSIONS["pdf"],
+            decoder_version=_DECODER_VERSIONS["pdf"],
+            source_sha512=source_sha512,
+        )
+
+    # TXT (and unknown text-like formats): deterministic plain-text baseline.
+    normalized = normalize_txt(raw)
+    return TextDispatchResult(
+        format="txt",
+        parser="txt",
+        route="text",
+        document=normalized,
+        text=normalized.text,
+        warnings=warnings + list(normalized.warnings),
+        parser_version=_PARSER_VERSIONS["txt"],
+        decoder_version=_DECODER_VERSIONS["txt"],
+        source_sha512=source_sha512,
+    )
+
+
+class TextDispatch:
+    """Contract boundary for the production text dispatch (CONTRACTS.md:74).
+
+    ``TextDispatch.dispatch(source, raw_or_native) -> TextDispatchResult`` — a
+    thin adapter over :func:`dispatch_text` so the contract name is importable
+    by later phases and by the production stage registry.
+    """
+
+    @staticmethod
+    def dispatch(source: Any, raw_or_native: Any) -> TextDispatchResult:
+        fmt: str | None = None
+        sha: str | None = None
+        if isinstance(source, dict):
+            fmt = source.get("format")
+            sha = source.get("sha512")
+        elif source is not None:
+            fmt = getattr(source, "format", None)
+            sha = getattr(source, "sha512", None)
+        if isinstance(raw_or_native, (bytes, bytearray)):
+            raw = bytes(raw_or_native)
+        else:
+            raw = bytes(getattr(raw_or_native, "data", b"") or b"")
+        return dispatch_text(raw, format=fmt, source_sha512=sha)
+
+
 #: File extension used when naming the spooled input per parser.
 _EXT: dict[str, str] = {
     "txt": "txt",

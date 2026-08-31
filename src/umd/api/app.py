@@ -59,6 +59,7 @@ from umd.observability.logging import StructuredLogger
 from umd.projections.base import ReplayDriver
 from umd.projections.checkpoint import ProjectionCheckpointStore
 from umd.projections.current import CurrentTierOneBuilder
+from umd.projections.edges import ActiveSemanticEdgeProjectionBuilder
 from umd.projections.query import QueryService
 from umd.projections.question import QuestionService
 from umd.projections.search import SearchProjectionBuilder, SearchService
@@ -81,6 +82,7 @@ from umd.storage.postgres.stage_repository import JobRunAudit, StageRunRepositor
 
 _PROJECTION_QUERY = "current_tier1"
 _PROJECTION_SEARCH = "search"
+_PROJECTION_EDGES = "semantic_edges"
 
 
 def engine_from_settings(settings: Settings) -> sa.Engine:
@@ -163,6 +165,7 @@ def build_context(
         builders={
             "current_tier1": CurrentTierOneBuilder(),
             "search": SearchProjectionBuilder(),
+            "semantic_edges": ActiveSemanticEdgeProjectionBuilder(),
         },
         providers=providers,
         sandbox=SubprocessSandboxRunner(),
@@ -204,6 +207,7 @@ def build_context(
 
     query_guard = ConsistencyGuard(ProjectionFreshness(engine, _PROJECTION_QUERY), settings)
     search_guard = ConsistencyGuard(ProjectionFreshness(engine, _PROJECTION_SEARCH), settings)
+    edge_guard = ConsistencyGuard(ProjectionFreshness(engine, _PROJECTION_EDGES), settings)
 
     limiter = TokenBucketRateLimiter(settings.rate_limit)
     rate_guard = RateLimitGuard(limiter)
@@ -230,6 +234,7 @@ def build_context(
     )
     ctx.extra["query_guard"] = query_guard
     ctx.extra["search_guard"] = search_guard
+    ctx.extra["edge_guard"] = edge_guard
     ctx.extra["rate_guard"] = rate_guard
     ctx.extra["job_store"] = job_store
     ctx.extra["work_registry"] = work_registry

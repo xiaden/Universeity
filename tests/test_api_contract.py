@@ -18,6 +18,7 @@ import base64
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import sqlalchemy as sa
@@ -31,6 +32,8 @@ from umd.domain.models import Evidence
 from umd.projections.base import ReplayDriver
 from umd.projections.checkpoint import ProjectionCheckpoint, ProjectionCheckpointStore
 from umd.projections.current import CurrentTierOneBuilder
+from umd.projections.edges import ActiveSemanticEdgeProjectionBuilder
+from umd.projections.query import QueryService
 from umd.projections.search import SearchProjectionBuilder
 from umd.resolution.mentions import MentionService, PostgresMentionRepository
 from umd.storage.postgres.ledger import SemanticLedger
@@ -50,9 +53,31 @@ def _tail(engine: sa.Engine) -> int:
 
 
 def _build(engine: sa.Engine, *, force_search_resume: bool = True) -> None:
-    """Replay-build both Tier-1 projections (current_tier1 + search) to the tail."""
+    """Replay-build every Tier-1 projection (current_tier1 + edges + search) to the tail.
+
+    P5-S1: the search projection now reconciles BOTH the ``edge:%`` and ``assert:%``
+    document families from the ACTIVE edge store on finalize (the immutable assertion
+    stream is no longer a search-doc source for utterances), so the semantic_edges
+    projection must be built BEFORE search for utterance/edge terms to be searchable.
+    """
     store = ProjectionCheckpointStore(engine)
     ReplayDriver(engine, store).run(CurrentTierOneBuilder(), wipe=True)
+    ReplayDriver(engine, store).run(ActiveSemanticEdgeProjectionBuilder(), wipe=True)
+    ReplayDriver(engine, store).run(
+        SearchProjectionBuilder(), wipe=True, force_resume=force_search_resume
+    )
+
+
+def _build_all(engine: sa.Engine, *, force_search_resume: bool = True) -> None:
+    """Replay-build every Tier-1 projection including the semantic_edges store.
+
+    The edge store is built BEFORE the search projection: the search builder's
+    ``finalize`` reads the active edge store (P2-S4) so relationship-edge search hits
+    are indexed from the freshly-replayed active edges.
+    """
+    store = ProjectionCheckpointStore(engine)
+    ReplayDriver(engine, store).run(CurrentTierOneBuilder(), wipe=True)
+    ReplayDriver(engine, store).run(ActiveSemanticEdgeProjectionBuilder(), wipe=True)
     ReplayDriver(engine, store).run(
         SearchProjectionBuilder(), wipe=True, force_resume=force_search_resume
     )
@@ -1202,3 +1227,1024 @@ def test_release_factory_never_constructs_test_doubles(umd_db, source_store) -> 
     assert not isinstance(runner, DurableDAGRunner)
     assert not isinstance(runner, SynchronousRunner)
     assert ctx.extra.get("production_wired") is True
+
+
+# ---------------------------------------------------------------------------
+# P3-S4: public relationship-edge surface (structured query, search, question)
+# ---------------------------------------------------------------------------
+
+
+def _seed_entities(client) -> None:
+    for ref, label in (("e:hero", "Sherlock"), ("e:villain", "Moriarty")):
+        r = client.post("/v1/entities", json={"ref": ref, "label": label}, headers=W)
+        assert r.status_code == 201, r.text
+
+
+def test_public_relationship_edges_query_returns_active_edges_with_provenance(api_ctx) -> None:
+    """P3-S4: the PUBLIC structured query answers RELATIONSHIP_EDGES with every
+    active edge plus provenance — via /v1/query/structured over real Postgres."""
+    client, engine = api_ctx.client, api_ctx.engine
+    content = "The quick brown fox jumps over the lazy dog."
+    assert (
+        client.post(
+            "/v1/sources", json={"media_kind": "txt", "content": content}, headers=W
+        ).status_code
+        == 201
+    )
+    _seed_entities(client)
+    for obj in ("The game is afoot, Watson", "The game is afoot, Watson again"):
+        assert (
+            client.post(
+                "/v1/claims",
+                json={
+                    "predicate_code": "SPEAKS",
+                    "subject_ref": "e:hero",
+                    "object_ref": obj,
+                    "confidence": 0.8,
+                },
+                headers=W,
+            ).status_code
+            == 201
+        )
+    token = _tail(engine)
+    _build_all(engine)
+
+    rq = client.post(
+        "/v1/query/structured",
+        json={
+            "kind": "RELATIONSHIP_EDGES",
+            "filters": {"subject": "e:hero", "predicate": "SPEAKS"},
+            "consistency_token": token,
+        },
+        headers=R,
+    )
+    assert rq.status_code == 200, rq.text
+    page = rq.json()
+    assert page["total"] == 2  # multi-edge: both utterances active
+    assert {h["value"] for h in page["results"]} == {
+        "The game is afoot, Watson",
+        "The game is afoot, Watson again",
+    }
+    for h in page["results"]:
+        assert h["capabilities"]["edge"] is True
+        assert h["provenance"]["fact_id"]
+        assert h["provenance"]["state"]
+        assert h["provenance"]["seq"] >= 1
+        assert h["confidence"] is not None
+    assert page["bound_report"]["bounded"] is True
+    assert page["freshness"]["status"] == "fresh"
+    assert page["freshness"]["applied_seq"] >= token
+
+
+def test_public_relationship_edges_no_stale_after_override(api_ctx) -> None:
+    """P3-S4: after an operator override the public relationship read never serves
+    the stale superseded edge — only the new active edge is returned."""
+    client, engine = api_ctx.client, api_ctx.engine
+    content = "The quick brown fox jumps over the lazy dog."
+    assert (
+        client.post(
+            "/v1/sources", json={"media_kind": "txt", "content": content}, headers=W
+        ).status_code
+        == 201
+    )
+    _seed_entities(client)
+    assert (
+        client.post(
+            "/v1/claims",
+            json={
+                "predicate_code": "SPEAKS",
+                "subject_ref": "e:hero",
+                "object_ref": "original line",
+                "confidence": 0.8,
+            },
+            headers=W,
+        ).status_code
+        == 201
+    )
+    _build_all(engine)
+    r1 = client.post(
+        "/v1/query/structured",
+        json={
+            "kind": "RELATIONSHIP_EDGES",
+            "filters": {"subject": "e:hero", "predicate": "SPEAKS"},
+        },
+        headers=R,
+    ).json()
+    assert {h["value"] for h in r1["results"]} == {"original line"}
+
+    # Operator override supersedes the machine edge.
+    assert (
+        client.post(
+            "/v1/claims/e:hero/override",
+            json={
+                "predicate_code": "SPEAKS",
+                "object_ref": "corrected line",
+                "reason": "correction",
+            },
+            headers=W,
+        ).status_code
+        == 200
+    )
+    _build_all(engine)
+    r2 = client.post(
+        "/v1/query/structured",
+        json={
+            "kind": "RELATIONSHIP_EDGES",
+            "filters": {"subject": "e:hero", "predicate": "SPEAKS"},
+        },
+        headers=R,
+    ).json()
+    assert {h["value"] for h in r2["results"]} == {"corrected line"}
+    assert "original line" not in {h["value"] for h in r2["results"]}
+
+
+def test_public_relationship_edges_bounded_pagination(api_ctx) -> None:
+    """P3-S4: the public relationship read honors bounded depth/pagination and
+    never leaks superseded edges into the active page."""
+    client, engine = api_ctx.client, api_ctx.engine
+    content = "The quick brown fox jumps over the lazy dog."
+    assert (
+        client.post(
+            "/v1/sources", json={"media_kind": "txt", "content": content}, headers=W
+        ).status_code
+        == 201
+    )
+    _seed_entities(client)
+    for i in range(4):
+        assert (
+            client.post(
+                "/v1/claims",
+                json={
+                    "predicate_code": "SPEAKS",
+                    "subject_ref": "e:hero",
+                    "object_ref": f"line {i}",
+                    "confidence": 0.8,
+                },
+                headers=W,
+            ).status_code
+            == 201
+        )
+    _build_all(engine)
+
+    def page(offset: int) -> dict:
+        return client.post(
+            "/v1/query/structured",
+            json={
+                "kind": "RELATIONSHIP_EDGES",
+                "filters": {"subject": "e:hero", "predicate": "SPEAKS"},
+                "limit": 2,
+                "offset": offset,
+            },
+            headers=R,
+        ).json()
+
+    p0, p1, p2 = page(0), page(2), page(4)
+    assert p0["total"] == 4
+    assert len(p0["results"]) == 2 and len(p1["results"]) == 2 and len(p2["results"]) == 0
+    values = {h["value"] for h in p0["results"]} | {h["value"] for h in p1["results"]}
+    assert values == {"line 0", "line 1", "line 2", "line 3"}
+
+
+def test_search_surfaces_relationship_edge_results_gap(api_ctx) -> None:
+    """P3-S4: search surfaces active relationship edges as result-kind-labelled hits.
+
+    A relationship edge (HAS_EMOTION) whose object text appears nowhere in the source
+    content is retrievable by search because SearchProjectionBuilder indexes the active
+    edge store (non-utterance predicates) as INTERPRETATION hits carrying an ``edge``
+    capability, so the relationship object term is searchable with provenance.
+    """
+    client, engine = api_ctx.client, api_ctx.engine
+    content = "The quick brown fox jumps over the lazy dog."
+    assert (
+        client.post(
+            "/v1/sources", json={"media_kind": "txt", "content": content}, headers=W
+        ).status_code
+        == 201
+    )
+    _seed_entities(client)
+    # A non-utterance relationship edge with a distinctive object term.
+    assert (
+        client.post(
+            "/v1/claims",
+            json={
+                "predicate_code": "HAS_EMOTION",
+                "subject_ref": "e:hero",
+                "object_ref": "hopeful-dawn",
+                "confidence": 0.6,
+            },
+            headers=W,
+        ).status_code
+        == 201
+    )
+    _build_all(engine)
+
+    rs = client.post("/v1/search", json={"query": "hopeful-dawn", "mode": "exact"}, headers=R)
+    assert rs.status_code == 200, rs.text
+    body = rs.json()
+    assert body["total"] >= 1, (
+        "search did not surface the active HAS_EMOTION relationship edge "
+        "(SearchService must return relationship-edge results per plan P2-S4/P3-S4)"
+    )
+    assert any(
+        "edge" in (h.get("capabilities") or {}) or h["kind"] == "INTERPRETATION"
+        for h in body["hits"]
+    )
+
+
+def test_semantic_question_draws_on_active_edges_gap(api_ctx) -> None:
+    """P3-S4: a semantic question about a relationship is answered from the ACTIVE
+    relationship edges. QuestionService compiles the relationship question to the
+    RELATIONSHIP_EDGES typed op (never unstructured-only RAG) and returns the CO_OCCURS
+    active edge as a provenance-bearing answer item.
+    """
+    client, engine = api_ctx.client, api_ctx.engine
+    content = "The quick brown fox jumps over the lazy dog."
+    assert (
+        client.post(
+            "/v1/sources", json={"media_kind": "txt", "content": content}, headers=W
+        ).status_code
+        == 201
+    )
+    _seed_entities(client)
+    assert (
+        client.post(
+            "/v1/claims",
+            json={
+                "predicate_code": "CO_OCCURS",
+                "subject_ref": "e:hero",
+                "object_ref": "e:villain",
+                "confidence": 0.6,
+            },
+            headers=W,
+        ).status_code
+        == 201
+    )
+    _build_all(engine)
+
+    rs = client.post(
+        "/v1/query/semantic",
+        json={"question": "what is the relationship between e:hero and e:villain"},
+        headers=R,
+    )
+    assert rs.status_code == 200, rs.text
+    sab = rs.json()
+    assert "RELATIONSHIP_EDGES" in sab["compiled_ops"], (
+        "semantic question did not compile to a RELATIONSHIP_EDGES read; "
+        "QuestionService must answer relationship questions from active edges "
+        "(per plan P2-S4/P3-S4)"
+    )
+    assert any(
+        item.get("predicate") == "CO_OCCURS" and item.get("value") == "e:villain"
+        for item in sab["answer"]
+    ), "answer must draw on the active CO_OCCURS edge"
+
+
+def test_edge_derived_reads_gate_on_edge_guard(api_ctx) -> None:
+    """P4-S1: RELATIONSHIP_EDGES structured reads and relationship semantic questions are
+    gated on the ``semantic_edges`` ``edge_guard`` (not only the scalar ``query_guard``).
+
+    When ``current_tier1`` is fresh but the edge store trails the token, a token-bearing
+    edge read 503s (``transient-lag``) while a non-edge read served by ``query_guard``
+    passes — the edge-derived read must not be served from a lagging edge store.
+    """
+    client, engine = api_ctx.client, api_ctx.engine
+
+    assert (
+        client.post(
+            "/v1/claims",
+            json={
+                "predicate_code": "HAS_EMOTION",
+                "subject_ref": "e:hero",
+                "object_ref": "term-one",
+                "confidence": 0.6,
+            },
+            headers=W,
+        ).status_code
+        == 201
+    )
+    _build_all(engine)
+
+    # A second assertion advances the ledger.
+    assert (
+        client.post(
+            "/v1/claims",
+            json={
+                "predicate_code": "HAS_EMOTION",
+                "subject_ref": "e:villain",
+                "object_ref": "term-two",
+                "confidence": 0.6,
+            },
+            headers=W,
+        ).status_code
+        == 201
+    )
+    # Catch current_tier1 up to the tail but leave semantic_edges + search lagging.
+    store = ProjectionCheckpointStore(engine)
+    ReplayDriver(engine, store).run(CurrentTierOneBuilder(), wipe=False)
+    token = _tail(engine)  # ledger seq current_tier1 has reached; edges have not.
+
+    # Non-edge read gated on query_guard (current_tier1 fresh) passes with the token.
+    r = client.post(
+        "/v1/query/structured",
+        json={"kind": "ENTITY", "filters": {"ref": "e:hero"}, "consistency_token": token},
+        headers=R,
+    )
+    assert r.status_code == 200, r.text
+
+    # Edge-derived structured read gated on edge_guard (edges lagging) -> 503 transient-lag.
+    r = client.post(
+        "/v1/query/structured",
+        json={
+            "kind": "RELATIONSHIP_EDGES",
+            "filters": {"subject": "e:hero"},
+            "consistency_token": token,
+        },
+        headers=R,
+    )
+    assert r.status_code == 503, r.text
+    assert r.json()["x-consistency"] == "transient-lag"
+
+    # Relationship semantic question gated on edge_guard -> 503 transient-lag.
+    r = client.post(
+        "/v1/query/semantic",
+        json={
+            "question": "what is the relationship between e:hero and e:villain",
+            "consistency_token": token,
+        },
+        headers=R,
+    )
+    assert r.status_code == 503, r.text
+    assert r.json()["x-consistency"] == "transient-lag"
+
+
+def test_public_search_no_stale_utterance_after_override(api_ctx) -> None:
+    """P5-S2: the public ``/v1/search`` surface returns ZERO hits for a superseded
+    SPEAKS utterance and >=1 for the corrected value (search_guard-gated), so a stale
+    post-correction utterance is never served — while token-bearing RELATIONSHIP_EDGES
+    reads for SPEAKS remain ``edge_guard``-gated (never the scalar query_guard).
+    """
+    client, engine = api_ctx.client, api_ctx.engine
+    content = "The quick brown fox jumps over the lazy dog."
+    assert (
+        client.post(
+            "/v1/sources", json={"media_kind": "txt", "content": content}, headers=W
+        ).status_code
+        == 201
+    )
+    _seed_entities(client)
+    assert (
+        client.post(
+            "/v1/claims",
+            json={
+                "predicate_code": "SPEAKS",
+                "subject_ref": "e:hero",
+                "object_ref": "stale-line",
+                "confidence": 0.8,
+            },
+            headers=W,
+        ).status_code
+        == 201
+    )
+    _build_all(engine)
+    rs = client.post("/v1/search", json={"query": "stale-line", "mode": "exact"}, headers=R)
+    assert rs.status_code == 200, rs.text
+    assert rs.json()["total"] >= 1
+
+    # Operator override supersedes the SPEAKS utterance on the active edge store.
+    assert (
+        client.post(
+            "/v1/claims/e:hero/override",
+            json={
+                "predicate_code": "SPEAKS",
+                "object_ref": "corrected-line",
+                "reason": "correction",
+            },
+            headers=W,
+        ).status_code
+        == 200
+    )
+    _build_all(engine)
+
+    # The public search surface returns ZERO for the superseded utterance text and
+    # >=1 for the corrected value, carrying search_guard-gated freshness.
+    rs_stale = client.post("/v1/search", json={"query": "stale-line", "mode": "exact"}, headers=R)
+    assert rs_stale.status_code == 200, rs_stale.text
+    assert rs_stale.json()["total"] == 0, (
+        "stale superseded utterance remained searchable after override"
+    )
+    rs_new = client.post("/v1/search", json={"query": "corrected-line", "mode": "exact"}, headers=R)
+    assert rs_new.status_code == 200, rs_new.text
+    assert rs_new.json()["total"] >= 1
+    assert rs_new.json()["freshness"] is not None
+    # The corrected hit is the INTERPRETATION ``assert:{fact_id}`` doc (not stale source
+    # evidence), indexed from the active edge store.
+    assert any(h["kind"] == "INTERPRETATION" for h in rs_new.json()["hits"])
+
+
+def test_speaks_edge_reads_gate_on_edge_guard(api_ctx) -> None:
+    """P5-S2: SPEAKS is an utterance predicate that lives on the active edge store too,
+    so token-bearing RELATIONSHIP_EDGES reads for SPEAKS gate on ``edge_guard`` (not only
+    the scalar ``query_guard``). When current_tier1 is fresh but semantic_edges trails,
+    a token-bearing SPEAKS RELATIONSHIP_EDGES read 503s transient-lag.
+    """
+    client, engine = api_ctx.client, api_ctx.engine
+    assert (
+        client.post(
+            "/v1/claims",
+            json={
+                "predicate_code": "SPEAKS",
+                "subject_ref": "e:hero",
+                "object_ref": "utter-one",
+                "confidence": 0.8,
+            },
+            headers=W,
+        ).status_code
+        == 201
+    )
+    _build_all(engine)
+
+    # A second SPEAKS assertion advances the ledger.
+    assert (
+        client.post(
+            "/v1/claims",
+            json={
+                "predicate_code": "SPEAKS",
+                "subject_ref": "e:villain",
+                "object_ref": "utter-two",
+                "confidence": 0.8,
+            },
+            headers=W,
+        ).status_code
+        == 201
+    )
+    # Catch current_tier1 up to the tail but leave semantic_edges + search lagging.
+    store = ProjectionCheckpointStore(engine)
+    ReplayDriver(engine, store).run(CurrentTierOneBuilder(), wipe=False)
+    token = _tail(engine)  # ledger seq current_tier1 has reached; edges have not.
+
+    # Non-edge read gated on query_guard passes with the token.
+    r = client.post(
+        "/v1/query/structured",
+        json={"kind": "ENTITY", "filters": {"ref": "e:hero"}, "consistency_token": token},
+        headers=R,
+    )
+    assert r.status_code == 200, r.text
+
+    # SPEAKS RELATIONSHIP_EDGES read gated on edge_guard (edges lagging) -> 503.
+    r = client.post(
+        "/v1/query/structured",
+        json={
+            "kind": "RELATIONSHIP_EDGES",
+            "filters": {"subject": "e:hero", "predicate": "SPEAKS"},
+            "consistency_token": token,
+        },
+        headers=R,
+    )
+    assert r.status_code == 503, r.text
+    assert r.json()["x-consistency"] == "transient-lag"
+
+
+# ---------------------------------------------------------------------------
+# P3-S2: 'The Lantern Keeper' book fixture through the PUBLIC HTTP boundary —
+# deterministic reads + provider-seam aliases/traits with honest gating.
+# ---------------------------------------------------------------------------
+
+
+def test_phase3_book_http_public_reads_deterministic(api_ctx) -> None:
+    """Ingest the book fixture through public HTTP, poll durable job state, then
+    read scenes/utterances/relationship-edges/evidence via public query routes.
+
+    >=3 distinct characters are proven via the relationship-edge subjects (Mara,
+    Ellis, Orin deterministically PRESENT_IN/MENTIONED_IN); the narrator's
+    non-confirmed (ambiguous) statement is never promoted to an authoritative /
+    conflicting claim; search for character/trait/relationship text honestly
+    returns 0 (deterministic semantic refs are content-hash UUIDs — a documented
+    production gap, never fabricated).
+    """
+    from fixtures import semantic_book_bytes
+
+    client, engine = api_ctx.client, api_ctx.engine
+
+    r = client.post(
+        "/v1/sources",
+        files={"file": ("lantern.txt", semantic_book_bytes("txt"), "text/plain")},
+        data={"media_kind": "txt"},
+        headers=W,
+    )
+    assert r.status_code == 201, r.text
+    sid = r.json()["source_id"]
+    job_id = f"job-{sid[:12]}"
+    status = "running"
+    for _ in range(40):
+        rj = client.get(f"/v1/jobs/{job_id}", headers=R)
+        status = rj.json()["status"]
+        if status in ("complete", "failed", "cancelled"):
+            break
+    assert status == "complete", f"book job did not reach complete (got {status})"
+    _build_all(engine)  # API never writes projection stores; rebuild like the suite does
+
+    # -- scenes: >=2 chapters + >=2 sections -> >=3 structural SCENE hits (txt)
+    sc = client.post(
+        "/v1/query/structured", json={"kind": "SCENE", "filters": {"source_id": sid}}, headers=R
+    )
+    assert sc.status_code == 200, sc.text
+    assert sc.json()["total"] >= 3, "expected >=3 structural scenes from the 2-chapter book"
+
+    # -- utterances: SPEAKS attribution is deterministically asserted
+    ut = client.post("/v1/query/structured", json={"kind": "UTTERANCE", "limit": 50}, headers=R)
+    assert ut.status_code == 200, ut.text
+    assert ut.json()["total"] >= 1, "no SPEAKS utterance surfaced via public route"
+    assert any(h["predicate"] == "SPEAKS" for h in ut.json()["results"])
+
+    # -- >=3 distinct characters via relationship-edge subjects (public reads)
+    re_ = client.post(
+        "/v1/query/structured", json={"kind": "RELATIONSHIP_EDGES", "limit": 100}, headers=R
+    )
+    assert re_.status_code == 200, re_.text
+    assert re_.json()["total"] >= 1
+    char_subjects = {
+        h["ref"] for h in re_.json()["results"] if h["predicate"] in ("MENTIONED_IN", "PRESENT_IN")
+    }
+    assert len(char_subjects) >= 3, (
+        "expected >=3 distinct characters deterministically present (Mara/Ellis/Orin)"
+    )
+
+    # -- evidence with locators + provenance via public route
+    ev = client.post(
+        "/v1/query/structured",
+        json={"kind": "EVIDENCE", "filters": {"source_id": sid}, "limit": 100},
+        headers=R,
+    )
+    assert ev.status_code == 200, ev.text
+    ev_hits = ev.json()["results"]
+    assert ev.json()["total"] >= 1
+    # evidence is retrieved with locators + provenance (source_id anchor + locator).
+    # Normalize UUID dashes: the ingest `sid` is non-dashed hex, the DB round-trip
+    # provenance source_id is dashed — same id, different string form.
+    assert any(
+        (h.get("provenance", {}).get("source_id") or "").replace("-", "") == sid
+        and h.get("provenance", {}).get("locator")
+        for h in ev_hits
+    )
+
+    # -- ambiguous (narrator-never-confirmed) statement is NOT authoritative:
+    #    no CONFLICTING / CONFIRMED claim is reachable. Deterministic reconciliation
+    #    never asserts the watchtower-light claim (it stays narration text_span).
+    co = client.post("/v1/query/structured", json={"kind": "CONTRADICTIONS"}, headers=R)
+    assert co.status_code == 200, co.text
+    assert co.json()["total"] == 0, "ambiguous fact must not surface as a contradiction"
+
+    # -- POSITIVE assertion (QA R1): the ambiguous watchtower-light fact IS present
+    #    as a narration text_span EVIDENCE row (locator + source provenance) but is
+    #    NEVER promoted by a SemanticAsserted ledger event. Deterministic
+    #    reconciliation never asserts the light as authoritative — the statement is
+    #    evidence (narrator-never-confirmed narration), not a promoted fact.
+    #    (a) a narration evidence row corresponds to the watchtower statement.
+    wt = client.post(
+        "/v1/query/structured",
+        json={"kind": "EVIDENCE", "filters": {"source_id": sid}, "limit": 200},
+        headers=R,
+    )
+    assert wt.status_code == 200, wt.text
+    assert any(
+        h.get("predicate") == "text_span"  # EVIDENCE hits expose kind in ``predicate``
+        and h.get("provenance", {}).get("locator")
+        and (h.get("provenance", {}).get("source_id") or "").replace("-", "") == sid
+        for h in wt.json()["results"]
+    ), "watchtower narration must surface as evidence with locator + provenance"
+    # (b) no SemanticAsserted ledger event for this source promotes the claim.
+    _evt_wt = db_meta.tables["semantic_event"]
+    _evid_wt = db_meta.tables["evidence"]
+    with engine.connect() as conn:
+        wt_span = conn.execute(
+            sa.select(_evid_wt.c.locator, _evid_wt.c.source_id).where(
+                _evid_wt.c.source_id == str(uuid.UUID(sid)),
+                _evid_wt.c.evidence_kind == "text_span",
+                _evid_wt.c.quality["text"].astext.contains("whether it had been real"),
+            )
+        ).first()
+        assert wt_span is not None and wt_span.locator, (
+            "watchtower narration text_span evidence must be persisted (locator + source)"
+        )
+        promoted = (
+            conn.execute(
+                sa.select(_evt_wt.c.seq).where(
+                    _evt_wt.c.event_type == "SemanticAsserted",
+                    _evt_wt.c.correlation_id
+                    == str(uuid.uuid5(uuid.NAMESPACE_URL, f"umd-job:{job_id}")),
+                    sa.or_(
+                        _evt_wt.c.payload["subject_ref"].astext.contains("light"),
+                        _evt_wt.c.payload["object_ref"].astext.contains("light"),
+                        _evt_wt.c.payload["predicate_code"].astext.contains("light"),
+                    ),
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert not promoted, "no SemanticAsserted event may promote the watchtower-light claim"
+
+    # -- search for character/trait/relationship text: honest deterministic result.
+    #    Deterministic semantic refs are content-hash UUIDs (no display names) and
+    #    trait/alias observations are not produced, so these searches return 0.
+    for term in ("Mara", "siblings", "moss-green"):
+        rs = client.post(
+            "/v1/search", json={"query": term, "mode": "exact", "source_id": sid}, headers=R
+        )
+        assert rs.status_code == 200, rs.text
+        assert rs.json()["total"] == 0, f"search '{term}' must be 0 deterministically"
+
+
+def test_phase3_book_provider_aliases_and_traits_through_production_seam(
+    umd_db: sa.Engine, source_store
+) -> None:
+    """Register a test SemanticProvider into the production runtime (the SAME seam
+    ``build_context`` wires) and prove the provider-backed analyzer runs through the
+    real production stage, committing alias + trait observations as durable evidence
+    with provider provenance. Phase 3 lockstep: the provider observations now flow
+    through the ``_reconciliation_input`` seam, so the provider aliases/traits are
+    POSITIVELY retrievable through the public read surfaces (relationship edges +
+    search) — while the canonical-entity surface (ENTITY) honestly stays empty
+    because this fixture emits no ``EntityResolved`` events (provider aliases surface
+    as KNOWN_AS/ALIAS_OF edges, never fabricated canonical rows).
+    """
+    from fixtures import semantic_book_bytes
+    from semantic_parity_oracle import FakeSemanticProvider
+
+    app = create_app(
+        engine=umd_db, source_store=source_store, settings=_client_settings(), runner="hermetic"
+    )
+    ctx = app.state.ctx
+    composer = ctx.extra["work_registry"]["STRUCTURAL_ANALYSIS"].__self__
+    fake = FakeSemanticProvider()
+    composer._runtime.providers.register(fake)
+    ctx.settings.semantic.provider = "fake_semantic"
+    ctx.settings.semantic.model = "qwen-test"
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/sources",
+            files={"file": ("lantern.txt", semantic_book_bytes("txt"), "text/plain")},
+            data={"media_kind": "txt"},
+            headers=W,
+        )
+        assert r.status_code == 201, r.text
+        sid = r.json()["source_id"]
+        job_id = f"job-{sid[:12]}"
+        status = "running"
+        for _ in range(40):
+            rj = client.get(f"/v1/jobs/{job_id}", headers=R)
+            status = rj.json()["status"]
+            if status in ("complete", "failed", "cancelled"):
+                break
+        assert status == "complete", f"provider book job did not reach complete (got {status})"
+
+    # provider genuinely invoked through the production seam (real model request)
+    assert fake.calls, "fake semantic provider was never invoked"
+    assert fake.calls[0].input_refs, "provider call must be anchored to input locators"
+
+    # provider observations committed as durable evidence with provider provenance
+    with umd_db.connect() as c:
+        rows = c.execute(
+            sa.text(
+                "SELECT locator, tool_versions, quality FROM evidence "
+                "WHERE source_id=:s AND quality->>'kind'='semantic_observations'"
+            ),
+            {"s": sid},
+        ).fetchall()
+    assert rows, "no provider semantic-observation evidence committed"
+    tv = rows[0][1]
+    assert tv.get("provider") == "fake_semantic"  # provider provenance on evidence
+    obs = rows[0][2]["observations"]
+    assert obs, "provider observations must carry at least one observation"
+    gb = obs[0]["generated_by"]
+    assert gb.get("path") == "provider" and gb.get("provider") == "fake_semantic"
+
+    # the model-call record carries the provider's alias + trait output: >=2
+    # aliases (Moss->Mara, the apprentice->Mara, the cartographer->Ellis, the
+    # warden->Orin) and >=2 traits (moss-green eyes, grey beard).
+    aliases: set[tuple[str, str]] = set()
+    traits: set[tuple[str, str]] = set()
+    with umd_db.connect() as c:
+        mrows = c.execute(
+            sa.text(
+                "SELECT quality FROM evidence WHERE source_id=:s "
+                "AND evidence_kind='metadata' AND tool_versions ? 'provider'"
+            ),
+            {"s": sid},
+        ).fetchall()
+    for (qq,) in mrows:
+        out = qq.get("output") or {}
+        for a in out.get("aliases", []):
+            aliases.add((a["alias"], a["canonical_name"]))
+        for t in out.get("traits", []):
+            traits.add((t["entity"], t["trait"]))
+    assert len(aliases) >= 2, f"provider aliases missing (got {sorted(aliases)})"
+    assert len(traits) >= 2, f"provider traits missing (got {sorted(traits)})"
+
+    # Phase 3 lockstep: provider observations now flow through the seam. Rebuild the
+    # Tier-1 projections via the sanctioned replay path so the provider-backed
+    # assertions are positively visible through the public read surfaces.
+    _build_all(umd_db)
+
+    with TestClient(app) as client:
+        # POSITIVE: provider aliases/traits are retrievable as relationship edges.
+        re_ = client.post(
+            "/v1/query/structured",
+            json={"kind": "RELATIONSHIP_EDGES", "limit": 200},
+            headers=R,
+        )
+        assert re_.status_code == 200, re_.text
+        by_pred: dict[str, set[str]] = {}
+        for h in re_.json()["results"]:
+            by_pred.setdefault(h["predicate"], set()).add(h["value"])
+        assert "the apprentice" in by_pred.get("KNOWN_AS", set()), (
+            "provider alias must now be visible as a KNOWN_AS edge"
+        )
+        assert "moss-green eyes" in by_pred.get("HAS_TRAIT", set()), (
+            "provider trait must now be visible as a HAS_TRAIT edge"
+        )
+        assert "ALIAS_OF" in by_pred
+
+        # ENTITY stays honestly empty: the book fixture emits no EntityResolved
+        # events, so current_state has no CANONICAL_ENTITY rows. This is honest
+        # non-promotion (never a fabricated pass) — the provider aliases surface as
+        # KNOWN_AS/ALIAS_OF edges asserted above.
+        ent = client.post("/v1/query/structured", json={"kind": "ENTITY", "limit": 50}, headers=R)
+        assert ent.status_code == 200, ent.text
+        assert ent.json()["total"] == 0, (
+            "no EntityResolved events -> no CANONICAL_ENTITY rows (honest non-promotion)"
+        )
+
+        # POSITIVE search: the provider edge docs are indexed with the display text
+        # (ref=edge:<fact_id> => derived from the active edge store, not a fabricated
+        # source). They carry no source_id (content-addressable edge docs), so the
+        # search must be asserted WITHOUT the source filter; a source-scoped search
+        # honestly stays 0 because the edge docs are not source-scoped.
+        sr = client.post("/v1/search", json={"query": "apprentice", "mode": "exact"}, headers=R)
+        assert sr.status_code == 200, sr.text
+        assert sr.json()["total"] >= 1, "provider alias must now be searchable"
+        ahit = sr.json()["hits"][0]
+        assert ahit["kind"] == "INTERPRETATION" and ahit["label"] == "interpretation"
+        assert ahit["text"] == "the apprentice" and ahit["ref"].startswith("edge:"), ahit
+        mg = client.post("/v1/search", json={"query": "moss-green", "mode": "exact"}, headers=R)
+        assert mg.json()["total"] >= 1, "provider trait must now be searchable"
+        assert mg.json()["hits"][0]["text"] == "moss-green eyes"
+
+        # Honest non-promotion preserved: 'siblings' (unsupported predicate, stays
+        # evidence-only) and 'Mara' (canonical ref is content-hash, not display text)
+        # remain non-searchable.
+        for term in ("siblings", "Mara"):
+            r0 = client.post("/v1/search", json={"query": term, "mode": "exact"}, headers=R)
+            assert r0.status_code == 200, r0.text
+            assert r0.json()["total"] == 0, f"'{term}' must stay non-searchable (honest gap)"
+
+
+def _provider_book(umd_db, source_store, provider) -> tuple[Any, str, Any, Any]:
+    """Build the hermetic API app with ``provider`` registered into the production
+    runtime, ingest 'The Lantern Keeper', and run the full job to completion.
+    Returns ``(app, sid, provider, ctx)``."""
+    from fixtures import semantic_book_bytes
+
+    app = create_app(
+        engine=umd_db, source_store=source_store, settings=_client_settings(), runner="hermetic"
+    )
+    ctx = app.state.ctx
+    composer = ctx.extra["work_registry"]["STRUCTURAL_ANALYSIS"].__self__
+    composer._runtime.providers.register(provider)
+    ctx.settings.semantic.provider = provider.name
+    ctx.settings.semantic.model = "lantern-qwen"
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/sources",
+            files={"file": ("lantern.txt", semantic_book_bytes("txt"), "text/plain")},
+            data={"media_kind": "txt"},
+            headers=W,
+        )
+        assert r.status_code == 201, r.text
+        sid = r.json()["source_id"]
+        job_id = f"job-{sid[:12]}"
+        status = "running"
+        for _ in range(40):
+            rj = client.get(f"/v1/jobs/{job_id}", headers=R)
+            status = rj.json()["status"]
+            if status in ("complete", "failed", "cancelled"):
+                break
+        assert status == "complete", f"provider book job did not reach complete (got {status})"
+    return app, sid, provider, ctx
+
+
+# ---------------------------------------------------------------------------
+# P3-S4 — provider-backed answers through the public semantic-question surface
+# (QuestionService typed operations: relationship / entity / evidence).
+# ---------------------------------------------------------------------------
+
+
+def test_phase3_book_provider_semantic_questions_public_surface(
+    umd_db: sa.Engine, source_store
+) -> None:
+    from test_reconciliation_provider_promotion import _LanternProvider
+
+    provider = _LanternProvider()
+    app, sid, provider, ctx = _provider_book(umd_db, source_store, provider)
+    assert len(provider.calls) == 1, "provider must be invoked exactly once"
+    _build_all(umd_db)
+
+    with TestClient(app) as client:
+        # -- relationship question draws on the ACTIVE edge store (edge_guard gated).
+        re_ = client.post(
+            "/v1/query/structured",
+            json={"kind": "RELATIONSHIP_EDGES", "limit": 200},
+            headers=R,
+        )
+        assert re_.status_code == 200, re_.text
+        known = next(h for h in re_.json()["results"] if h["predicate"] == "KNOWN_AS")
+        subj, obj = known["ref"], known["value"]
+        rel_q = f"relationship between {subj} and {obj}"
+        assert ctx.question.requires_edge_guard(rel_q), "relationship question must use edge_guard"
+        q = client.post(
+            "/v1/query/semantic",
+            json={"question": rel_q, "constraints": {"limit": 20}},
+            headers=R,
+        )
+        assert q.status_code == 200, q.text
+        j = q.json()
+        assert j["compiled_ops"] == ["RELATIONSHIP_EDGES"]
+        assert len(j["answer"]) >= 1, "relationship question returned no provider-backed edge"
+        a = j["answer"][0]
+        assert a["predicate"] == "KNOWN_AS" and a["value"] == obj
+        assert a["confidence"] == known["confidence"], "provider confidence lost in question"
+        assert "SOURCE_EVIDENCE" in j["result_kind_labels"]
+
+        # -- entity question surfaces the provider alias via hybrid alternatives.
+        q2 = client.post(
+            "/v1/query/semantic",
+            json={"question": "who is the apprentice", "constraints": {"limit": 20}},
+            headers=R,
+        )
+        j2 = q2.json()
+        assert "SEARCH_HYBRID" in j2["compiled_ops"]
+        assert any(
+            alt["value"] == "the apprentice" and alt["kind"] == "INTERPRETATION"
+            for alt in j2["alternatives"]
+        ), "provider alias must surface as a hybrid alternative"
+
+        # -- evidence question is bounded and result-kind labelled.
+        q3 = client.post(
+            "/v1/query/semantic",
+            json={"question": "evidence", "constraints": {"limit": 3}},
+            headers=R,
+        )
+        j3 = q3.json()
+        assert j3["compiled_ops"] == ["EVIDENCE"]
+        assert len(j3["answer"]) <= 3, "evidence question must be bounded by limit"
+        assert j3["answer"], "evidence question returned nothing"
+        assert all(a["kind"] == "SOURCE_EVIDENCE" for a in j3["answer"])
+
+
+# ---------------------------------------------------------------------------
+# P3-S5 — provider edge/search documents become visible ONLY after the existing
+# active-edge replay + search freshness gates; SearchProjectionBuilder is the sole
+# search writer; correction rebuilds remove stale provider documents.
+# ---------------------------------------------------------------------------
+
+
+def test_phase3_book_provider_search_after_replay_and_freshness_gates(
+    umd_db: sa.Engine, source_store
+) -> None:
+    from test_reconciliation_provider_promotion import _LanternProvider
+
+    provider = _LanternProvider()
+    app, sid, provider, ctx = _provider_book(umd_db, source_store, provider)
+
+    with TestClient(app) as client:
+        # BEFORE the search projection replay: no provider edge docs are searchable.
+        mg = client.post("/v1/search", json={"query": "moss-green", "mode": "exact"}, headers=R)
+        assert mg.status_code == 200, mg.text
+        assert mg.json()["total"] == 0, (
+            "provider docs must not be visible before the active-edge + search replay"
+        )
+    # The DAG/reconciliation wrote NO search docs directly (sole-writer invariant).
+    with umd_db.connect() as c:
+        assert int(c.execute(sa.text("SELECT count(*) FROM search_document")).scalar()) == 0, (
+            "reconciliation must not write search documents directly"
+        )
+
+    # Build the active-edge + search projections (the freshness gate).
+    _build_all(umd_db)
+    with TestClient(app) as client:
+        mg = client.post("/v1/search", json={"query": "moss-green", "mode": "exact"}, headers=R)
+        assert mg.json()["total"] >= 1
+        assert mg.json()["hits"][0]["text"] == "moss-green eyes"  # HAS_TRAIT display text
+        for term, text in (("apprentice", "the apprentice"), ("resolute", "resolute")):
+            r = client.post("/v1/search", json={"query": term, "mode": "exact"}, headers=R)
+            assert r.json()["total"] >= 1 and r.json()["hits"][0]["text"] == text, term
+        # fuzzy + hybrid modes also surface the provider edge documents.
+        for mode in ("fuzzy", "hybrid"):
+            fm = client.post("/v1/search", json={"query": "moss-green", "mode": mode}, headers=R)
+            assert fm.status_code == 200, fm.text
+            assert fm.json()["total"] >= 1, f"{mode} search missed the provider trait doc"
+            assert any(h["text"] == "moss-green eyes" for h in fm.json()["hits"]), (
+                f"{mode} search did not surface the HAS_TRAIT provider doc"
+            )
+
+    # SearchProjectionBuilder is the SOLE search writer: every doc kind is a builder
+    # output (edge:/assert: interpretations, source evidence, canonical entities).
+    with umd_db.connect() as c:
+        bad = c.execute(
+            sa.text(
+                "SELECT count(*) FROM search_document WHERE kind NOT IN "
+                "('INTERPRETATION','SOURCE_EVIDENCE','CANONICAL_ENTITY')"
+            )
+        ).scalar()
+    assert int(bad) == 0, "search_document holds a doc kind the builder never produces"
+
+    # Correction rebuild removes the stale provider trait document.
+    re_ = QueryService(umd_db).structured({"kind": "RELATIONSHIP_EDGES", "limit": 200})
+    trait = next(
+        h for h in re_.results if h.predicate == "HAS_TRAIT" and h.value == "moss-green eyes"
+    )
+    ctx.commands.record_correction(
+        subject_ref=trait.ref,
+        predicate="HAS_TRAIT",
+        object_ref="emerald eyes",
+        prior_ref="moss-green eyes",
+        actor="human",
+        reason="correction",
+    )
+    store = ProjectionCheckpointStore(umd_db)
+    ReplayDriver(umd_db, store).run(ActiveSemanticEdgeProjectionBuilder(), wipe=False)
+    ReplayDriver(umd_db, store).run(SearchProjectionBuilder(), wipe=False, force_resume=True)
+    with TestClient(app) as client:
+        stale = client.post("/v1/search", json={"query": "moss-green", "mode": "exact"}, headers=R)
+        assert stale.json()["total"] == 0, "correction rebuild must remove the stale provider doc"
+        fresh = client.post("/v1/search", json={"query": "emerald", "mode": "exact"}, headers=R)
+        assert fresh.json()["total"] >= 1, "correction rebuild must index the corrected doc"
+
+
+# ---------------------------------------------------------------------------
+# P3-S6 — evidence reads expose the original provider model-call + semantic-
+# observation evidence (exact locators, content-discriminated identity, warnings,
+# provenance) even when an observation is omitted from reconciliation; no public
+# surface invents a human-readable reference or presents model output as authority.
+# ---------------------------------------------------------------------------
+
+
+def test_phase3_book_provider_evidence_reads_expose_observations_and_provenance(
+    umd_db: sa.Engine, source_store
+) -> None:
+    from test_reconciliation_provider_promotion import _LanternProvider
+
+    provider = _LanternProvider()
+    app, sid, provider, ctx = _provider_book(umd_db, source_store, provider)
+    assert len(provider.calls) == 1
+
+    # Original provider model-call + semantic-observation evidence with provenance.
+    with umd_db.connect() as c:
+        rows = c.execute(
+            sa.text(
+                "SELECT locator, tool_versions, quality FROM evidence "
+                "WHERE source_id=:s AND quality->>'kind'='semantic_observations'"
+            ),
+            {"s": sid},
+        ).fetchall()
+    assert rows, "provider semantic-observation evidence missing"
+    locator, tv, quality = rows[0][0], rows[0][1], rows[0][2]
+    assert tv.get("provider") == provider.name
+    obs = quality["observations"]
+    # Every observation carries exact segment locators + provider generated_by.
+    for o in obs:
+        seg = (o.get("segment") or {}).get("locator")
+        assert seg and str(seg).startswith("chapter/"), "observation lost exact segment locator"
+        gb = o.get("generated_by") or {}
+        assert gb.get("provider") == provider.name and gb.get("path") == "provider"
+    # An observation OMITTED from reconciliation (unsupported SIBLING_OF) is still
+    # exposed as evidence — never fabricated into an assertion, never erased.
+    preds = {o.get("predicate") for o in obs if "predicate" in o}
+    assert "SIBLING_OF" in preds, "omitted-from-reconciliation observation must stay evidence"
+
+    # Public EVIDENCE read surfaces content-addressed refs + evidence_kind capability.
+    with TestClient(app) as client:
+        ev = client.post(
+            "/v1/query/structured",
+            json={"kind": "EVIDENCE", "filters": {"source_id": sid}, "limit": 200},
+            headers=R,
+        )
+        assert ev.status_code == 200, ev.text
+        j = ev.json()
+        assert j["total"] >= 1
+        # Content-discriminated identity: evidence refs are content-addressed UUIDs
+        # (never a human-readable "Mara said ..." reference invented by a surface).
+        refs = [h["ref"] for h in j["results"]]
+        assert all(len(str(r)) == 36 and str(r).count("-") == 4 for r in refs), refs[:5]
+        # The provider semantic-observation evidence is reachable by its EXACT
+        # content-addressed locator (never re-labeled or invented).
+        assert any(h.get("provenance", {}).get("locator") == locator for h in j["results"]), (
+            f"provider evidence locator {locator!r} not exposed by EVIDENCE read"
+        )
+        # No surface presents model output as authority: evidence is exposed as
+        # evidence (evidence_kind capability + SOURCE_EVIDENCE labelling), never as an
+        # authoritative semantic assertion.
+        assert any(h.get("capabilities", {}).get("evidence_kind") for h in j["results"]), (
+            "evidence read must expose evidence_kind, not model output as authority"
+        )

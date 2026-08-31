@@ -171,6 +171,7 @@ _UMD_APP_TABLES = (
     "predicate",
     "search_document",
     "projection_generation",
+    "active_semantic_edge",
 )
 
 

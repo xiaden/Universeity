@@ -37,6 +37,7 @@ from umd.domain.events import SemanticEvent
 from umd.projections.base import ReplayDriver
 from umd.projections.checkpoint import ProjectionCheckpointStore
 from umd.projections.current import CurrentTierOneBuilder, tier0_checksum
+from umd.projections.edges import ActiveSemanticEdgeProjectionBuilder
 from umd.projections.search import SearchProjectionBuilder
 from umd.projections.tables import projection_generation, search_document_in
 from umd.projections.vector import EmbeddingProjectionBuilder
@@ -293,6 +294,89 @@ def test_only_builders_write_projection_stores_ledger_path_writes_none(
     assert len(_sd_refs(umd_db)) >= 1
     with umd_db.connect() as conn:
         assert int(conn.execute(sa.select(sa.func.count()).select_from(_embed)).scalar() or 0) >= 1
+
+
+# ---------------------------------------------------------------------------
+# P3-S2: migration 0008 applies on real PostgreSQL; edges written only by builder
+# ---------------------------------------------------------------------------
+
+
+def test_migration_0008_active_semantic_edge_and_indexes_exist(umd_db: sa.Engine) -> None:
+    """P3-S2: migration 0008 applies on real PostgreSQL — the table and every
+    read-path index (multi-edge subject/predicate/active, plus subject/predicate/
+    active/scope/state) exist."""
+    with umd_db.connect() as conn:
+        table = conn.execute(
+            sa.text("SELECT to_regclass('public.active_semantic_edge') IS NOT NULL")
+        ).scalar()
+        assert table is True
+        idxs = {
+            str(r[0])
+            for r in conn.execute(
+                sa.text("SELECT indexname FROM pg_indexes WHERE tablename = 'active_semantic_edge'")
+            ).fetchall()
+        }
+    assert {
+        "pk_active_semantic_edge",
+        "ix_active_semantic_edge_subject_pred",
+        "ix_active_semantic_edge_subject",
+        "ix_active_semantic_edge_predicate",
+        "ix_active_semantic_edge_active",
+        "ix_active_semantic_edge_scope",
+        "ix_active_semantic_edge_state",
+    } <= idxs
+
+
+def test_active_semantic_edge_written_only_by_builder(umd_db: sa.Engine) -> None:
+    """P3-S2: no stage/API/ledger append path writes the edge store — active edges
+    appear only after the replay-built ActiveSemanticEdgeProjectionBuilder runs."""
+    source_id = insert_source(umd_db, media_kind="text")
+    seg = _make_segment(umd_db, source_id, "edge#1")
+    ledger = SemanticLedger(umd_db)
+    ledger.append(
+        [
+            _assertion("e:1", "utter:1"),
+            _assertion("e:2", "utter:2"),
+            _mention_with_segment(source_id, "Ownership mention", seg),
+        ]
+    )
+    with umd_db.connect() as conn:
+        assert (
+            int(conn.execute(sa.text("SELECT count(*) FROM active_semantic_edge")).scalar() or 0)
+            == 0
+        ), "append path must not write active_semantic_edge"
+
+    builder = ActiveSemanticEdgeProjectionBuilder()
+    ReplayDriver(umd_db, ProjectionCheckpointStore(umd_db)).run(builder, wipe=True)
+    with umd_db.connect() as conn:
+        n = int(conn.execute(sa.text("SELECT count(*) FROM active_semantic_edge")).scalar() or 0)
+    assert n >= 2, "edge builder must materialize the appended assertions as active edges"
+
+
+def test_edge_wipe_and_replay_is_deterministic(umd_db: sa.Engine) -> None:
+    """P3-S2: wiping and replaying the edge builder is deterministic — the same
+    active-edge fact set (fact_id, predicate, subject, object, active) is reproduced."""
+    ledger = SemanticLedger(umd_db)
+    ledger.append([_assertion("e:1", "utter:1"), _assertion("e:2", "utter:2")])
+
+    def snapshot() -> set[tuple[str, str, str, str, bool]]:
+        builder = ActiveSemanticEdgeProjectionBuilder()
+        ReplayDriver(umd_db, ProjectionCheckpointStore(umd_db)).run(builder, wipe=True)
+        with umd_db.connect() as conn:
+            rows = conn.execute(
+                sa.text(
+                    "SELECT fact_id, predicate, subject_ref, object_ref, active "
+                    "FROM active_semantic_edge ORDER BY fact_id"
+                )
+            ).fetchall()
+        return {
+            (str(r.fact_id), r.predicate, r.subject_ref, r.object_ref, bool(r.active)) for r in rows
+        }
+
+    first = snapshot()
+    second = snapshot()
+    assert first == second
+    assert len(first) >= 2
 
 
 # ---------------------------------------------------------------------------

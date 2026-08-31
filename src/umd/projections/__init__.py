@@ -19,6 +19,7 @@ from umd.projections.checkpoint import (
     ProjectionCheckpointStore,
 )
 from umd.projections.current import CurrentTierOneBuilder, tier0_checksum
+from umd.projections.edges import EDGE_PROJECTION_NAME, ActiveSemanticEdgeProjectionBuilder
 from umd.projections.embedder import embed_text
 from umd.projections.poison import PoisonDecision, PoisonOutcome, classify
 from umd.projections.publish import ProjectionGeneration, ProjectionPublishManager
@@ -52,6 +53,8 @@ __all__ = [
     "ProjectionCheckpointStore",
     "CurrentTierOneBuilder",
     "tier0_checksum",
+    "ActiveSemanticEdgeProjectionBuilder",
+    "EDGE_PROJECTION_NAME",
     "embed_text",
     "PoisonDecision",
     "PoisonOutcome",

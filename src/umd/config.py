@@ -128,6 +128,21 @@ class RasterSettings(BaseSettings):
     ocr_provider: str = "reference"
 
 
+class SemanticSettings(BaseSettings):
+    """Semantic text-analysis provider selection (Plan M P2).
+
+    ``reference`` is the deterministic default; a configured provider/model
+    activates the optional provider-backed semantic-analysis path. An
+    unavailable/unsupported/disabled/gated provider degrades honestly to the
+    deterministic/reference baseline with a warning — never a fabricated active
+    provider result (the analyzer boundary, :mod:`umd.analysis.semantic_analyzer`,
+    mirrors the OCR/ASR gate pattern).
+    """
+
+    provider: str = "reference"
+    model: str | None = None
+
+
 class ProjectionSettings(BaseSettings):
     """Tier-1 projection / blue-green / search / vector knobs (Phase 2)."""
 
@@ -159,6 +174,7 @@ class Settings(BaseSettings):
     ocfl: OcflSettings = Field(default_factory=OcflSettings)
     limits: LimitsSettings = Field(default_factory=LimitsSettings)
     raster: RasterSettings = Field(default_factory=RasterSettings)
+    semantic: SemanticSettings = Field(default_factory=SemanticSettings)
     projection: ProjectionSettings = Field(default_factory=ProjectionSettings)
     rebuild: RebuildSettings = Field(default_factory=RebuildSettings)
     api: ApiSettings = Field(default_factory=ApiSettings)

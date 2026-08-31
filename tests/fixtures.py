@@ -122,6 +122,44 @@ def epub_bytes(dialogue: bool = True) -> bytes:
     return buf.getvalue()
 
 
+def multi_chapter_epub_bytes() -> bytes:
+    """An EPUB with TWO spine chapters, each containing paragraphs (Plan L P3-S3
+    acceptance). Deterministic: identical bytes on every call, so segment IDs and
+    evidence identity are stable across reruns."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("mimetype", "application/epub+zip")
+        z.writestr(
+            "META-INF/container.xml",
+            '<?xml version="1.0"?><container version="1.0" '
+            'xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+            '<rootfiles><rootfile full-path="OEBPS/content.opf" '
+            'media-type="application/oebps-package+xml"/></rootfiles></container>',
+        )
+        z.writestr(
+            "OEBPS/content.opf",
+            '<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" '
+            'version="2.0" unique-identifier="uid"><metadata '
+            'xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Two Gardens</dc:title>'
+            "<dc:language>en</dc:language></metadata><manifest>"
+            '<item id="c1" href="chap1.xhtml" media-type="application/xhtml+xml"/>'
+            '<item id="c2" href="chap2.xhtml" media-type="application/xhtml+xml"/>'
+            '</manifest><spine><itemref idref="c1"/><itemref idref="c2"/></spine></package>',
+        )
+        z.writestr(
+            "OEBPS/chap1.xhtml",
+            _epub_xhtml(
+                "Chapter One",
+                ["Alice walked into the garden.", "She saw the White Rabbit."],
+            ),
+        )
+        z.writestr(
+            "OEBPS/chap2.xhtml",
+            _epub_xhtml("Chapter Two", ['"Hello," said Alice.', "She waved goodbye."]),
+        )
+    return buf.getvalue()
+
+
 def malformed_epub_bytes() -> bytes:
     """A ZIP that is not a valid EPUB (no mimetype/container) — deterministic."""
     buf = io.BytesIO()
@@ -732,3 +770,299 @@ def sandbox_violation_payload(kind: str) -> list[str]:
     if kind == "crash":
         return ["-c", "import os; os.abort()"]
     raise ValueError(f"unknown sandbox violation kind: {kind}")
+
+
+# ---------------------------------------------------------------------------
+# Phase P (Semantic Capability Plans L-Q) — realistic deterministic small book
+#
+# ONE generic, repository-owned small book used as the semantic oracle across
+# Plans L-Q. It is NOT a provider-specific golden database and ports no SQLite /
+# audiobook behavior. The same story is realized as TXT, Markdown, and EPUB so
+# Plan-L TextDispatch format parity can be asserted: identical inputs always
+# yield identical bytes, hashes, segment IDs, and evidence-identity material
+# ((source_id, locator, evidence_kind, config_digest)).
+# ---------------------------------------------------------------------------
+
+BOOK_TITLE = "The Lantern Keeper"
+
+# Canonical character -> aliases (>=3 characters, >=2 aliases; a nickname and a
+# title/role are used as alternate names for the same character).
+BOOK_CHARACTERS: dict[str, tuple[str, ...]] = {
+    "Mara": ("Moss", "the apprentice"),
+    "Ellis": ("the cartographer",),
+    "Orin": ("the warden",),
+}
+BOOK_ALIASES: tuple[str, ...] = tuple(a for aliases in BOOK_CHARACTERS.values() for a in aliases)
+
+# One relationship between characters (siblings).
+BOOK_RELATIONSHIPS: tuple[tuple[str, str, str], ...] = (("Mara", "Ellis", "siblings"),)
+
+# Descriptive trait(s) present in the text (appearance/description).
+BOOK_TRAITS: dict[str, str] = {
+    "Mara": "moss-green eyes",
+    "Orin": "grey beard",
+}
+
+# A claim stated by a character but never confirmed by the narrator; it must stay
+# resolvable as ambiguous / unresolved in later phases (never auto-promoted).
+BOOK_AMBIGUOUS_FACT = (
+    "Mara claims she saw a light burning in the watchtower window; the narrator "
+    "never confirms whether the light was real."
+)
+
+#: Chapter/scene/paragraph structure: (chapter_title, ((scene_title, (para, ...)), ...)).
+_BOOK_CHAPTERS: list[tuple[str, tuple[tuple[str, tuple[str, ...]], ...]]] = [
+    (
+        "Chapter 1: The Apprentice",
+        (
+            (
+                "At the Lamp Posts",
+                (
+                    "Mara lit the last lantern at the edge of the village. Mara was the "
+                    "apprentice to the village lantern-keeper, and her moss-green eyes "
+                    "were the same colour as the lichen on the fence posts. Her elder "
+                    "brother Ellis, the cartographer, stood a few paces behind her, "
+                    "unrolling a fresh map. Ellis knew the eastern road well.",
+                    '"The flame keeps slipping," Mara said.',
+                    'Ellis folded the map under his arm. "Hold the striker still, Moss," '
+                    "Ellis said. The nickname had stuck since her apprenticeship, and Moss "
+                    "answered to it without missing a beat.",
+                    "Mara knelt again, and the wick caught, burning clean and steady.",
+                ),
+            ),
+            (
+                "The Warden's House",
+                (
+                    "At the warden's house, Orin sat over his ledger, combing his grey "
+                    "beard. Orin did not look up when the two came in.",
+                    '"The eastern road is closed," Orin said. "A rockfall took the bridge."',
+                    'Ellis tapped the map. "Then I must chart the long way through the hills."',
+                    "Mara said nothing. She was thinking about the light she had seen in "
+                    "the watchtower, and whether it had been real.",
+                ),
+            ),
+        ),
+    ),
+    (
+        "Chapter 2: The Empty Tower",
+        (
+            (
+                "The Watchtower",
+                (
+                    "Before first light, Mara and Ellis climbed the hill to the empty "
+                    "watchtower, following the path she knew by heart.",
+                    "At the top the wind came through the broken windows, and far below "
+                    "the village lights were going out one by one.",
+                    '"I saw a light up here last night," Mara said. "Burning in the window."',
+                    "Ellis found no lamp and no candle. The window ledge was cold and bare.",
+                    'Ellis brushed the dust from his hands. "Nothing burned here, Moss."',
+                    "Mara said nothing at all.",
+                ),
+            ),
+        ),
+    ),
+]
+
+#: The formats the same book is realized in (Plan-L TextDispatch parity targets).
+BOOK_FORMATS: tuple[str, ...] = ("txt", "markdown", "epub")
+
+#: Semantic-input thresholds declared by the fixture (asserted by the determinism
+#: test): >=2 chapters, >=3 scenes, >=3 characters, >=2 aliases.
+BOOK_CHAPTER_COUNT = len(_BOOK_CHAPTERS)
+BOOK_SCENE_COUNT = sum(len(scenes) for _title, scenes in _BOOK_CHAPTERS)
+
+
+def semantic_book_scenes() -> list[tuple[int, str, tuple[str, ...]]]:
+    """``(1-based_chapter_index, scene_title, paragraphs)`` in reading order."""
+    out: list[tuple[int, str, tuple[str, ...]]] = []
+    for ci, (_chapter_title, scenes) in enumerate(_BOOK_CHAPTERS, start=1):
+        for scene_title, paras in scenes:
+            out.append((ci, scene_title, paras))
+    return out
+
+
+def _book_paragraphs() -> list[list[str]]:
+    """All paragraph text, grouped per chapter (in reading order)."""
+    return [[p for _scene, paras in scenes for p in paras] for _title, scenes in _BOOK_CHAPTERS]
+
+
+def semantic_book_txt() -> str:
+    """Plain-text realization of the book (chapter headers + blank-line paragraphs)."""
+    blocks: list[str] = []
+    for chapter_title, scenes in _BOOK_CHAPTERS:
+        blocks.append(chapter_title)
+        blocks.extend(p for _scene, scene_paras in scenes for p in scene_paras)
+    return "\n\n".join(blocks)
+
+
+def semantic_book_markdown() -> str:
+    """Markdown realization: H1 = chapter, H2 = scene, paragraphs underneath."""
+    lines: list[str] = []
+    for chapter_title, scenes in _BOOK_CHAPTERS:
+        lines.append(f"# {chapter_title}")
+        lines.append("")
+        for scene_title, paras in scenes:
+            lines.append(f"## {scene_title}")
+            lines.append("")
+            for p in paras:
+                lines.append(p)
+                lines.append("")
+    return "\n".join(lines).rstrip("\n")
+
+
+#: Fixed zip member timestamp so the EPUB archive's raw bytes are byte-for-byte
+#: deterministic (``zipfile.writestr`` defaults to the current wall-clock time,
+#: which would make the fixture non-reproducible). The zip epoch 1980-01-01.
+_BOOK_EPUB_MTIME = (1980, 1, 1, 0, 0, 0)
+
+
+def _book_epub_member(name: str, data: bytes) -> tuple[zipfile.ZipInfo, bytes]:
+    """A fixed-timestamp ``ZipInfo`` for one EPUB member (deterministic bytes)."""
+    info = zipfile.ZipInfo(name, date_time=_BOOK_EPUB_MTIME)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    return info, data
+
+
+def semantic_book_epub_bytes() -> bytes:
+    """EPUB realization (two spine chapters, stdlib zipfile — AGPL-avoidance path).
+
+    Deterministic: identical bytes on every call (fixed member date/time), so
+    hashes, segment IDs, and evidence identity are stable across runs.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr(*_book_epub_member("mimetype", "application/epub+zip"))
+        z.writestr(
+            *_book_epub_member(
+                "META-INF/container.xml",
+                '<?xml version="1.0"?><container version="1.0" '
+                'xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+                '<rootfiles><rootfile full-path="OEBPS/content.opf" '
+                'media-type="application/oebps-package+xml"/></rootfiles></container>',
+            )
+        )
+        n = len(_BOOK_CHAPTERS)
+        manifest = "".join(
+            f'<item id="c{i}" href="chap{i}.xhtml" media-type="application/xhtml+xml"/>'
+            for i in range(1, n + 1)
+        )
+        spine = "".join(f'<itemref idref="c{i}"/>' for i in range(1, n + 1))
+        z.writestr(
+            *_book_epub_member(
+                "OEBPS/content.opf",
+                '<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" '
+                'version="2.0" unique-identifier="uid"><metadata '
+                'xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>'
+                "The Lantern Keeper"
+                "</dc:title>"
+                "<dc:language>en</dc:language></metadata><manifest>"
+                f"{manifest}</manifest><spine>{spine}</spine></package>",
+            )
+        )
+        for i, (chapter_title, scenes) in enumerate(_BOOK_CHAPTERS, start=1):
+            paras = [p for _scene, scene_paras in scenes for p in scene_paras]
+            z.writestr(
+                *_book_epub_member(f"OEBPS/chap{i}.xhtml", _epub_xhtml(chapter_title, paras))
+            )
+    return buf.getvalue()
+
+
+def semantic_book_bytes(fmt: str) -> bytes:
+    """Raw bytes of the book in the requested format (deterministic)."""
+    if fmt == "txt":
+        return semantic_book_txt().encode("utf-8")
+    if fmt == "markdown":
+        return semantic_book_markdown().encode("utf-8")
+    if fmt == "epub":
+        return semantic_book_epub_bytes()
+    raise ValueError(f"unknown book format: {fmt!r}")
+
+
+#: Pinned expected sha512 (hex) of each format's raw fixture bytes. Generated once
+#: from the deterministic generators; the determinism test asserts recomputation
+#: matches these literals (a non-circular fixity pin).
+BOOK_SOURCE_SHA512: dict[str, str] = {
+    "txt": (
+        "cc4ea6d9bb43926e73157c0fce68d9650c31343ea74c9522d"
+        "6ec2757a31b048c0dec14510661a11052957446a06c6228a3"
+        "a15fac245a49a65d097b98a051054f"
+    ),
+    "markdown": (
+        "f4ae873b78c029ce685da05b9a78f51ff6391b8c2392b4bc0"
+        "9a8ab2ba063a326f31bb1abfbdf6c6d1bb400f617bf4974bb"
+        "99c4393276e3867b9cef210710bfad"
+    ),
+    "epub": (
+        "7fb5edb922e30f69274256260069d33bfabceea4d0c022826"
+        "a726ba493a7c1762f534ec25ae6ae21589e850f3396e1c960"
+        "c91d9a971566f05100aee4663273cc"
+    ),
+}
+
+#: Stable configuration digest used by later phases when deriving evidence-identity
+#: material ((source_id, locator, evidence_kind, config_digest)). Matches the
+#: production text-dispatch digest (``umd-dispatch@1``) so the fixture's expected
+#: identity tuples line up with what the pipeline will actually emit.
+BOOK_EVIDENCE_CONFIG_DIGEST: str = "umd-dispatch@1"
+
+
+#: Deterministic segment/locator expectations per format (document/chapter/section
+#: /paragraph), derived from the chapter/scene structure the generators emit.
+#:   * txt: one implicit section per chapter (segment_txt) + per-paragraph paths
+#:     under each chapter's section;
+#:   * markdown: H1 -> chapter, H2 -> section (scenes), paragraphs under chapters;
+#:   * epub: spine item -> chapter, blocks (h1 heading + <p>) -> paragraphs, no
+#:     section segments.
+BOOK_EXPECTED_CHAPTER_PATHS: tuple[str, ...] = ("document/1", "chapter/1", "chapter/2")
+BOOK_EXPECTED_SECTION_PATHS: dict[str, tuple[str, ...]] = {
+    "txt": ("chapter/1/section/1", "chapter/2/section/1"),
+    "markdown": ("chapter/1/section/1", "chapter/1/section/2", "chapter/2/section/1"),
+    "epub": (),
+}
+BOOK_EXPECTED_PARAGRAPHS: dict[str, int] = {
+    "txt": 15,  # 9 (ch1: heading-line quirk + 8) + 6
+    "markdown": 14,  # 4 + 4 + 6
+    "epub": 16,  # h1 heading counts as paragraph 1 of each chapter: 9 + 7
+}
+
+
+def semantic_book_structural_paths(fmt: str) -> tuple[str, ...]:
+    """Explicit expected structural locator paths for one format (document/
+    chapter/section/paragraph), used as the deterministic locator oracle."""
+    if fmt == "txt":
+        paths = ["document/1"]
+        for ci, chapter_paras in enumerate(_book_paragraphs(), start=1):
+            paths.append(f"chapter/{ci}")
+            paths.append(f"chapter/{ci}/section/1")
+            # Mirrors segment_txt via _chapter_boundaries: the FIRST "Chapter N"
+            # line is consumed into chapter 1's body (the boundary only triggers
+            # once a following chapter header is seen), so chapter 1 carries one
+            # extra paragraph — its own "Chapter 1: ..." heading line.
+            para_count = len(chapter_paras) + (1 if ci == 1 else 0)
+            paths.extend(
+                f"chapter/{ci}/section/1/paragraph/{pi}" for pi in range(1, para_count + 1)
+            )
+        return tuple(paths)
+    if fmt == "markdown":
+        # Mirrors segment_markdown: H1 -> chapter, H2 -> section, and a
+        # document-GLOBAL paragraph index under each chapter.
+        paths = ["document/1"]
+        para_idx = 0
+        for ci, (_chapter_title, scenes) in enumerate(_BOOK_CHAPTERS, start=1):
+            paths.append(f"chapter/{ci}")
+            for si, (_scene_title, paras) in enumerate(scenes, start=1):
+                paths.append(f"chapter/{ci}/section/{si}")
+                for _p in paras:
+                    para_idx += 1
+                    paths.append(f"chapter/{ci}/paragraph/{para_idx}")
+        return tuple(paths)
+    if fmt == "epub":
+        paths = ["document/1"]
+        for ci, (_chapter_title, scenes) in enumerate(_BOOK_CHAPTERS, start=1):
+            paras = [p for _scene, scene_paras in scenes for p in scene_paras]
+            paths.append(f"chapter/{ci}")
+            paths.extend(
+                f"chapter/{ci}/paragraph/{pi}" for pi in range(1, len(paras) + 2)
+            )  # +1 for the h1 heading block
+        return tuple(paths)
+    raise ValueError(f"unknown book format: {fmt!r}")

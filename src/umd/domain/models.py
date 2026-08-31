@@ -168,6 +168,22 @@ def is_known_predicate(code: str) -> bool:
     return code in PREDICATE_VOCABULARY
 
 
+# Reconciliation-era additions (Plan O P1-S1). These are data entries registered
+# eagerly so the generic vocabulary covers the reconciled observation surface
+# (identity/alias, mentions, utterance membership, traits, relationships,
+# emotion/state/context and scene structure) without a schema migration. They are
+# plain vocabulary rows — not consumer-specific schemas — and feed the predicate
+# table via the idempotent materialization seed on first use.
+register_predicate("MENTIONED_IN", "An entity is mentioned in a segment.")
+register_predicate("UTTERED_IN", "An utterance is spoken within a scene/segment.")
+register_predicate("HAS_TRAIT", "An entity has a descriptive trait.")
+register_predicate("CO_OCCURS", "Two entities co-occur in a shared segment/context.")
+register_predicate("HAS_EMOTION", "An entity exhibits an emotion.")
+register_predicate("IN_STATE", "An entity is in a narrative state.")
+register_predicate("HAS_CONTEXT", "A scene/segment has a context/environment observation.")
+register_predicate("STARTS_AT", "A scene starts at a source segment.")
+
+
 class Predicate(BaseModel):
     """A predicate-dictionary entry (predicate table row)."""
 

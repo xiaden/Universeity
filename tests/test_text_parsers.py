@@ -15,12 +15,14 @@ from fixtures import (
     epub_bytes,
     malformed_epub_bytes,
     markdown_bytes,
+    multi_chapter_epub_bytes,
     pdf_image_only_bytes,
     pdf_text_bytes,
     txt_bytes,
 )
-from umd.extractors.epub import EpubParseError, extract_epub
-from umd.extractors.markdown import parse_markdown
+from umd.extractors.dispatch import TextDispatch, TextDispatchResult, dispatch_text
+from umd.extractors.epub import EpubDocument, EpubParseError, extract_epub
+from umd.extractors.markdown import MarkdownDocument, parse_markdown
 from umd.extractors.pdf import detect_pdf_text
 from umd.extractors.txt import normalize_txt
 
@@ -123,3 +125,107 @@ class TestPdf:
         p.write_bytes(pdf_text_bytes())
         r = detect_pdf_text(p)
         assert r.has_any_text
+
+
+class TestTextDispatch:
+    """Plan L P3-S1: the shared production text-dispatch result.
+
+    ``dispatch_text`` selects the format-appropriate parser (TXT→``normalize_txt``,
+    Markdown→``parse_markdown``, EPUB→``extract_epub``, PDF→the existing PDF path),
+    records provenance/status, and never surfaces raw binary as normalized text.
+    """
+
+    def test_result_shape_records_format_route_versions(self) -> None:
+        res = dispatch_text(txt_bytes(), format="txt", source_sha512="s" * 128)
+        assert isinstance(res, TextDispatchResult)
+        assert res.format == "txt"
+        assert res.parser == "txt"
+        assert res.route == "text"
+        assert not res.non_text and not res.degraded
+        assert res.text
+        assert res.parser_version == "umd-txt@1"
+        assert res.decoder_version == "umd-stdlib-decode@1"
+        assert res.config_digest == "umd-dispatch@1"
+        assert res.source_sha512 == "s" * 128
+
+    def test_txt_selects_normalize_txt(self) -> None:
+        res = dispatch_text(txt_bytes(), format="txt")
+        assert res.parser == "txt" and res.route == "text"
+        assert res.text.startswith("Chapter 1")
+
+    def test_markdown_selects_parse_markdown(self) -> None:
+        res = dispatch_text(markdown_bytes(), format="markdown")
+        assert res.parser == "markdown" and res.route == "text"
+        assert isinstance(res.document, MarkdownDocument)
+        assert any(b.kind == "heading" for b in res.document.blocks)
+        assert res.text  # flattened normalized prose
+
+    def test_epub_selects_extract_epub(self) -> None:
+        res = dispatch_text(epub_bytes(), format="epub")
+        assert res.parser == "epub" and res.route == "text"
+        assert isinstance(res.document, EpubDocument)
+        assert len(res.document.spine) == 1
+        assert res.text  # flattened spine paragraphs
+
+    def test_multi_chapter_epub_has_two_chapters(self) -> None:
+        res = dispatch_text(multi_chapter_epub_bytes(), format="epub")
+        assert res.parser == "epub" and res.route == "text"
+        assert len(res.document.spine) == 2
+        # each spine chapter carries paragraph segments
+        assert all(sp.paragraphs for sp in res.document.spine)
+
+    def test_pdf_text_uses_existing_pdf_path(self) -> None:
+        res = dispatch_text(pdf_text_bytes(), format="pdf")
+        assert res.parser == "pdf" and res.route == "text"
+        assert "Hello from the text layer" in res.text
+
+    def test_image_only_pdf_routes_to_raster_not_text(self) -> None:
+        res = dispatch_text(pdf_image_only_bytes(), format="pdf")
+        assert res.route == "image_raster"
+        assert res.non_text is True
+        assert res.text == ""  # binary page bytes never normalized as text
+
+    def test_malformed_epub_is_degraded_and_safe(self) -> None:
+        res = dispatch_text(malformed_epub_bytes(), format="epub")
+        assert res.route == "degraded"
+        assert res.degraded is True and res.non_text is True
+        assert res.text == ""
+        assert res.document is None
+        assert any("epub parse failed" in w for w in res.warnings)
+
+    def test_unknown_format_keeps_plain_text_baseline_with_warning(self) -> None:
+        res = dispatch_text(txt_bytes(), format="bogus")
+        assert res.parser == "txt" and res.route == "text"
+        assert any("unsupported/unknown text format" in w for w in res.warnings)
+
+    def test_deterministic_rerun_same_result(self) -> None:
+        raw = markdown_bytes()
+        a = dispatch_text(raw, format="markdown", source_sha512="d" * 128)
+        b = dispatch_text(raw, format="markdown", source_sha512="d" * 128)
+        assert (
+            a.format,
+            a.parser,
+            a.route,
+            a.text,
+            a.parser_version,
+            a.decoder_version,
+            a.config_digest,
+            a.source_sha512,
+        ) == (
+            b.format,
+            b.parser,
+            b.route,
+            b.text,
+            b.parser_version,
+            b.decoder_version,
+            b.config_digest,
+            b.source_sha512,
+        )
+        assert a.document.to_dict() == b.document.to_dict()
+
+    def test_text_dispatch_contract_adapter(self) -> None:
+        # CONTRACTS.md:74 TextDispatch.dispatch(source, raw_or_native) adapter.
+        res = TextDispatch.dispatch({"format": "txt", "sha512": "s" * 128}, txt_bytes())
+        assert isinstance(res, TextDispatchResult)
+        assert res.parser == "txt" and res.route == "text"
+        assert res.source_sha512 == "s" * 128

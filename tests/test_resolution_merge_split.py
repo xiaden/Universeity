@@ -220,3 +220,134 @@ def test_split_restoration_is_deterministic(umd_db):
     # Candidates are retained post-split: restoration not destructive to history.
     got = PostgresMentionRepository(umd_db).get(m1_id)
     assert got is not None and {c.entity_ref for c in got.candidates} == {ent_b, ent_c}
+
+
+# ---------------------------------------------------------------------------
+# Plan N Phase 3 (P3-S2) — contradiction (no cross-seed collapse), quarantine
+# tie retention, and lock/override precedence over machine resolution reruns.
+# ---------------------------------------------------------------------------
+
+
+def test_machine_rerun_never_collapses_two_existing_canonicals():
+    """Two mentions already seeded to DIFFERENT canonicals but strongly linked
+    are never merged by a machine rerun — the attempted cross-seed merge is
+    surfaced as a contradiction and both canonicals are preserved."""
+    import uuid
+
+    from umd.resolution.mentions import SourceMention
+    from umd.resolution.service import EntityResolutionService
+
+    m1 = SourceMention(
+        id=uuid.UUID("10000000-0000-0000-0000-000000000000"),
+        source_id="s",
+        entity_id="ent:A",
+        mention_text="Alex",
+        metadata_={"entity_type": "character"},
+        confidence=0.9,
+    )
+    m2 = SourceMention(
+        id=uuid.UUID("20000000-0000-0000-0000-000000000000"),
+        source_id="s",
+        entity_id="ent:B",
+        mention_text="Alex",
+        metadata_={"entity_type": "character"},
+        confidence=0.9,
+    )
+    batch = EntityResolutionService().resolve_mentions([m1, m2])
+
+    refs = {e.ref for e in batch.canonical_entities}
+    assert refs == {"ent:A", "ent:B"}  # both preserved, never collapsed
+    assert len(batch.contradictions) == 1  # surfaced, never silently merged
+    assert m1.mention_id in batch.assignments and m2.mention_id in batch.assignments
+
+
+def test_split_quarantines_ambiguous_tie_retaining_candidates(umd_db):
+    """A mention whose candidates TIE between two split targets is quarantined
+    (surfaced, never dropped) and its candidate set stays intact/reversible."""
+    source_id = insert_source(umd_db)
+    ent_a = insert_entity(umd_db, label="A")
+    ent_b = insert_entity(umd_db, label="B")
+    ent_c = insert_entity(umd_db, label="C")
+
+    svc = MentionService(
+        ledger=SemanticLedger(umd_db), repository=PostgresMentionRepository(umd_db)
+    )
+    m1 = mention(
+        source_id=source_id, entity_id=ent_a, text="Alex", candidates=[(ent_b, 0.9), (ent_c, 0.1)]
+    )
+    m2 = mention(
+        source_id=source_id, entity_id=ent_a, text="lex", candidates=[(ent_b, 0.5), (ent_c, 0.5)]
+    )
+    _, m1_id = svc.record(m1)
+    _, m2_id = svc.record(m2)
+
+    resolver = Resolver(
+        ledger=SemanticLedger(umd_db),
+        enumerator=PostgresSplitEnumerator(umd_db, PostgresMentionRepository(umd_db)),
+        mentions=PostgresMentionRepository(umd_db),
+        engine=umd_db,
+        quarantine=quarantine_fn(umd_db),
+    )
+    outcome = resolver.split(entity=ent_a, targets=[ent_b, ent_c], reason="restore B/C")
+
+    # Decisive mention is assigned; the TIED mention is quarantined, never guessed.
+    assert outcome.plan.assignments[m1_id] == ent_b
+    assert m2_id in outcome.plan.quarantined_refs
+    assert m2_id in _quarantined(umd_db)
+    # Quarantine never deletes the candidate set (reversible, append-only history).
+    got = PostgresMentionRepository(umd_db).get(m2_id)
+    assert got is not None and {c.entity_ref for c in got.candidates} == {ent_b, ent_c}
+
+
+def test_user_override_and_lock_outrank_machine_resolution():
+    """Human confirmation outranks machine reruns: a USER_OVERRIDE on an alias
+    survives a later machine EntityResolved, and a locked entity rejects every
+    later machine change (precedence enforced by the shared reducer)."""
+    from umd.domain.events import SemanticEvent
+    from umd.storage.postgres.reducer import (
+        USER_OVERRIDE,
+        CurrentReducedState,
+        CurrentStateReducer,
+    )
+
+    def resolved(seq: int, entity: str, canonical: str) -> SemanticEvent:
+        return SemanticEvent(
+            event_type="EntityResolved",
+            seq=seq,
+            authority="machine",
+            payload={"kind": "ALIAS", "entity_id": entity, "target_entity_id": canonical},
+        )
+
+    r = CurrentStateReducer()
+    st = CurrentReducedState()
+
+    # 1. A machine alias decision is folded.
+    r.reduce(st, resolved(1, "alias:x", "canon:1"))
+    assert st.rows[("alias:x", "CANONICAL_ENTITY")].object_ref == "canon:1"
+
+    # 2. A human override pins alias:x -> canon:2.
+    r.reduce(
+        st,
+        SemanticEvent(
+            event_type="OverrideApplied",
+            seq=2,
+            authority=USER_OVERRIDE,
+            payload={
+                "subject_ref": "alias:x",
+                "predicate": "CANONICAL_ENTITY",
+                "object_ref": "canon:2",
+            },
+        ),
+    )
+    row = st.rows[("alias:x", "CANONICAL_ENTITY")]
+    assert row.object_ref == "canon:2"
+    assert row.authority == USER_OVERRIDE
+
+    # 3. A LATER machine rerun must NOT overwrite the human pin.
+    r.reduce(st, resolved(3, "alias:x", "canon:3"))
+    assert st.rows[("alias:x", "CANONICAL_ENTITY")].object_ref == "canon:2"
+
+    # 4. A locked entity rejects later machine resolution entirely.
+    r.reduce(st, SemanticEvent(event_type="Locked", seq=4, payload={"entity_ref": "alias:y"}))
+    r.reduce(st, resolved(5, "alias:y", "canon:9"))
+    assert ("alias:y", "CANONICAL_ENTITY") not in st.rows  # locked -> no change row

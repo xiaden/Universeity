@@ -23,6 +23,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from fixtures import raster_text_only_bytes
+from umd.analysis.semantic_analyzer import SemanticAnalysisInput
 from umd.audio import tone
 from umd.audio.availability import audio_capability_report, flatten_audio_capabilities
 from umd.audio.pipeline import run_audio_baseline
@@ -308,3 +309,59 @@ def test_recording_double_or_readiness_text_is_not_execution_evidence() -> None:
     assert probe.check().reachable is False
     # A bare object with no real admin surface is not evidence of a live engine.
     assert HatchetConnectivityProbe(client=object()).check().reachable is False
+
+
+# ---------------------------------------------------------------------------
+# Plan M P3-S2: a disabled/gated semantic provider is reported honestly
+# ---------------------------------------------------------------------------
+
+
+def _sem_input() -> SemanticAnalysisInput:
+    from umd.analysis.text_structural import ParagraphSegment
+
+    return SemanticAnalysisInput(
+        source_id="00000000-0000-4000-8000-000000000001",
+        segments=[
+            ParagraphSegment(
+                text="Alice spoke.",
+                paragraph_index=1,
+                chapter=1,
+                locator="chapter/1/paragraph/1",
+                structural_path="chapter/1/paragraph/1",
+            )
+        ],
+    )
+
+
+def test_disabled_semantic_provider_reported_honestly() -> None:
+    """A semantic provider that is unregistered/disabled degrades to the
+    deterministic/reference baseline with a truthful warning — never a
+    fabricated 'provider success' (same honesty as the audio/OCR gates)."""
+    from umd.analysis.semantic import SemanticPath
+    from umd.analysis.semantic_analyzer import SemanticTextAnalyzer
+    from umd.models import ProviderRegistry
+
+    analyzer = SemanticTextAnalyzer(ProviderRegistry(), provider="ollama", model="qwen")
+    result = analyzer.analyze(_sem_input())
+    # retained baseline is deterministic/reference, never a provider claim
+    assert result.generated_by.path == SemanticPath.DETERMINISTIC
+    joined = "\n".join(result.warnings)
+    assert any(word in joined for word in ("unavailable", "unsupported", "disabled")), (
+        "configured-but-unavailable semantic provider must be reported honestly"
+    )
+    assert "provider success" not in joined.lower()
+    # deterministic baseline observations retained
+    assert result.dialogue_spans
+
+
+def test_semantic_analyzer_never_reports_active_without_real_provider() -> None:
+    """A configured semantic provider with no reachable adapter is never
+    reported as 'active' — its result stays on the deterministic path (P3-S2)."""
+    from umd.analysis.semantic import SemanticPath
+    from umd.analysis.semantic_analyzer import SemanticTextAnalyzer
+    from umd.models import ProviderRegistry
+
+    analyzer = SemanticTextAnalyzer(ProviderRegistry(), provider="vllm", model="qwen")
+    result = analyzer.analyze(_sem_input())
+    assert result.generated_by.path == SemanticPath.DETERMINISTIC
+    assert any("vllm" in w for w in result.warnings)
