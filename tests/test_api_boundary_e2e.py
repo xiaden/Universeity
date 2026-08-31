@@ -679,6 +679,14 @@ def _dashless(uuid_like: str) -> str:
     return uuid_like.replace("-", "")
 
 
+def _dashed(uuid_like: str) -> str:
+    """Normalize a 32-hex id (as returned by POST /v1/sources) to dashed UUID form,
+    which is the format the membership filters expect (Plan T P2-S1)."""
+    return (
+        f"{uuid_like[:8]}-{uuid_like[8:12]}-{uuid_like[12:16]}-{uuid_like[16:20]}-{uuid_like[20:]}"
+    )
+
+
 def _memb(source_ids: list[str] | None) -> set[str]:
     return {_dashless(s) for s in (source_ids or [])}
 
@@ -782,8 +790,11 @@ def test_boundary_identity_abc_full_dag(api_ctx: ApiCtx) -> None:
     _assert_metadata_contract(mara_a[0], context="entity-mara-a")
 
     # Bounded scoped reads return only the right canonicals per source (R4).
+    # source_id filters expect DASHED UUID form (stored membership source_ids are
+    # dashed); POST /v1/sources returns dashless, so normalize (same convention the
+    # hermetic test_http_public_identity_abc follows).
     for sid, expected in ((sa_id, mara_a[0]), (sc_id, mara_c[0])):
-        scoped = _entities(client, source_id=sid)
+        scoped = _entities(client, source_id=_dashed(sid))
         mara_here = [i for i in scoped if (i.get("display_label") or i["label"]) == "Mara"]
         assert len(mara_here) == 1, (sid, mara_here)
         assert mara_here[0]["ref"] == expected["ref"]
@@ -791,7 +802,7 @@ def test_boundary_identity_abc_full_dag(api_ctx: ApiCtx) -> None:
 
     # Scoped reads also surface the correct source-local John, never the other.
     for sid, expected in ((sa_id, john_a[0]), (sb_id, john_b[0])):
-        scoped = _entities(client, source_id=sid)
+        scoped = _entities(client, source_id=_dashed(sid))
         john_here = [i for i in scoped if (i.get("display_label") or i["label"]) == "John"]
         assert len(john_here) == 1, (sid, john_here)
         assert john_here[0]["ref"] == expected["ref"]
