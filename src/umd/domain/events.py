@@ -191,9 +191,26 @@ def _upcast_semantic_asserted_1_to_2(payload: dict[str, Any]) -> dict[str, Any]:
     return widened
 
 
+def _upcast_entity_resolved_1_to_2(payload: dict[str, Any]) -> dict[str, Any]:
+    """v1 -> v2: v2 adds additive canonical-identity metadata fields (Plan S
+    P1-S3). The pure upcaster supplies neutral defaults so retained v1 rows
+    (MERGE/SPLIT/ALIAS) replay unchanged as v2; nothing historical is mutated."""
+    widened = dict(payload)
+    widened.setdefault("canonical_type", None)
+    widened.setdefault("display_label", None)
+    widened.setdefault("aliases", [])
+    widened.setdefault("support_refs", [])
+    widened.setdefault("memberships", {})
+    widened.setdefault("state", None)
+    widened.setdefault("confidence", None)
+    return widened
+
+
 UPCASTERS: dict[tuple[str, int], Upcaster] = {
     # SemanticAsserted v1 -> v2 (pure upcaster, no I/O).
     ("SemanticAsserted", 1): _upcast_semantic_asserted_1_to_2,
+    # EntityResolved v1 -> v2 (Plan S P1-S3): additive canonical-identity metadata.
+    ("EntityResolved", 1): _upcast_entity_resolved_1_to_2,
 }
 
 

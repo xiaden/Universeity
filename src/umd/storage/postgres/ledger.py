@@ -405,7 +405,12 @@ class SemanticLedger:
     def _load_affected_state(
         self, conn: sa.Connection, events: list[SemanticEvent]
     ) -> CurrentReducedState:
-        from umd.storage.postgres.reducer import LOCK_PREDICATE, entity_ref_of, event_target
+        from umd.storage.postgres.reducer import (
+            LOCK_PREDICATE,
+            entity_ref_of,
+            event_target,
+            identity_event_target,
+        )
 
         state = CurrentReducedState()
         refs: set[str] = set()
@@ -417,6 +422,11 @@ class SemanticLedger:
             tgt = event_target(ev)
             if tgt and tgt[1] != "*":
                 targets.add(tgt)
+            # Plan S (P1-S4): load the durable canonical-identity metadata row so
+            # the inline Tier-0 fold merges (LWW) rather than clobbering it.
+            idtgt = identity_event_target(ev)
+            if idtgt:
+                targets.add(idtgt)
         # Lock markers per involved entity (indexed prefix) -> lock map + rows.
         if refs:
             lock_rows = conn.execute(

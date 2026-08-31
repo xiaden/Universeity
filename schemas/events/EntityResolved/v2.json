@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/events/EntityResolved/v2.json",
+  "title": "EntityResolved",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "entity_id"
+  ],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": [
+        "MERGE",
+        "SPLIT",
+        "ALIAS",
+        "ESTABLISH",
+        "UPDATE"
+      ]
+    },
+    "entity_id": {
+      "type": "string"
+    },
+    "target_entity_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "assignments": {
+      "type": "object"
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "quarantined_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "canonical_type": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "display_label": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "aliases": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "support_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "memberships": {
+      "type": "object",
+      "properties": {
+        "work_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "continuity_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "state": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "confidence": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

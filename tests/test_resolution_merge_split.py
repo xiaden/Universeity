@@ -351,3 +351,57 @@ def test_user_override_and_lock_outrank_machine_resolution():
     r.reduce(st, SemanticEvent(event_type="Locked", seq=4, payload={"entity_ref": "alias:y"}))
     r.reduce(st, resolved(5, "alias:y", "canon:9"))
     assert ("alias:y", "CANONICAL_ENTITY") not in st.rows  # locked -> no change row
+
+
+def test_merge_is_log_record_not_identity_delete_and_replay_deterministic():
+    """Plan S P1-S6: a merge of accepted canonicals is a log record, not a delete —
+    the established identity metadata rows are neither removed nor rewritten, and
+    replay of the same stream is deterministic."""
+    from umd.domain.events import SemanticEvent
+    from umd.resolution.resolution import resolved_event
+    from umd.storage.postgres.reducer import (
+        CANONICAL_IDENTITY_PREDICATE,
+        CurrentReducedState,
+        CurrentStateReducer,
+    )
+
+    def establish(canonical: str, seq: int, label: str) -> SemanticEvent:
+        return resolved_event(
+            kind="ESTABLISH", entity_id=canonical, target_entity_id=canonical, display_label=label
+        ).model_copy(update={"seq": seq})
+
+    events = [
+        establish("canon:1", 1, "Alice"),
+        establish("canon:2", 2, "Bob"),
+        SemanticEvent(
+            event_type="EntityResolved",
+            seq=3,
+            authority="machine",
+            payload={
+                "kind": "MERGE",
+                "entity_id": "canon:1",
+                "target_entity_id": "canon:2",
+                "refs": ["canon:2"],
+                "assignments": {"canon:2": "canon:1"},
+            },
+        ),
+    ]
+
+    r = CurrentStateReducer()
+    st = CurrentReducedState()
+    for ev in events:
+        r.reduce(st, ev)
+
+    # Merge is a log record, not a delete: both identity rows survive.
+    assert ("canon:1", CANONICAL_IDENTITY_PREDICATE) in st.rows
+    assert ("canon:2", CANONICAL_IDENTITY_PREDICATE) in st.rows
+    # The merged target keeps its display label; nothing was synthesized.
+    assert st.rows[("canon:1", CANONICAL_IDENTITY_PREDICATE)].object_ref is not None
+    assert st.rows[("canon:2", CANONICAL_IDENTITY_PREDICATE)].object_ref is not None
+
+    # Replaying the identical stream is deterministic.
+    st2 = CurrentStateReducer().replay(events)
+    assert st.rows.keys() == st2.rows.keys()
+    for k in st.rows:
+        assert st.rows[k].object_ref == st2.rows[k].object_ref
+        assert st.rows[k].seq == st2.rows[k].seq

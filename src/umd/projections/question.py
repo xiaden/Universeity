@@ -196,17 +196,32 @@ class QuestionService:
             )
         elif entity is not None:
             # who/what/describe/where + entity -> bounded ENTITY lookup.
+            # Plan S (P2-S4): a human-readable name/alias resolves to its canonical
+            # through the bounded query contract (exact display-label, then the alias
+            # surface) — never by fabricating an ID or treating an unregistered string
+            # as authority. An opaque ref (contains ':') is looked up directly.
             compiled_ops.append("ENTITY")
-            pages.append(
-                self._query.structured(
+            ref_like = ":" in entity
+            entity_filters: dict[str, Any] = {"ref": entity} if ref_like else {"name": entity}
+            page = self._query.structured(
+                StructuredQuery(
+                    kind="ENTITY",
+                    filters=entity_filters,
+                    confidence_min=c.confidence_min,
+                    limit=c.limit,
+                )
+            )
+            if not ref_like and not page.results:
+                # Fall back to the alias surface (e.g. a nickname resolves its canonical).
+                page = self._query.structured(
                     StructuredQuery(
                         kind="ENTITY",
-                        filters={"ref": entity},
+                        filters={"alias": entity},
                         confidence_min=c.confidence_min,
                         limit=c.limit,
                     )
                 )
-            )
+            pages.append(page)
             # Alternatives: resolve the entity name through hybrid search so the
             # answer can point at matching source evidence / interpretations too.
             if self._search is not None:

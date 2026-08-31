@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import re
+from collections.abc import Iterable
 
 #: URL-safe alphabet without padding, so the token is safe in every path position.
 _ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
@@ -38,6 +39,30 @@ def canonical_identity(sha512: str, work_id: str | None = None, kind: str = "sou
     if work_id:
         return f"{kind}:{work_id}:{sha512}"
     return f"{kind}:{sha512}"
+
+
+def canonical_entity_ref(member_ids: Iterable[str]) -> str:
+    """Deterministic, source-independent canonical ENTITY ref (Plan S P1-S2).
+
+    Replaces the old source-bound ``entity:canonical:<source_id>:<digest>`` form:
+    the returned ref carries NO source-bound prefix and no filename input. The
+    digest is derived solely from the *accepted identity anchor* — the sorted
+    member mention ids of the accepted canonical cluster:
+
+      * reruns over the same accepted cluster converge to the SAME ref;
+      * same-name text in different contexts yields distinct member ids and thus
+        distinct (separate or reviewable) identities — same-name text alone
+        never merges;
+      * the ref does not embed a source id, so sources are only joined through
+        explicit supported correspondence or human-confirmed identity evidence.
+
+    :param member_ids: the mention ids accepted as members of the canonical
+        cluster (the deterministic identity anchor for that scope).
+    """
+    members = sorted(set(str(m) for m in member_ids))
+    material = "\x1f".join(members)
+    digest = hashlib.sha256(material.encode()).hexdigest()[:16]
+    return f"entity:canonical:{digest}"
 
 
 def _norm_structural_path(path: str) -> str:

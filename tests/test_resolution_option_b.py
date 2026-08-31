@@ -417,3 +417,50 @@ def test_query_entities_alias_uuid_legacy_map_resolves_deduped(umd_db: sa.Engine
     )
     assert [h.value for h in page.results] == [canonical_eid]
     assert page.total == 1
+
+
+def test_production_resolution_establishes_durable_identity(umd_db: sa.Engine) -> None:
+    """Plan S P1-S1/P1-S6: production resolution establishes a durable, replayable
+    canonical identity (ESTABLISH event + CANONICAL_IDENTITY row) for each accepted
+    canonical, while keeping ``entity_mention.entity_id`` NULL (Option B)."""
+    from umd.storage.postgres.reducer import CANONICAL_IDENTITY_PREDICATE
+
+    composer, sid = _build_composer(umd_db)
+    _seed_cast(composer, sid)
+    outcome = composer._entity_resolution(make_manifest("ENTITY_RESOLUTION"))  # noqa: SLF001
+    refs = _canonical_refs_of(outcome)
+    assert len(refs) == 3
+
+    with umd_db.connect() as conn:
+        est = conn.execute(
+            sa.select(sa.func.count())
+            .select_from(_se)
+            .where(
+                (_se.c.event_type == "EntityResolved")
+                & (_se.c.payload["kind"].astext == "ESTABLISH")
+            )
+        ).scalar()
+        identity_rows = conn.execute(
+            sa.select(sa.func.count())
+            .select_from(_cs)
+            .where(_cs.c.predicate == CANONICAL_IDENTITY_PREDICATE)
+        ).scalar()
+        null_fks = conn.execute(
+            sa.select(sa.func.count()).select_from(_em).where(_em.c.entity_id.is_(None))
+        ).scalar()
+        total_mentions = conn.execute(sa.select(sa.func.count()).select_from(_em)).scalar()
+
+    assert int(est) == 3  # one ESTABLISH per accepted canonical
+    assert int(identity_rows) == 3  # identity metadata folds to Tier-0
+    assert int(null_fks) == int(total_mentions)  # no fabricated UUID FK
+
+    # Inline vs wipe-and-replay equivalence for the identity metadata.
+    from umd.projections.base import ReplayDriver
+    from umd.projections.checkpoint import ProjectionCheckpointStore
+    from umd.projections.current import CurrentTierOneBuilder, tier0_checksum
+
+    t0 = tier0_checksum(umd_db)
+    builder = CurrentTierOneBuilder()
+    res = ReplayDriver(umd_db, ProjectionCheckpointStore(umd_db)).run(builder, wipe=True)
+    assert res.fresh
+    assert builder.checksum(umd_db) == t0

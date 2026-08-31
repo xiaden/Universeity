@@ -143,3 +143,47 @@ def test_ambiguous_alias_stays_unresolved_and_reviewable():
     assert ASTRA not in {a.alias_ref for a in batch.alias_mappings}
     # A batch with an unresolved mention is surfaced as AMBIGUOUS, not confirmed.
     assert batch.state == ConfidenceState.AMBIGUOUS.value
+
+
+def test_accepted_canonicals_carry_full_identity_metadata():
+    """Plan S P1-S1/P1-S6: accepted canonicals carry the full first-class identity.
+
+    Opaque non-source-bound ref, type, display label, active aliases, exact
+    support refs, confidence/state, generated-by provenance, and
+    work/source/continuity memberships — with no synthetic alias entity.
+    """
+    batch = EntityResolutionService(resolve_floor=0.4).resolve_mentions(_book_mentions())
+    assert len(batch.canonical_entities) == 3
+    for e in batch.canonical_entities:
+        # Opaque ref: no source-bound prefix, no filename, deterministic hex tail.
+        tail = e.ref[len("entity:canonical:") :]
+        assert ":" not in tail, e.ref
+        assert "chapter" not in tail and "paragraph" not in tail, e.ref
+        assert e.entity_type == "character"
+        assert e.state in {ConfidenceState.PROBABLE.value, ConfidenceState.CONFIRMED.value}
+        assert e.generated_by.get("generator") == "EntityResolutionService"
+        assert e.generated_by.get("config_digest") == "umd-entity-resolution@1"
+        # Exact support/evidence refs == the member mention refs.
+        assert set(e.support_refs) == set(e.member_mention_ids)
+        # Work/source membership context (source_local; work/continuity empty here).
+        assert e.memberships["source_ids"] == ["src-book"]
+        assert e.memberships["work_ids"] == []
+        assert e.memberships["continuity_ids"] == []
+    # Active aliases are the distinct non-label surfaces; no synthetic alias entity.
+    by_label = {e.label: e for e in batch.canonical_entities}
+    assert by_label["Alice"].aliases == ["Al"]
+    assert by_label["Robert"].aliases == ["Bob"]
+    assert by_label["Carol"].aliases == ["Caro"]
+    # ESTABLISH commands route canonical-establishment identity metadata.
+    establish = [c for c in batch.commands if c.kind == "ESTABLISH"]
+    assert len(establish) == 3
+    for cmd in establish:
+        assert cmd.metadata["display_label"] in by_label
+        assert cmd.metadata["canonical_type"] == "character"
+        assert cmd.metadata["support_refs"]
+        assert set(cmd.metadata["memberships"].keys()) == {
+            "source_ids",
+            "work_ids",
+            "continuity_ids",
+        }
+        assert cmd.metadata["aliases"] == by_label[cmd.metadata["display_label"]].aliases

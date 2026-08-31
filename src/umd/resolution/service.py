@@ -41,9 +41,13 @@ Semantics
 
 Plan N canonical-reference representation (v1 — Option B, CONTRACTS.md:77):
   the canonical refs produced here are deterministic STRINGS
-  (``entity:canonical:<src>:<digest>`` or a reused seeded ref). They are carried
-  in the immutable ``EntityMentioned``/``EntityResolved`` ledger payloads and
-  reducer-backed ``current_state``. ``entity_mention.entity_id`` (a nullable
+  (``entity:canonical:<sha256-16hex>`` or a reused seeded ref). Per Plan S
+  P1-S2 the source-bound ``entity:canonical:<src>:<digest>`` form was replaced
+  by this source-agnostic deterministic format — the ref carries NO source
+  prefix, is stable for the accepted identity anchor/scope, and same-name text
+  alone never merges. The refs are carried in the immutable
+  ``EntityMentioned``/``EntityResolved`` ledger payloads and reducer-backed
+  ``current_state``. ``entity_mention.entity_id`` (a nullable
   UUID FK) stays NULL for these non-UUID refs; ``current_entity_map`` is written
   only when both refs are UUID-compatible (legacy UUID-backed paths). No
   entity-table writer, migration, relation entity, or topology/stage change is
@@ -54,15 +58,15 @@ Plan N canonical-reference representation (v1 — Option B, CONTRACTS.md:77):
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel, Field
 
+from umd.domain.ids import canonical_entity_ref
 from umd.domain.models import ConfidenceState
-from umd.resolution.candidates import CandidatePolicy, MentionBlockIndex
+from umd.resolution.candidates import CandidatePolicy, MentionBlockIndex, normalize_name
 from umd.resolution.mentions import SourceMention
 
 #: A candidate score above which a mention link is treated as a co-reference
@@ -77,8 +81,18 @@ _DEFAULT_RESOLVE_FLOOR = 0.5
 # ---------------------------------------------------------------------------
 
 
+def _empty_memberships() -> dict[str, list[str]]:
+    return {"source_ids": [], "work_ids": [], "continuity_ids": []}
+
+
 class CanonicalEntity(BaseModel):
-    """One resolved canonical entity (a distinct character/entity cluster)."""
+    """One resolved canonical entity (a distinct character/entity cluster).
+
+    Plan S (P1-S1): each accepted canonical carries an opaque deterministic
+    ref, canonical type, active display label, active aliases, member mention
+    refs, exact support/evidence refs, confidence/state, generated-by
+    provenance, and work/source/continuity membership context.
+    """
 
     ref: str
     label: str
@@ -88,6 +102,12 @@ class CanonicalEntity(BaseModel):
     confidence: float = 0.0
     state: str = ConfidenceState.PROBABLE.value
     support_refs: list[str] = Field(default_factory=list)
+    #: Active alias surface forms (the distinct non-label member surfaces).
+    aliases: list[str] = Field(default_factory=list)
+    #: Generated-by provenance of the accepted decision (analyzer/config/stage).
+    generated_by: dict[str, Any] = Field(default_factory=dict)
+    #: Work/source/continuity membership context of the canonical identity.
+    memberships: dict[str, list[str]] = Field(default_factory=_empty_memberships)
 
 
 class AliasMapping(BaseModel):
@@ -127,13 +147,16 @@ class ResolutionCommand(BaseModel):
     resolved ``SourceMention`` for ``MENTION`` commands.
     """
 
-    kind: str  # MENTION | ALIAS | MERGE
+    kind: str  # MENTION | ALIAS | MERGE | ESTABLISH
     entity_id: str
     target_entity_id: str | None = None
     refs: list[str] = Field(default_factory=list)
     assignments: dict[str, str] = Field(default_factory=dict)
     reason: str = ""
     mention: SourceMention | None = None
+    #: Canonical identity metadata for ``ESTABLISH`` commands (type, label,
+    #: aliases, support refs, memberships, state, confidence).
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ResolutionBatch(BaseModel):
@@ -152,11 +175,23 @@ class ResolutionBatch(BaseModel):
 
 
 class ResolutionInput(BaseModel):
-    """The ``input`` to :meth:`EntityResolutionService.resolve_mentions`."""
+    """The ``input`` to :meth:`EntityResolutionService.resolve_mentions`.
+
+    Plan S (P3-S1): carries the work/continuity scope the source belongs to so
+    the resolver can scope identity decisions to an explicit work/continuity
+    rather than merging same-name strings across unrelated sources. The memberships
+    mirror the ``SourceMembershipService`` context (work/source/continuity ids).
+    """
 
     source_id: str
     mentions: list[SourceMention] = Field(default_factory=list)
     generated_by: dict[str, Any] = Field(default_factory=dict)
+    #: Work scope of the source being resolved (explicit supported correspondence).
+    work_id: str | None = None
+    #: Continuity scope (a declared narrative continuity across works/sources).
+    continuity_id: str | None = None
+    #: Membership context carried from the source registry (source/work/continuity).
+    memberships: dict[str, list[str]] = Field(default_factory=_empty_memberships)
 
 
 # ---------------------------------------------------------------------------
@@ -243,16 +278,6 @@ class _UnionFind:
         )
 
 
-def _canonical_ref(source_id: str, member_ids: list[str]) -> str:
-    """Deterministic canonical ref for a NEW cluster.
-
-    Derived from the sorted member mention ids so a rerun over the same mentions
-    converges to the same ref; never a random uuid.
-    """
-    digest = hashlib.sha256("|".join(sorted(member_ids)).encode()).hexdigest()[:12]
-    return f"entity:canonical:{source_id}:{digest}"
-
-
 def _source_id_of(mentions: Iterable[SourceMention]) -> str:
     for m in mentions:
         if m.source_id:
@@ -263,10 +288,15 @@ def _source_id_of(mentions: Iterable[SourceMention]) -> str:
 def _canonical_label(members: list[SourceMention]) -> str:
     """Pick the canonical surface label deterministically.
 
-    Prefer the longest distinct surface form shared across members, tie-broken
-    by the earliest mention id so the choice is stable across reruns.
+    Prefer a real (non-alias) entity mention surface over provider-declared
+    alias surfaces so the canonical keeps its primary name (Plan S P5-S1): an
+    alias mention carries ``metadata_.canonical_name`` and must never become
+    the display label of the cluster it resolves to. Within the preferred
+    pool, use the longest distinct surface form, tie-broken by the earliest
+    mention id so the choice is stable across reruns.
     """
-    by_id = {m.mention_id: m for m in members}
+    pool = [m for m in members if not (m.metadata_ or {}).get("canonical_name")] or list(members)
+    by_id = {m.mention_id: m for m in pool}
     ordered = sorted(by_id, key=lambda mid: (len(by_id[mid].mention_text), mid), reverse=True)
     return by_id[ordered[0]].mention_text
 
@@ -324,10 +354,16 @@ class EntityResolutionService:
             mentions = list(input.mentions)
             source_id = input.source_id or _source_id_of(mentions)
             gb = dict(input.generated_by) or dict(generated_by or {})
+            input_work_id = input.work_id
+            input_continuity_id = input.continuity_id
+            input_scope = dict(input.memberships)
         else:
             mentions = list(input)
             source_id = _source_id_of(mentions)
             gb = dict(generated_by or {})
+            input_work_id = None
+            input_continuity_id = None
+            input_scope = {}
 
         gb.setdefault("generator", "EntityResolutionService")
         if not gb.get("config_digest"):
@@ -359,6 +395,48 @@ class EntityResolutionService:
                     continue
                 uf.union(m.mention_id, target, candidate_ref=m.mention_id)
 
+        # Pass 2b — link provider-declared aliases to their canonical cluster by
+        # canonical_name (Plan S P5-S1). An alias observation names its canonical
+        # by display surface (no canonical ref exists yet at observation time), so
+        # union it with the source-local REAL (non-alias) mention whose surface
+        # matches that name. Alias mentions carry the canonical name inside their
+        # own normalized_forms (e.g. 'the apprentice' -> ['mara','the apprentice']),
+        # so they must NEVER be union targets for other aliases — otherwise two
+        # alias mentions pair with each other and fabricate a synthetic alias
+        # canonical. Prefer a real mention whose mention_text equals the canonical
+        # name (exact real-mention match). Deterministic order; source-local;
+        # never crosses scopes.
+        for m in sorted(mentions, key=lambda x: x.mention_id):
+            cn = (m.metadata_ or {}).get("canonical_name")
+            if not cn:
+                continue
+            cn_norm = normalize_name(cn) or cn.casefold()
+            real_targets = [
+                t
+                for t in mention_by_id.values()
+                if t.source_id == m.source_id
+                and t.mention_id != m.mention_id
+                and not (t.metadata_ or {}).get("canonical_name")
+            ]
+            ordered = sorted(real_targets, key=lambda x: x.mention_id)
+            # Exact real-mention match: the real mention whose surface literally
+            # equals the canonical name wins before any normalized-form match.
+            union_target = next(
+                (t for t in ordered if normalize_name(t.mention_text) == cn_norm),
+                None,
+            )
+            if union_target is None:
+                union_target = next(
+                    (
+                        t
+                        for t in ordered
+                        if cn_norm in {*t.normalized_forms, normalize_name(t.mention_text)}
+                    ),
+                    None,
+                )
+            if union_target is not None:
+                uf.union(m.mention_id, union_target.mention_id, candidate_ref=m.mention_id)
+
         # Pass 3 — group members by root.
         roots: dict[str, list[SourceMention]] = {}
         for m in mentions:
@@ -377,7 +455,7 @@ class EntityResolutionService:
                 canonical_ref = seed
                 entity_state = ConfidenceState.CONFIRMED.value
             else:
-                canonical_ref = _canonical_ref(source_id, [m.mention_id for m in members])
+                canonical_ref = canonical_entity_ref(m.mention_id for m in members)
                 entity_state = ConfidenceState.PROBABLE.value
 
             # Decide whether this component resolves to a canonical or stays
@@ -392,16 +470,58 @@ class EntityResolutionService:
 
             label = _canonical_label(members)
             conf = _cluster_confidence(members)
+            entity_type = _entity_type_of(members)
+            member_ids = [m.mention_id for m in members]
+            aliases = sorted({m.mention_text for m in members} - {label})
+            memberships = {
+                "source_ids": sorted({m.source_id for m in members if m.source_id}),
+                "work_ids": sorted({m.work_id for m in members if m.work_id}),
+                "continuity_ids": sorted({m.continuity_id for m in members if m.continuity_id}),
+            }
+            # Carry the explicit source-level work/continuity scope (P3-S1) when a
+            # member did not annotate it directly, so the canonical stays scoped.
+            if input_work_id and not memberships["work_ids"]:
+                memberships["work_ids"] = [input_work_id]
+            if input_continuity_id and not memberships["continuity_ids"]:
+                memberships["continuity_ids"] = [input_continuity_id]
+            if not memberships["source_ids"] and input_scope.get("source_ids"):
+                memberships["source_ids"] = list(input_scope["source_ids"])
             canonical_entities.append(
                 CanonicalEntity(
                     ref=canonical_ref,
                     label=label,
                     source_id=source_id,
-                    entity_type=_entity_type_of(members),
-                    member_mention_ids=[m.mention_id for m in members],
+                    entity_type=entity_type,
+                    member_mention_ids=member_ids,
                     confidence=conf,
                     state=entity_state,
                     support_refs=sorted(m.mention_id for m in members),
+                    aliases=aliases,
+                    generated_by=dict(gb),
+                    memberships=memberships,
+                )
+            )
+            # Canonical establishment: a first-class append-only ledger event that
+            # records the accepted canonical's identity metadata (type, display
+            # label, aliases, support refs, memberships, state, confidence).
+            commands.append(
+                ResolutionCommand(
+                    kind="ESTABLISH",
+                    entity_id=canonical_ref,
+                    target_entity_id=canonical_ref,
+                    refs=sorted(m.mention_id for m in members),
+                    assignments={m.mention_id: canonical_ref for m in members},
+                    reason="canonical establishment",
+                    metadata={
+                        "canonical_type": entity_type,
+                        "display_label": label,
+                        "aliases": aliases,
+                        "support_refs": sorted(m.mention_id for m in members),
+                        "memberships": memberships,
+                        "state": entity_state,
+                        "confidence": conf,
+                        "generated_by": dict(gb),
+                    },
                 )
             )
 

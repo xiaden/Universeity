@@ -64,8 +64,9 @@ The concrete semantic repair family follows the preserved A–K foundation/remed
 | P | `TASK-universal-media-decomposer-P-semantic-book-fixture-parity-e2e.md` | Realistic small-book fixture, generic Alexandria 2a–2f parity matrix, production/public E2E | L–O |
 | Q | `TASK-universal-media-decomposer-Q-semantic-capability-verification.md` | Full static, unit, PostgreSQL, StageWork, public E2E, Docker/hosted and immutable-ledger verification | L–P |
 | R | `TASK-universal-media-decomposer-R-provider-observation-reconciliation-promotion.md` | Evidence-backed provider observations reach existing reconciliation, replay/current/edge/search/query surfaces with exact provenance and honest degradation | Q |
+| S | `TASK-universal-media-decomposer-S-semantic-identity-and-relationship-repair.md` | Ledger-first canonical identity, human-readable labels/aliases, cross-source membership/ambiguity, validated relationship predicates, and public semantic E2E | R and the completed L–P foundations; Q remains historical verification evidence |
 
-Plans L–R repair existing semantic seams only. They do not amend or re-execute Plan K, add a semantic graph database, copy Alexandria/audiobook state, introduce a second scheduler, or change OCFL/ledger authority.
+Plans L–S repair existing semantic seams only. They do not amend or re-execute Plan K, add a semantic graph database, copy Alexandria/audiobook state, introduce a second scheduler, or change OCFL/ledger authority. Plan S specifically keeps the SQL `entity` table from becoming a second semantic authority, preserves Plan N Option B string refs and Plan R provider hydration, and leaves Docker/live Hatchet outcomes honestly gated.
 
 No v1 plan introduces a semantic graph database, RDF authority/projection, dedicated vector database, XTDB witness, or Dagster scheduler. Their interfaces and measured promotion triggers remain documented extension paths.
 

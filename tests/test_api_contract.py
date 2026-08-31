@@ -1845,8 +1845,11 @@ def test_phase3_book_http_public_reads_deterministic(api_ctx) -> None:
     assert not promoted, "no SemanticAsserted event may promote the watchtower-light claim"
 
     # -- search for character/trait/relationship text: honest deterministic result.
-    #    Deterministic semantic refs are content-hash UUIDs (no display names) and
-    #    trait/alias observations are not produced, so these searches return 0.
+    #    Canonical display names ARE indexed, but canonical search docs carry
+    #    source_id=None, so the SearchService source_id filter scopes them out —
+    #    the 'Mara' total==0 here is a source_id-filter artifact, not an honest
+    #    absence of a canonical surface. 'siblings' / 'moss-green' zeros are
+    #    genuine (no predicate/trait observations produced on this path).
     for term in ("Mara", "siblings", "moss-green"):
         rs = client.post(
             "/v1/search", json={"query": term, "mode": "exact", "source_id": sid}, headers=R
@@ -1864,9 +1867,10 @@ def test_phase3_book_provider_aliases_and_traits_through_production_seam(
     with provider provenance. Phase 3 lockstep: the provider observations now flow
     through the ``_reconciliation_input`` seam, so the provider aliases/traits are
     POSITIVELY retrievable through the public read surfaces (relationship edges +
-    search) — while the canonical-entity surface (ENTITY) honestly stays empty
-    because this fixture emits no ``EntityResolved`` events (provider aliases surface
-    as KNOWN_AS/ALIAS_OF edges, never fabricated canonical rows).
+    search). P5-S1 lockstep: the reconciliation resolution now establishes the
+    provider-backed canonicals through the typed public ENTITY surface — Mara/Ellis/
+    Orin carry their provider aliases as ALIASES (the apprentice/the cartographer/the
+    warden), never as standalone synthetic alias entities.
     """
     from fixtures import semantic_book_bytes
     from semantic_parity_oracle import FakeSemanticProvider
@@ -1966,38 +1970,135 @@ def test_phase3_book_provider_aliases_and_traits_through_production_seam(
         )
         assert "ALIAS_OF" in by_pred
 
-        # ENTITY stays honestly empty: the book fixture emits no EntityResolved
-        # events, so current_state has no CANONICAL_ENTITY rows. This is honest
-        # non-promotion (never a fabricated pass) — the provider aliases surface as
-        # KNOWN_AS/ALIAS_OF edges asserted above.
-        ent = client.post("/v1/query/structured", json={"kind": "ENTITY", "limit": 50}, headers=R)
-        assert ent.status_code == 200, ent.text
-        assert ent.json()["total"] == 0, (
-            "no EntityResolved events -> no CANONICAL_ENTITY rows (honest non-promotion)"
-        )
+        # P5-S1 canonical establishment: the provider book now yields first-class
+        # canonical entities through the typed public ENTITY read surface. The
+        # display label is the primary character name and provider alias surfaces
+        # (the apprentice/the cartographer/the warden/Moss) are ALIASES of their
+        # canonical — never standalone synthetic alias entities.
+        le = client.get("/v1/entities?limit=50", headers=R)
+        assert le.status_code == 200, le.text
+        ent_rows = {(it.get("display_label") or it["label"]): it for it in le.json()["items"]}
+        assert le.json()["total"] >= 3, le.text
+        assert {"Mara", "Ellis", "Orin"} <= set(ent_rows), sorted(ent_rows)
+        assert "the apprentice" in ent_rows["Mara"]["aliases"], ent_rows["Mara"]
+        assert "the cartographer" in ent_rows["Ellis"]["aliases"], ent_rows["Ellis"]
+        assert "the warden" in ent_rows["Orin"]["aliases"], ent_rows["Orin"]
+        # Retrieve Mara by its opaque canonical ref (typed GET, no table-only proof).
+        g = client.get(f"/v1/entities/{ent_rows['Mara']['ref']}", headers=R)
+        assert g.status_code == 200, g.text
+        assert (g.json().get("display_label") or g.json()["label"]) == "Mara", g.text
 
         # POSITIVE search: the provider edge docs are indexed with the display text
         # (ref=edge:<fact_id> => derived from the active edge store, not a fabricated
-        # source). They carry no source_id (content-addressable edge docs), so the
+        # source) and canonical identities/aliases are indexed as CANONICAL_ENTITY
+        # docs. They carry no source_id (content-addressable edge docs), so the
         # search must be asserted WITHOUT the source filter; a source-scoped search
         # honestly stays 0 because the edge docs are not source-scoped.
         sr = client.post("/v1/search", json={"query": "apprentice", "mode": "exact"}, headers=R)
         assert sr.status_code == 200, sr.text
         assert sr.json()["total"] >= 1, "provider alias must now be searchable"
-        ahit = sr.json()["hits"][0]
-        assert ahit["kind"] == "INTERPRETATION" and ahit["label"] == "interpretation"
-        assert ahit["text"] == "the apprentice" and ahit["ref"].startswith("edge:"), ahit
+        assert sr.json()["hits"][0]["text"] == "the apprentice", sr.json()["hits"][0]
         mg = client.post("/v1/search", json={"query": "moss-green", "mode": "exact"}, headers=R)
         assert mg.json()["total"] >= 1, "provider trait must now be searchable"
         assert mg.json()["hits"][0]["text"] == "moss-green eyes"
+        # 'Mara' is now searchable via its canonical display label/alias index.
+        mr = client.post("/v1/search", json={"query": "Mara", "mode": "exact"}, headers=R)
+        assert mr.status_code == 200, mr.text
+        assert mr.json()["total"] >= 1, "Mara canonical must now be searchable"
 
-        # Honest non-promotion preserved: 'siblings' (unsupported predicate, stays
-        # evidence-only) and 'Mara' (canonical ref is content-hash, not display text)
-        # remain non-searchable.
-        for term in ("siblings", "Mara"):
-            r0 = client.post("/v1/search", json={"query": term, "mode": "exact"}, headers=R)
-            assert r0.status_code == 200, r0.text
-            assert r0.json()["total"] == 0, f"'{term}' must stay non-searchable (honest gap)"
+        # Honest gap preserved: 'siblings' (the SIBLING_OF edge's doc text is the
+        # opaque canonical/fallback object ref, not the word 'siblings') remains
+        # non-searchable.
+        r0 = client.post("/v1/search", json={"query": "siblings", "mode": "exact"}, headers=R)
+        assert r0.status_code == 200, r0.text
+        assert r0.json()["total"] == 0, "'siblings' must stay non-searchable (honest gap)"
+
+
+def test_p5_s1_public_identity_e2e(umd_db: sa.Engine, source_store) -> None:
+    """P5-S1: the realistic Lantern Keeper public E2E proves first-class canonical
+    identity and the sibling relationship entirely through typed public read
+    surfaces (never direct table-only proof): list Mara/Ellis/Orin, retrieve Mara by
+    canonical ref, exact/fuzzy/alias search, aliases, Mara scenes + utterances,
+    traits with evidence/provenance, and a query-visible SIBLING_OF relationship."""
+    from semantic_parity_oracle import FakeSemanticProvider
+
+    app, sid, _provider, _ctx = _provider_book(umd_db, source_store, FakeSemanticProvider())
+    _build_all(umd_db)
+
+    with TestClient(app) as client:
+        # -- list characters returns Mara/Ellis/Orin (total >= 3) -------------------
+        le = client.get("/v1/entities?limit=50", headers=R)
+        assert le.status_code == 200, le.text
+        by_label = {(it.get("display_label") or it["label"]): it for it in le.json()["items"]}
+        assert le.json()["total"] >= 3, le.text
+        assert {"Mara", "Ellis", "Orin"} <= set(by_label), sorted(by_label)
+        mara = by_label["Mara"]
+        ellis = by_label["Ellis"]
+
+        # -- retrieve Mara by its opaque canonical ref ------------------------------
+        g = client.get(f"/v1/entities/{mara['ref']}", headers=R)
+        assert g.status_code == 200, g.text
+        m = g.json()
+        assert (m.get("display_label") or m["label"]) == "Mara", m
+        # aliases returned on the canonical (never a synthetic alias entity).
+        assert "the apprentice" in m.get("aliases", []), m
+        assert "Moss" in m.get("aliases", []), m
+        # memberships exposed through the typed read.
+        assert m.get("memberships", {}).get("source_ids"), m
+
+        # -- exact / fuzzy / alias search all resolve to the same canonical --------
+        ex = client.post("/v1/search", json={"query": "Mara", "mode": "exact"}, headers=R)
+        assert ex.status_code == 200 and ex.json()["total"] >= 1, ex.text
+        assert any(h["text"] == "Mara" for h in ex.json()["hits"]), ex.json()["hits"]
+        fz = client.post("/v1/search", json={"query": "mara", "mode": "fuzzy"}, headers=R)
+        assert fz.status_code == 200 and fz.json()["total"] >= 1, fz.text
+        al = client.post("/v1/search", json={"query": "the apprentice", "mode": "exact"}, headers=R)
+        assert al.status_code == 200 and al.json()["total"] >= 1, al.text
+
+        # -- Mara scenes and utterances (structured public reads) -------------------
+        sc = client.post(
+            "/v1/query/structured", json={"kind": "SCENE", "filters": {"source_id": sid}}, headers=R
+        )
+        assert sc.status_code == 200 and sc.json()["total"] >= 3, sc.text
+        ut = client.post("/v1/query/structured", json={"kind": "UTTERANCE", "limit": 50}, headers=R)
+        assert ut.status_code == 200 and ut.json()["total"] >= 1, ut.text
+        assert any(h["predicate"] == "SPEAKS" for h in ut.json()["results"]), ut.json()["results"]
+
+        # -- relationship edges: characters present + sibling + traits ----------------
+        re_ = client.post(
+            "/v1/query/structured", json={"kind": "RELATIONSHIP_EDGES", "limit": 300}, headers=R
+        )
+        assert re_.status_code == 200, re_.text
+        by_pred: dict[str, list[dict[str, Any]]] = {}
+        for h in re_.json()["results"]:
+            by_pred.setdefault(h["predicate"], []).append(h)
+        present = {h["ref"] for h in by_pred.get("PRESENT_IN", [])} | {
+            h["ref"] for h in by_pred.get("MENTIONED_IN", [])
+        }
+        assert {mara["ref"], ellis["ref"]} <= present, present
+        # traits with evidence/provenance: HAS_TRAIT edge for Mara's moss-green eyes.
+        assert any(h.get("value") == "moss-green eyes" for h in by_pred.get("HAS_TRAIT", [])), (
+            by_pred.get("HAS_TRAIT")
+        )
+        # query-visible sibling relationship: SIBLING_OF Mara -> Ellis.
+        sib = [h for h in by_pred.get("SIBLING_OF", [])]
+        assert sib, by_pred.get("SIBLING_OF")
+        assert sib[0]["ref"] == mara["ref"], sib[0]
+        assert sib[0]["value"] == ellis["ref"], sib[0]
+
+        # -- traits backed by evidence with locator + provenance ---------------------
+        ev = client.post(
+            "/v1/query/structured",
+            json={"kind": "EVIDENCE", "filters": {"source_id": sid}, "limit": 200},
+            headers=R,
+        )
+        assert ev.status_code == 200, ev.text
+        assert any(
+            h.get("predicate") == "text_span"
+            and h.get("provenance", {}).get("locator")
+            and (h.get("provenance", {}).get("source_id") or "").replace("-", "") == sid
+            for h in ev.json()["results"]
+        ), "traits must be backed by evidence with locator + provenance"
 
 
 def _provider_book(umd_db, source_store, provider) -> tuple[Any, str, Any, Any]:
@@ -2058,8 +2159,13 @@ def test_phase3_book_provider_semantic_questions_public_surface(
             headers=R,
         )
         assert re_.status_code == 200, re_.text
-        known = next(h for h in re_.json()["results"] if h["predicate"] == "KNOWN_AS")
-        subj, obj = known["ref"], known["value"]
+        # P5 lockstep: after canonical merging the KNOWN_AS alias edges are
+        # self-referential (an entity known-as its own alias). Use the query-visible
+        # SIBLING_OF Mara->Ellis edge (two DISTINCT canonicals) as the typed
+        # cross-entity relationship answer.
+        rels = re_.json()["results"]
+        sib = next(h for h in rels if h["predicate"] == "SIBLING_OF")
+        subj, obj = sib["ref"], sib["value"]
         rel_q = f"relationship between {subj} and {obj}"
         assert ctx.question.requires_edge_guard(rel_q), "relationship question must use edge_guard"
         q = client.post(
@@ -2071,9 +2177,9 @@ def test_phase3_book_provider_semantic_questions_public_surface(
         j = q.json()
         assert j["compiled_ops"] == ["RELATIONSHIP_EDGES"]
         assert len(j["answer"]) >= 1, "relationship question returned no provider-backed edge"
-        a = j["answer"][0]
-        assert a["predicate"] == "KNOWN_AS" and a["value"] == obj
-        assert a["confidence"] == known["confidence"], "provider confidence lost in question"
+        assert any(a["predicate"] == "SIBLING_OF" and a["value"] == obj for a in j["answer"]), j
+        sib_ans = next(a for a in j["answer"] if a["predicate"] == "SIBLING_OF")
+        assert sib_ans["confidence"] == sib["confidence"], "provider confidence lost in question"
         assert "SOURCE_EVIDENCE" in j["result_kind_labels"]
 
         # -- entity question surfaces the provider alias via hybrid alternatives.
@@ -2218,10 +2324,12 @@ def test_phase3_book_provider_evidence_reads_expose_observations_and_provenance(
         assert seg and str(seg).startswith("chapter/"), "observation lost exact segment locator"
         gb = o.get("generated_by") or {}
         assert gb.get("provider") == provider.name and gb.get("path") == "provider"
-    # An observation OMITTED from reconciliation (unsupported SIBLING_OF) is still
-    # exposed as evidence — never fabricated into an assertion, never erased.
+    # The SIBLING_OF relationship observation is exposed as durable evidence even
+    # though the predicate is not part of the provider->edge promotion in this
+    # seam — it is never fabricated/erased at the evidence layer. (Plan S Phase 4:
+    # SIBLING_OF is registered, but the evidence row still records the observation.)
     preds = {o.get("predicate") for o in obs if "predicate" in o}
-    assert "SIBLING_OF" in preds, "omitted-from-reconciliation observation must stay evidence"
+    assert "SIBLING_OF" in preds, "observation must remain durable evidence"
 
     # Public EVIDENCE read surfaces content-addressed refs + evidence_kind capability.
     with TestClient(app) as client:

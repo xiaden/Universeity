@@ -340,10 +340,26 @@ class SemanticCommandService:
         assumptions: dict[str, Any] | None = None,
         confidence: float | None = None,
         correlation_id: Any | None = None,
+        idempotency_key: str | uuid.UUID | None = None,
     ) -> CommitResult:
         alignment_id = uuid.uuid4()
 
         def record_row(conn: sa.Connection) -> None:
+            if idempotency_key is not None:
+                # Plan S (P3-S3): when a deterministic idempotency_key is supplied,
+                # ``complete_and_append`` re-runs side_effects on a dedup, so guard
+                # the alignment insert — skip if this alignment already exists. This
+                # keeps the alignment ledger duplicate-free across reruns.
+                exists = conn.execute(
+                    sa.select(_alignment_t.c.id).where(
+                        _alignment_t.c.left_ref == left_ref,
+                        _alignment_t.c.right_ref == right_ref,
+                        _alignment_t.c.alignment_type == alignment_type,
+                        _alignment_t.c.method == method,
+                    )
+                ).scalar()
+                if exists is not None:
+                    return
             conn.execute(
                 _alignment_t.insert().values(
                     id=alignment_id,
@@ -374,6 +390,7 @@ class SemanticCommandService:
                     correlation_id=correlation_id,
                 )
             ],
+            idempotency_key=idempotency_key,
             side_effects=record_row,
         )
 

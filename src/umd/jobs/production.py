@@ -74,6 +74,7 @@ Invariants enforced here (the binding contract the spec-first registry tests pin
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from collections.abc import Callable, Sequence
@@ -223,6 +224,11 @@ def _source_row(engine: sa.Engine, source_id: str | None) -> dict[str, Any] | No
         "size_bytes": int(row.size_bytes),
         "media_kind": row.media_kind,
         "format": row.format,
+        # Plan S (P3-S1): the source's explicit work/continuity scope. Carried so
+        # resolution can scope identity to a supported correspondence (a shared
+        # work/continuity) instead of merging same-name strings across sources.
+        "work_id": str(row.work_id) if row.work_id else None,
+        "continuity_id": str(row.continuity_id) if row.continuity_id else None,
     }
 
 
@@ -827,9 +833,96 @@ class _Composer:
                             "config_digest": _ENTITY_RESOLUTION_CONFIG_DIGEST,
                         },
                     },
+                    # Plan S (P3-S1): carry the source's explicit work/continuity
+                    # scope so the mention stays scoped to its supported source
+                    # context (never treated as a cross-source merge by itself).
+                    work_id=src.get("work_id"),
+                    continuity_id=src.get("continuity_id"),
                     metadata_=meta,
                 )
             )
+        return out
+
+    def _seed_supported_correspondence(
+        self, src: dict[str, Any], mentions: list[SourceMention]
+    ) -> list[SourceMention]:
+        """Seed mentions onto an existing supported cross-source canonical.
+
+        Plan S (P3-S1/S2): cross-source identity is inferred ONLY within an explicit
+        supported scope — a shared work/continuity membership that already established
+        a canonical from a SIBLING source. A mention whose normalized surface uniquely
+        matches one established canonical in the SAME work scope (from a different
+        source) is seeded to that ref so the resolver reuses it (one opaque ref across
+        sources). Same-name characters in DIFFERENT scopes never match, and a name with
+        several candidates stays unseeded (separate/reviewable) — never guessed.
+
+        This is a pure read over the committed identity ``current_state``; it writes
+        nothing. Reruns over the same state converge to the same seeds.
+        """
+        work_id = src.get("work_id")
+        continuity_id = src.get("continuity_id")
+        if (not work_id and not continuity_id) or not mentions:
+            return mentions
+        from umd.resolution.candidates import normalize_name
+        from umd.storage.postgres.reducer import CANONICAL_IDENTITY_PREDICATE
+
+        _cs = db_meta.tables["current_state"]
+        with self._engine.connect() as conn:
+            rows = list(
+                conn.execute(
+                    sa.select(_cs.c.entity_ref, _cs.c.object_ref, _cs.c.state).where(
+                        _cs.c.predicate == CANONICAL_IDENTITY_PREDICATE
+                    )
+                ).fetchall()
+            )
+
+        # Map a normalized surface -> candidate canonical refs that are established in
+        # an EXPLICIT supported scope (shared work or continuity membership) and not
+        # invalidated. Seeding to a canonical this source already shares is harmless
+        # (the ESTABLISH idempotency key dedups identical metadata), so we never skip a
+        # ref merely because this source is already a member — that would break rerun
+        # convergence. Same-name refs in DIFFERENT scopes are never candidates, and a
+        # surface mapping to several candidate refs is left unseeded (reviewable).
+        candidates: dict[str, list[str]] = {}
+        for r in rows:
+            if r.state in ("INVALIDATED",):
+                continue
+            try:
+                meta = json.loads(r.object_ref)
+            except (TypeError, ValueError):
+                continue
+            memberships = meta.get("memberships") or {}
+            if not (
+                (work_id and work_id in (memberships.get("work_ids") or []))
+                or (continuity_id and continuity_id in (memberships.get("continuity_ids") or []))
+            ):
+                continue  # no supported scope -> unrelated, never matched
+            surfaces: list[str] = []
+            if meta.get("display_label"):
+                surfaces.append(str(meta["display_label"]))
+            surfaces.extend(str(a) for a in (meta.get("aliases") or []))
+            for surf in {normalize_name(s) for s in surfaces if normalize_name(s)}:
+                candidates.setdefault(surf, []).append(str(r.entity_ref))
+
+        def _unique_seed(m: SourceMention) -> str | None:
+            surfaces = [normalize_name(m.mention_text)] + [
+                f for f in (m.normalized_forms or []) if f
+            ]
+            found: set[str] = set()
+            for s in surfaces:
+                if not s:
+                    continue
+                found.update(candidates.get(s, []))
+            if len(found) == 1:
+                return next(iter(found))
+            return None  # none or ambiguous -> leave separate/reviewable
+
+        out: list[SourceMention] = []
+        for m in mentions:
+            seed = _unique_seed(m)
+            if seed is not None:
+                m = m.model_copy(update={"entity_id": seed})
+            out.append(m)
         return out
 
     def _apply_resolution(self, batch: Any, mentions: list[Any] | None = None) -> None:
@@ -876,6 +969,12 @@ class _Composer:
                     target_entity=cmd.entity_id,
                     merged_refs=cmd.refs or [cmd.entity_id],
                     assignments=cmd.assignments or {},
+                    reason=cmd.reason or "entity resolution",
+                )
+            elif cmd.kind == "ESTABLISH" and resolver is not None:
+                resolver.establish(
+                    canonical=cmd.entity_id,
+                    metadata=cmd.metadata,
                     reason=cmd.reason or "entity resolution",
                 )
 
@@ -1747,6 +1846,18 @@ class _Composer:
         if commands is not None and mentions:
             from umd.resolution.service import EntityResolutionService, ResolutionInput
 
+            # Plan S (P3-S1): seed mentions that already resolve to a supported
+            # cross-source canonical (same work/continuity scope) so a rerun reuses
+            # the established ref instead of deriving a source-local duplicate. This
+            # is the ONLY cross-source identity path: an explicit shared work/
+            # continuity scope authorizes the link — never same-name string
+            # equality across unrelated sources.
+            mentions = self._seed_supported_correspondence(src, mentions)
+            memberships = {
+                "source_ids": [src["id"]] if src["id"] else [],
+                "work_ids": [src["work_id"]] if src.get("work_id") else [],
+                "continuity_ids": [src["continuity_id"]] if src.get("continuity_id") else [],
+            }
             service = EntityResolutionService()
             batch = service.resolve_mentions(
                 ResolutionInput(
@@ -1757,6 +1868,9 @@ class _Composer:
                         "analyzer": "umd-entity-resolution@1",
                         "config_digest": _ENTITY_RESOLUTION_CONFIG_DIGEST,
                     },
+                    work_id=src.get("work_id"),
+                    continuity_id=src.get("continuity_id"),
+                    memberships=memberships,
                 )
             )
             self._apply_resolution(batch, mentions)
@@ -1769,20 +1883,124 @@ class _Composer:
         return StageOutcome(artifact_refs=refs, evidence_refs=refs)
 
     def _cross_source_alignment(self, manifest: StageManifest) -> StageOutcome:
+        """Represent supported cross-source identity through ledger/alignment semantics.
+
+        Plan S (P3-S3): within the existing nine-stage registry (no new scheduler /
+        stage / graph store / direct projection write), the stage makes the supported
+        cross-source correspondence explicit and reviewable in the alignment ledger:
+          * a canonical that already spans TWO+ sources of the current work is a
+            *supported* shared identity -> recorded as a CONTINUITY alignment;
+          * the same normalized label resolving to TWO+ distinct canonicals in the
+            same work, or across different works, is an *unrelated same-name* -> kept
+            separate and surfaced as a CORRESPONDENCE alignment (reviewable, never
+            merged by name);
+        Ambiguous/unresolved mentions are already surfaced via ``UNRESOLVED_ALIASES``.
+        Every record is idempotent (deterministic key) so reruns converge without
+        duplicating alignments.
+        """
         src = self._require_source(manifest)
         refs = [f"alignments:{src['id']}:continuity"]
         commands = self._opt("commands")
-        if commands is not None:
-            # Single-source run: deterministic source-continuity alignment plan.
-            left = manifest.evidence_refs[0] if manifest.evidence_refs else refs[0]
-            commands.record_alignment(
-                left_ref=left,
-                right_ref=refs[0],
-                alignment_type="CONTINUITY",
-                method="source-order",
-                correlation_id=self._corr(manifest.job_id),
-            )
+        if commands is None:
+            return StageOutcome(artifact_refs=refs, evidence_refs=refs)
+
+        # 1) Single-source deterministic source-continuity plan (unchanged, now
+        #    idempotent so a rerun never duplicates the ALIGNED event).
+        left = manifest.evidence_refs[0] if manifest.evidence_refs else refs[0]
+        commands.record_alignment(
+            left_ref=left,
+            right_ref=refs[0],
+            alignment_type="CONTINUITY",
+            method="source-order",
+            correlation_id=self._corr(manifest.job_id),
+            idempotency_key=uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"umd-align:{left}\x1f{refs[0]}\x1fCONTINUITY\x1fsource-order",
+            ),
+        )
+
+        # 2) Cross-source supported correspondence + reviewable same-name separation.
+        self._record_cross_source_correspondence(src, commands, manifest)
         return StageOutcome(artifact_refs=refs, evidence_refs=refs)
+
+    def _record_cross_source_correspondence(
+        self,
+        src: dict[str, Any],
+        commands: Any,
+        manifest: StageManifest,
+    ) -> None:
+        """Record CONTINUITY (supported) / CORRESPONDENCE (reviewable) alignments.
+
+        Reads the committed identity ``current_state`` (the ledger-backed canonical
+        identities) and records explicit alignment rows representing either a
+        supported shared identity across sources of one work, or an unrelated
+        same-name that must remain separate and reviewable. Purely read + ledger
+        record; never a name-based merge.
+        """
+        from umd.resolution.candidates import normalize_name
+        from umd.storage.postgres.reducer import CANONICAL_IDENTITY_PREDICATE
+
+        _cs = db_meta.tables["current_state"]
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(_cs.c.entity_ref, _cs.c.object_ref, _cs.c.state).where(
+                    _cs.c.predicate == CANONICAL_IDENTITY_PREDICATE
+                )
+            ).fetchall()
+        by_label: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        for r in rows:
+            if r.state in ("INVALIDATED",):
+                continue
+            try:
+                meta = json.loads(r.object_ref)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+            label = normalize_name(str(meta.get("display_label") or ""))
+            if not label:
+                continue
+            by_label.setdefault(label, []).append((str(r.entity_ref), meta))
+
+        evidence_ref = manifest.evidence_refs[0] if manifest.evidence_refs else None
+        for label, entries in sorted(by_label.items()):
+            by_ref = {ref: _m for ref, _m in entries}
+            # CONTINUITY: any single canonical in this label that already spans 2+
+            # sources of the current work is a supported shared identity.
+            for ref, meta in by_ref.items():
+                sources = set((meta.get("memberships") or {}).get("source_ids") or [])
+                if src["id"] in sources and len(sources) >= 2:
+                    right = evidence_ref or ref
+                    commands.record_alignment(
+                        left_ref=ref,
+                        right_ref=right,
+                        alignment_type="CONTINUITY",
+                        method="work-membership",
+                        confidence=0.9,
+                        correlation_id=self._corr(manifest.job_id),
+                        idempotency_key=uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"umd-align:{ref}\x1f{right}\x1fCONTINUITY\x1fwork-membership",
+                        ),
+                    )
+            # CORRESPONDENCE: 2+ distinct canonicals for one normalized label are an
+            # unrelated same-name (same work or cross-work) -> kept separate and
+            # surfaced as a reviewable record, never merged by name.
+            if len(by_ref) >= 2:
+                ordered = sorted(by_ref)
+                for a, b in zip(ordered[:-1], ordered[1:], strict=False):
+                    commands.record_alignment(
+                        left_ref=a,
+                        right_ref=b,
+                        alignment_type="CORRESPONDENCE",
+                        method="candidate-separation",
+                        assumptions={"label": label},
+                        correlation_id=self._corr(manifest.job_id),
+                        idempotency_key=uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"umd-align:{a}\x1f{b}\x1fCORRESPONDENCE\x1fcandidate-separation",
+                        ),
+                    )
 
     def _semantic_reconciliation(self, manifest: StageManifest) -> StageOutcome:
         """Drive the semantic reconciler (Plan O P1-S2 / Plan R P1).
@@ -1814,6 +2032,17 @@ class _Composer:
             )
         if input_ is None:
             return StageOutcome(artifact_refs=refs, evidence_refs=refs)
+        # Plan S (P5-S1): the reconciliation path is the canonical-establishment
+        # seam for provider/observation-backed identities. ``_reconciliation_input``
+        # already built a deterministic resolution batch over the committed
+        # deterministic + hydrated provider mentions; apply its ESTABLISH/ALIAS/
+        # MENTION commands through the existing command path so provider-derived
+        # canonicals (and their aliases/memberships) become durable, queryable
+        # identities — not just reconciler assertions. Idempotent: reruns converge
+        # to the same refs, and the ENTITY_RESOLUTION stage's own application for
+        # purely-deterministic sources remains authoritative.
+        if input_.resolution is not None:
+            self._apply_resolution(input_.resolution)
         from umd.reconciliation.reconciler import SemanticReconciler
 
         events = SemanticReconciler().reconcile(input_)

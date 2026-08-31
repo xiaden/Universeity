@@ -29,8 +29,10 @@ Invariants
 
 Plan N canonical-reference representation (v1 — Option B, CONTRACTS.md):
   production text resolution is *ledger-first*. The resolved canonical ref is a
-  deterministic STRING (``entity:canonical:<src>:<digest>``) carried in the
-  immutable ``EntityMentioned`` payload and reducer-backed ``current_state``;
+  deterministic, source-independent STRING (``entity:canonical:<sha256-16hex>``
+  — per Plan S P1-S2, replacing the earlier source-bound
+  ``entity:canonical:<src>:<digest>`` form) carried in the immutable
+  ``EntityMentioned`` payload and reducer-backed ``current_state``;
   ``entity_mention.entity_id`` is a nullable UUID FK, so a non-UUID ref is
   stored NULL on the row (never coerced, never fabricated into an ``entity``
   row). Valid UUID refs (legacy UUID-backed materialized paths) are still
@@ -120,7 +122,14 @@ class MentionCandidate(BaseModel):
 
 
 class SourceMention(BaseModel):
-    """A source mention pinned to evidence, with provenance + confidence state."""
+    """A source mention pinned to evidence, with provenance + confidence state.
+
+    Plan S (P1-S1): the mention remains a **source-local** record. It may carry
+    optional work/continuity membership scope (``work_id``/``continuity_id``) so a
+    canonical cluster can aggregate membership context; the mention itself is
+    never promoted to a cross-source entity. ``entity_id`` for a non-UUID string
+    canonical ref stays NULL on the typed row (nullable UUID FK, Option B).
+    """
 
     id: uuid.UUID | None = None
     source_id: str
@@ -138,6 +147,10 @@ class SourceMention(BaseModel):
     candidates: list[MentionCandidate] = Field(default_factory=list)
     provenance: dict[str, Any] = Field(default_factory=dict)
     metadata_: dict[str, Any] = Field(default_factory=dict)
+    #: Optional work/continuity membership scope (Plan S P1-S1): the mention
+    #: stays source-local; these carry the scope a canonical cluster aggregates.
+    work_id: str | None = None
+    continuity_id: str | None = None
 
     @property
     def mention_id(self) -> str:

@@ -10,6 +10,7 @@ fuses a pgvector/vector score into a hybrid, result-kind-labelled page.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,6 +30,7 @@ from umd.projections.tables import (
 from umd.projections.tables import (
     active_semantic_edge as _active_edge,
 )
+from umd.storage.postgres.reducer import CANONICAL_IDENTITY_PREDICATE
 
 #: Predicates whose ``object_ref`` is natural utterance/pronunciation text worth indexing.
 _UTTERANCE_PREDICATES = frozenset({"SPEAKS", "SAYS", "UTTERANCE", "PRONUNCIATION"})
@@ -111,10 +113,26 @@ class SearchProjectionBuilder:
         return None
 
     def finalize(self, conn: sa.Connection, driver: ReplayDriver) -> None:
-        # Refresh canonical-entity docs from the canonical Tier-1 state (equivalence with
-        # Tier-0): a CANONICAL_ENTITY winner is searchable under the entity ref.
+        # Plan S (P2-S3): refresh canonical-entity docs from the reducer Tier-1 state.
+        # The CANONICAL_IDENTITY row carries the durable identity metadata (display
+        # label + active aliases); we index those under the canonical opaque ref. This
+        # is a deterministic full-family rebuild — every finalize deletes ALL
+        # CANONICAL_ENTITY docs and reindexes exactly the current active labels +
+        # aliases, so a corrected/overridden historical label can never remain
+        # searchable. A canonical WITHOUT identity metadata (legacy/alias-only) falls
+        # back to indexing its CANONICAL_ENTITY object_ref, preserving prior behavior.
+        identity_refs = {
+            str(ref)
+            for (ref, predicate) in driver.state.rows
+            if predicate == CANONICAL_IDENTITY_PREDICATE
+        }
+        conn.execute(self._table.delete().where(self._table.c.kind == RESULT_KIND_CANONICAL_ENTITY))
         for (ref, predicate), row in driver.state.rows.items():
-            if predicate == "CANONICAL_ENTITY" and row.object_ref:
+            if predicate == CANONICAL_IDENTITY_PREDICATE and row.object_ref:
+                self._index_canonical_identity(conn, str(ref), row)
+            elif (
+                predicate == "CANONICAL_ENTITY" and row.object_ref and str(ref) not in identity_refs
+            ):
                 self._upsert(
                     conn,
                     ref=str(ref),
@@ -138,6 +156,50 @@ class SearchProjectionBuilder:
         # deterministically reconciles the whole ``edge:%`` + ``assert:%`` document
         # families.
         self._index_active_edges(conn, driver)
+
+    def _index_canonical_identity(self, conn: sa.Connection, ref: str, row: Any) -> None:
+        """Index a canonical identity's active display label + aliases under its ref.
+
+        The display label is indexed under the opaque canonical ``ref`` itself; each
+        active alias gets its own CANONICAL_ENTITY doc under a derived ``ref::alias:``
+        ref with ``entity_ref`` pointing back at the canonical — so exact, fuzzy and
+        alias searches all resolve to the same canonical opaque ref. Inactive
+        historical labels/aliases (only in ``row.alternatives`` + the immutable
+        ledger) are never indexed here.
+        """
+        try:
+            meta = json.loads(str(row.object_ref))
+        except (TypeError, ValueError):
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        label = str(meta.get("display_label") or "")
+        self._upsert(
+            conn,
+            ref=ref,
+            kind=RESULT_KIND_CANONICAL_ENTITY,
+            text=label,
+            source_id=None,
+            segment_id=None,
+            entity_ref=ref,
+            predicate=CANONICAL_IDENTITY_PREDICATE,
+            seq=row.seq,
+        )
+        for alias in meta.get("aliases") or []:
+            if not alias:
+                continue
+            alias_ref = f"{ref}::alias::{hashlib.sha256(str(alias).encode()).hexdigest()[:12]}"
+            self._upsert(
+                conn,
+                ref=alias_ref,
+                kind=RESULT_KIND_CANONICAL_ENTITY,
+                text=str(alias),
+                source_id=None,
+                segment_id=None,
+                entity_ref=ref,
+                predicate=CANONICAL_IDENTITY_PREDICATE,
+                seq=row.seq,
+            )
 
     def _index_active_edges(self, conn: sa.Connection, driver: ReplayDriver) -> None:
         # P4-S1 — cross-projection freshness protocol. Serialize this finalize against the

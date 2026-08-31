@@ -25,6 +25,7 @@ Semantics (from CONTRACTS.md / the DD):
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -49,6 +50,12 @@ STATE_INVALIDATED = "INVALIDATED"
 LOCK_PREDICATE = "*LOCK*"
 STATE_LOCKED = "LOCKED"
 STATE_UNLOCKED = "UNLOCKED"
+
+#: Pseudo-predicate under which a canonical entity's durable identity metadata
+#: (type, display label, aliases, support refs, memberships, state, confidence)
+#: is folded as a Tier-0 row (Plan S P1-S3/P1-S4). Persisted like any scalar row,
+#: so it is queryable and reconstructable by wipe-and-replay.
+CANONICAL_IDENTITY_PREDICATE = "CANONICAL_IDENTITY"
 
 
 class CurrentStateRow(BaseModel):
@@ -337,6 +344,10 @@ def _entity_resolved(row: CurrentStateRow, event: SemanticEvent, seq: int) -> Cu
     payload = event.payload
     kind = payload.get("kind", "ALIAS")
     target = payload.get("target_entity_id") or payload.get("entity_id")
+    state = payload.get("state") or (
+        STATE_CONFIRMED if kind in ("ALIAS", "ESTABLISH") else STATE_PROBABLE
+    )
+    conf = payload.get("confidence")
     return _assertion(
         row.model_copy(update={"authority": None}),
         SemanticEvent(
@@ -346,14 +357,192 @@ def _entity_resolved(row: CurrentStateRow, event: SemanticEvent, seq: int) -> Cu
                 "subject_ref": str(payload.get("entity_id", "")),
                 "object_ref": str(target) if target else None,
                 "authority": event.authority,
-                "confidence": None,
-                "state": STATE_CONFIRMED if kind == "ALIAS" else STATE_PROBABLE,
+                "confidence": conf,
+                "state": state,
             },
             authority=event.authority,
             seq=seq,
         ),
         seq,
     )
+
+
+def identity_event_target(event: SemanticEvent) -> tuple[str, str] | None:
+    """The ``(canonical_ref, CANONICAL_IDENTITY)`` row an event establishes or
+    corrects, or ``None`` if the event carries no canonical-identity metadata.
+
+    Canonical-identity events address the canonical entity itself, not an alias:
+      * ``EntityResolved`` kind ``ESTABLISH``/``UPDATE`` (creation / correction)
+        — ``entity_id`` IS the canonical ref;
+      * ``OverrideApplied``/``CorrectionApplied``/``Invalidated`` that explicitly
+        carry ``predicate == CANONICAL_IDENTITY`` (human override / invalidation).
+    Plain ``MERGE``/``SPLIT``/``ALIAS`` events address alias/candidate mentions
+    and do not rewrite the canonical's identity.
+    """
+    if event.event_type == "EntityResolved" and event.payload.get("kind") in (
+        "ESTABLISH",
+        "UPDATE",
+    ):
+        ref = event.payload.get("entity_id")
+    elif event.event_type in ("OverrideApplied", "CorrectionApplied", "Invalidated"):
+        if event.payload.get("predicate") != CANONICAL_IDENTITY_PREDICATE:
+            return None
+        ref = entity_ref_of(event)
+    else:
+        return None
+    if not ref:
+        return None
+    return (str(ref), CANONICAL_IDENTITY_PREDICATE)
+
+
+def _identity_metadata(event: SemanticEvent) -> dict[str, Any]:
+    """The canonical-identity metadata dict an event carries.
+
+    For an override/correction the corrected metadata may arrive as a JSON blob in
+    ``object_ref`` (parsed if valid JSON); otherwise it is assembled from the
+    additive payload fields. Only the latest non-invalidated/non-corrected values
+    are exposed active; prior values stay immutable in the event stream.
+    """
+    payload = event.payload
+    if event.event_type in ("OverrideApplied", "CorrectionApplied") and payload.get("object_ref"):
+        raw = str(payload.get("object_ref"))
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+    kind = payload.get("kind")
+    return {
+        "canonical_type": payload.get("canonical_type"),
+        "display_label": payload.get("display_label"),
+        "aliases": list(payload.get("aliases") or []),
+        "support_refs": list(payload.get("support_refs") or []),
+        "memberships": dict(payload.get("memberships") or {}),
+        "state": payload.get("state") or (STATE_CONFIRMED if kind == "ESTABLISH" else None),
+        "confidence": payload.get("confidence"),
+    }
+
+
+def _empty_memberships() -> dict[str, list[str]]:
+    return {"source_ids": [], "work_ids": [], "continuity_ids": []}
+
+
+def _memberships_of(row: CurrentStateRow) -> dict[str, list[str]]:
+    """Parse the memberships carried on a row's active metadata (or empty)."""
+    if not row.object_ref:
+        return _empty_memberships()
+    try:
+        parsed = json.loads(row.object_ref)
+    except (TypeError, ValueError):
+        return _empty_memberships()
+    if not isinstance(parsed, dict):
+        return _empty_memberships()
+    memberships = parsed.get("memberships")
+    if isinstance(memberships, dict):
+        return {
+            str(k): [str(x) for x in (v if isinstance(v, list) else [])]
+            for k, v in memberships.items()
+        }
+    return _empty_memberships()
+
+
+def _union_memberships(
+    prev: dict[str, list[str]], incoming: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    """Deterministically union two membership dicts, per sub-list, deduped.
+
+    Plan S (P3-S1/S2): membership is CUMULATIVE across the sources that feed a
+    canonical identity — re-establishing a canonical from a second source of the
+    same work accumulates that source (and never drops a prior one). Order is
+    ``prev`` then ``incoming``, deduplicated, so replay is deterministic.
+    """
+    out: dict[str, list[str]] = {}
+    for key in sorted(set(prev) | set(incoming)):
+        seen: list[str] = []
+        for item in list(prev.get(key) or []) + list(incoming.get(key) or []):
+            if item not in seen:
+                seen.append(item)
+        out[key] = seen
+    return out
+
+
+def _reduce_canonical_identity(row: CurrentStateRow, event: SemanticEvent) -> CurrentStateRow:
+    """Fold a canonical-identity establishment/correction/override/invalidation.
+
+    Pure, total, deterministic: honours USER_OVERRIDE precedence, lock state,
+    and last-write-wins ordering; invalidation marks the identity inactive. The
+    prior active metadata is retained in ``alternatives`` (reducer auxiliary) and
+    remains immutable in the event stream.
+    """
+    etype = event.event_type
+    seq = event.seq if event.seq is not None else row.seq + 1
+    if etype == "Invalidated":
+        if row.authority == USER_OVERRIDE and (event.authority or "machine") != USER_OVERRIDE:
+            return row
+        if seq < row.seq:
+            return row
+        if seq == row.seq:
+            return row
+        return row.model_copy(
+            update={
+                "state": STATE_INVALIDATED,
+                "seq": seq,
+                "authority": event.authority or row.authority,
+                "locked": row.locked,
+            }
+        )
+
+    # USER_OVERRIDE beats machine inference, always.
+    if row.authority == USER_OVERRIDE and (event.authority or "machine") != USER_OVERRIDE:
+        return row
+    if seq < row.seq:
+        return row
+    if seq == row.seq:
+        return row
+
+    metadata = _identity_metadata(event)
+    if metadata.get("memberships"):
+        metadata["memberships"] = _union_memberships(_memberships_of(row), metadata["memberships"])
+    alternatives = list(row.alternatives)
+    if row.object_ref and row.object_ref != json.dumps(metadata, sort_keys=True):
+        alternatives.append(
+            {
+                "object_ref": row.object_ref,
+                "authority": row.authority,
+                "state": row.state,
+                "confidence": row.confidence,
+                "seq": row.seq,
+            }
+        )
+    return row.model_copy(
+        update={
+            "object_ref": json.dumps(metadata, sort_keys=True),
+            "confidence": (payload_conf(event, row)),
+            "authority": (
+                USER_OVERRIDE
+                if event.authority == USER_OVERRIDE
+                else event.authority or row.authority
+            ),
+            "state": (
+                STATE_USER_CONFIRMED
+                if event.authority == USER_OVERRIDE
+                else metadata.get("state") or row.state or STATE_CONFIRMED
+            ),
+            "seq": seq,
+            "alternatives": alternatives,
+            "locked": row.locked,
+        }
+    )
+
+
+def payload_conf(event: SemanticEvent, row: CurrentStateRow) -> float | None:
+    p = event.payload.get("confidence")
+    if p is not None:
+        return float(p)
+    if event.confidence is not None:
+        return event.confidence
+    return row.confidence
 
 
 def _candidate(row: CurrentStateRow, event: SemanticEvent, seq: int) -> CurrentStateRow:
@@ -450,6 +639,19 @@ class CurrentStateReducer:
             current = CurrentStateRow(entity_ref=target[0], predicate=target[1])
         updated = reduce_current_state(current, event)
         state.rows[target] = updated
+
+        # Plan S (P1-S4): a canonical establishment/correction also reduces the
+        # durable identity metadata row (same lock/authority/LWW rules).
+        identity_target = identity_event_target(event)
+        if identity_target is not None:
+            if state.locks.get(identity_target[0]):
+                return state
+            identity_row = state.rows.get(identity_target)
+            if identity_row is None:
+                identity_row = CurrentStateRow(
+                    entity_ref=identity_target[0], predicate=identity_target[1]
+                )
+            state.rows[identity_target] = _reduce_canonical_identity(identity_row, event)
         return state
 
     def replay(self, events: list[SemanticEvent]) -> CurrentReducedState:

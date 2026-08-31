@@ -851,8 +851,10 @@ def test_book_fixture_full_dag_provider_promotion_via_ledger_not_projections(
     assert "PRESENT_IN" in by_obj
     assert "SPEAKS" in by_obj and "UTTERED_IN" in by_obj
     assert "CO_OCCURS" in by_obj
-    # Unsupported predicate stays evidence-only (never an assertion).
-    assert "SIBLING_OF" not in by_obj
+    # Plan S Phase 4 (P4-S1): SIBLING_OF is now a registered controlled-vocabulary
+    # relationship, so the provider's Mara->Ellis sibling observation is promoted
+    # through the ledger (it is no longer an unsupported evidence-only predicate).
+    assert "SIBLING_OF" in by_obj
 
     # Ledger carries the provider provenance on the appended SemanticAsserted events.
     assert prov_events and int(prov_events) > 0, "provider assertions missing from the ledger"

@@ -25,6 +25,7 @@ evidence and claims.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -64,6 +65,8 @@ class ResolutionKind(StrEnum):
     MERGE = "MERGE"
     SPLIT = "SPLIT"
     ALIAS = "ALIAS"
+    ESTABLISH = "ESTABLISH"
+    UPDATE = "UPDATE"
 
 
 # ---------------------------------------------------------------------------
@@ -81,8 +84,20 @@ def resolved_event(
     reason: str | None = None,
     quarantined_refs: list[str] | None = None,
     intensity: float | None = None,
+    canonical_type: str | None = None,
+    display_label: str | None = None,
+    aliases: list[str] | None = None,
+    support_refs: list[str] | None = None,
+    memberships: dict[str, list[str]] | None = None,
+    state: str | None = None,
 ) -> SemanticEvent:
-    """Build an ``EntityResolved`` event conforming to ``EntityResolved/v1.json``."""
+    """Build an ``EntityResolved`` event conforming to ``EntityResolved/v2.json``.
+
+    v2 (Plan S P1-S3) adds additive canonical-identity metadata (canonical type,
+    display label, active aliases, support refs, memberships, state). Retained
+    v1 MERGE/SPLIT/ALIAS events upcast with neutral defaults; nothing historical
+    is mutated.
+    """
     payload: dict[str, Any] = {
         "kind": kind,
         "entity_id": entity_id,
@@ -91,9 +106,15 @@ def resolved_event(
         "assignments": assignments or {},
         "reason": reason,
         "quarantined_refs": quarantined_refs or [],
+        "canonical_type": canonical_type,
+        "display_label": display_label,
+        "aliases": aliases or [],
+        "support_refs": support_refs or [],
+        "memberships": memberships or {},
+        "state": state,
     }
     if intensity is not None:
-        payload["intensity"] = intensity
+        payload["confidence"] = intensity
     return SemanticEvent(
         event_type="EntityResolved",
         authority="machine",
@@ -347,7 +368,7 @@ class PostgresSplitEnumerator:
 
 
 class Resolver:
-    """Applies MERGE / ALIAS / SPLIT as append-only events + ledger transactions."""
+    """Applies ESTABLISH / MERGE / ALIAS / SPLIT as append-only events + ledger transactions."""
 
     def __init__(
         self,
@@ -362,6 +383,50 @@ class Resolver:
         self._mentions = mentions
         self._engine = engine
         self._quarantine = quarantine
+
+    def establish(
+        self,
+        *,
+        canonical: str,
+        metadata: dict[str, Any] | None = None,
+        reason: str | None = None,
+    ) -> CommitResult:
+        """ESTABLISH: record an accepted canonical's identity metadata.
+
+        Plan S (P1-S3): the canonical becomes a first-class ledger identity — the
+        event carries canonical type, display label, active aliases, support refs,
+        memberships, state, and confidence. Idempotent via a stable canonical key
+        so a machine rerun converges (never duplicates the establishment).
+        """
+        meta = dict(metadata or {})
+        event = resolved_event(
+            kind="ESTABLISH",
+            entity_id=canonical,
+            target_entity_id=canonical,
+            refs=list(meta.get("support_refs") or [canonical]),
+            assignments={canonical: canonical},
+            reason=reason or "canonical establishment",
+            canonical_type=meta.get("canonical_type"),
+            display_label=meta.get("display_label"),
+            aliases=list(meta.get("aliases") or []),
+            support_refs=list(meta.get("support_refs") or []),
+            memberships=meta.get("memberships"),
+            state=meta.get("state"),
+            intensity=meta.get("confidence"),
+        )
+        # Plan S (P3-S1): the idempotency key includes a deterministic fingerprint
+        # of the identity metadata, so re-establishing the SAME canonical with a
+        # DIFFERENT source's membership appends (and the reducer union accumulates
+        # it), while a same-content rerun still converges without duplication.
+        # ``state`` is intentionally EXCLUDED from the fingerprint: a machine rerun
+        # that seeds onto an existing canonical flips PROBABLE -> CONFIRMED, which is
+        # a transient annotation, not new identity content — dropping it keeps the
+        # fingerprint stable so a rerun over the same members converges instead of
+        # appending a duplicate establishment.
+        fingerprint = {k: v for k, v in meta.items() if k != "state"}
+        digest = json.dumps(fingerprint, sort_keys=True, default=str)
+        idem = uuid.uuid5(uuid.NAMESPACE_URL, f"umd-establish:{canonical}\x1f{digest}")
+        return self._ledger.append([event], idempotency_key=idem)
 
     def merge(
         self,

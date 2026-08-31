@@ -99,9 +99,14 @@ class _LanternProvider:
     """A model provider emitting the FULL validated observation range anchored to
     the exact input segment locators (so every candidate passes exact support).
 
-    Includes one unsupported relationship predicate (``SIBLING_OF``, not a
-    registered predicate) that must stay evidence-only, and an ambiguous entity
-    surface that must never be fabricated into a canonical assertion.
+    Emits the FULL validated observation range anchored to the exact input
+    segment locators (so every candidate passes exact support): supported
+    speaker/relationship events that become SemanticReconciler events, an
+    ambiguous entity surface that must never be fabricated into a canonical
+    assertion, and unsupported relationship predicates that stay evidence-only.
+    ``SIBLING_OF`` is now registered in the controlled vocabulary (Plan S P4-S1),
+    so this provider's SIBLING_OF Mara->Ellis relationship is materialized as a
+    real semantic event rather than remaining evidence-only.
     """
 
     name = "lantern_semantic"
@@ -441,12 +446,11 @@ def test_p2s1_provider_categories_promote_to_reconciler_events(
     # Provider emotions / states / context -> their reconciler events.
     assert "HAS_EMOTION" in preds and "IN_STATE" in preds and "HAS_CONTEXT" in preds
 
-    # Supported relationship predicate -> the predicate is emitted directly.
+    # Supported relationship predicates -> the predicate is emitted directly.
+    # Plan S Phase 4 (P4-S1): SIBLING_OF is now a registered controlled-vocabulary
+    # relationship, so the provider's Mara->Ellis sibling observation is promoted.
     assert "CO_OCCURS" in preds, "supported relationship predicate must emit an event"
-
-    # Unsupported relationship predicate stays evidence-only: SIBLING_OF is not a
-    # registered predicate, so no SIBLING_OF event is fabricated.
-    assert "SIBLING_OF" not in preds, "unsupported relationship predicate must stay evidence-only"
+    assert "SIBLING_OF" in preds, "registered SIBLING_OF predicate must emit an event"
 
     # No fabricated predicate: every emitted predicate is a known reconciler output.
     known_predicates = {
@@ -459,6 +463,7 @@ def test_p2s1_provider_categories_promote_to_reconciler_events(
         "UTTERED_IN",
         "HAS_TRAIT",
         "CO_OCCURS",
+        "SIBLING_OF",
         "HAS_EMOTION",
         "IN_STATE",
         "HAS_CONTEXT",
@@ -476,8 +481,12 @@ def test_p2s1_unsupported_and_ambiguous_stay_evidence_only_never_fabricated(
     events = _recon_events(seam)
     by_pred = _events_by_predicate(events)
 
-    # Unsupported predicate (SIBLING_OF) -> no event.
-    assert "SIBLING_OF" not in by_pred
+    # SIBLING_OF is a registered controlled-vocabulary predicate (Plan S P4-S1), so
+    # the provider's sibling observation is now a valid reconciler event. The
+    # "unsupported stays evidence-only" guarantee is exercised with genuinely
+    # unregistered/malformed predicates in test_p2s4_unsupported_predicate_evidence...
+    # and in the Phase-4 sibling tests below.
+    assert "SIBLING_OF" in by_pred, "registered SIBLING_OF must now be emitted"
 
     # Speaker candidates produce no standalone predicate (SPEAKS/UTTERED_IN only
     # ever come from typed utterance observations, never from a bare speaker label).
@@ -734,23 +743,38 @@ def test_p2s4_unsupported_predicate_evidence_stays_evidence_only(
         run_structural=False,
     )
     gb = _provider_gb()
-    # A VALID relationship observation whose predicate is not registered: it must
-    # be rehydrated (valid model) yet stay evidence-only at reconciliation.
+    # Plan S Phase 4 (P4-S1) lockstep: SIBLING_OF is now a registered controlled
+    # vocabulary predicate, so it is no longer the "unsupported" example. The
+    # malformed/arbitrary-model-predicate rejection MUST remain strict, so this
+    # test now proves that a well-formed-but-unregistered predicate AND a malformed
+    # arbitrary string stay evidence-only at reconciliation (never fabricated).
     _record_observations(
         seam,
         [
+            # Well-formed but NOT in the controlled vocabulary -> rejected.
             {
                 "subject_ref": "Mara",
-                "predicate": "SIBLING_OF",
+                "predicate": "TRANSMUTATION_OF",
                 "object_ref": "Ellis",
                 "segment": {"locator": _VALID_LOCATOR},
                 "generated_by": gb,
-            }
+            },
+            # Malformed arbitrary model predicate (hyphen) -> rejected.
+            {
+                "subject_ref": "Mara",
+                "predicate": "sibling-of",
+                "object_ref": "Ellis",
+                "segment": {"locator": _VALID_LOCATOR},
+                "generated_by": gb,
+            },
         ],
     )
     events = _recon_events(seam)
     preds = {p["predicate_code"] for p in events}
-    assert "SIBLING_OF" not in preds, "unsupported relationship predicate must stay evidence-only"
+    assert "TRANSMUTATION_OF" not in preds, (
+        "unregistered predicate must stay evidence-only, never an assertion"
+    )
+    assert "SIBLING-OF" not in preds, "malformed arbitrary predicate must stay evidence-only"
 
 
 def test_p2s4_missing_model_degrades_with_honest_warning(

@@ -182,6 +182,12 @@ register_predicate("HAS_EMOTION", "An entity exhibits an emotion.")
 register_predicate("IN_STATE", "An entity is in a narrative state.")
 register_predicate("HAS_CONTEXT", "A scene/segment has a context/environment observation.")
 register_predicate("STARTS_AT", "A scene starts at a source segment.")
+# Plan S Phase 4 (P4-S1): the Lantern Keeper sibling predicate is a controlled,
+# validated-vocabulary relationship. It is admitted ONLY through register_predicate
+# (syntax gate: ^[A-Z][A-Z0-9_]{0,63}$ + registration into PREDICATE_VOCABULARY),
+# exactly like every other relationship predicate. Malformed/arbitrary model strings
+# are still rejected by is_known_predicate in the reconciler (never fabricated).
+register_predicate("SIBLING_OF", "An entity is a sibling of another entity.")
 
 
 class Predicate(BaseModel):

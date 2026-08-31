@@ -128,6 +128,16 @@ class EntityResponse(BaseModel):
     kind: str
     predicate: str | None = None
     value: str | None = None
+    # Plan S (P2-S2): canonical-identity metadata surfaced through the ENTITY read.
+    # Populated only for canonical identities read from the reducer CANONICAL_IDENTITY
+    # row; always None/empty for legacy CANONICAL_ENTITY fallback hits.
+    canonical_type: str | None = None
+    display_label: str | None = None
+    aliases: list[str] = Field(default_factory=list)
+    state: str | None = None
+    confidence: float | None = None
+    support_refs: list[str] = Field(default_factory=list)
+    memberships: dict[str, Any] = Field(default_factory=dict)
 
 
 class EntityListResponse(BaseModel):

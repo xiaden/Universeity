@@ -34,12 +34,20 @@ router = APIRouter(
 
 
 def _entity(h: Any) -> EntityResponse:
+    data = getattr(h, "data", None) or {}
     return EntityResponse(
         ref=h.ref,
         label=h.label,
         kind=h.kind,
         predicate=h.predicate,
         value=h.value,
+        canonical_type=data.get("canonical_type"),
+        display_label=data.get("display_label") or h.label,
+        aliases=list(data.get("aliases") or []),
+        state=data.get("state"),
+        confidence=data.get("confidence"),
+        support_refs=list(data.get("support_refs") or []),
+        memberships=dict(data.get("memberships") or {}),
     )
 
 
@@ -47,11 +55,23 @@ def _entity(h: Any) -> EntityResponse:
 def list_entities(
     limit: int = Query(default=20, ge=1, le=200),
     cursor: str | None = Query(default=None),
+    name: str | None = Query(default=None, description="exact active display-label filter"),
+    name_fuzzy: str | None = Query(default=None, description="case-insensitive label substring"),
+    alias: str | None = Query(default=None, description="alias surface resolves its canonical"),
     ctx: AppContext = Depends(get_context),
     _p: Any = Depends(get_principal),
 ) -> EntityListResponse:
     offset = offset_from(cursor)
-    page = ctx.query.structured(StructuredQuery(kind="ENTITY", limit=limit, offset=offset))
+    filters: dict[str, Any] = {}
+    if name:
+        filters["name"] = name
+    if name_fuzzy:
+        filters["name_fuzzy"] = name_fuzzy
+    if alias:
+        filters["alias"] = alias
+    page = ctx.query.structured(
+        StructuredQuery(kind="ENTITY", filters=filters, limit=limit, offset=offset)
+    )
     next_cursor, prev_cursor = page_cursors(offset, limit, page.total)
     return EntityListResponse(
         items=[_entity(h) for h in page.results],

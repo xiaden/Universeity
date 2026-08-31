@@ -30,6 +30,7 @@ from umd.projections.tables import (
 from umd.projections.tables import (
     active_semantic_edge as _edge,
 )
+from umd.storage.postgres.reducer import CANONICAL_IDENTITY_PREDICATE
 from umd.storage.postgres.tables import metadata as db_meta
 
 _cs = db_meta.tables["current_state"]
@@ -48,6 +49,23 @@ UTTERANCE_PREDICATES = frozenset({"SPEAKS", "SAYS", "UTTERANCE", "PRONUNCIATION"
 
 #: Segment types treated as scenes / shots / chapters (bounded scene query).
 SCENE_SEGMENT_TYPES = frozenset({"scene", "chapter", "shot", "frame", "section", "act"})
+
+
+def _identity_metadata(object_ref: Any) -> dict[str, Any]:
+    """Parse a persisted ``CANONICAL_IDENTITY`` row's JSON metadata dict.
+
+    ``current_state.object_ref`` is a JSON serialization of the canonical-identity
+    metadata ({canonical_type, display_label, aliases, support_refs, memberships,
+    state, confidence}). A malformed/unparsable blob degrades to ``{}`` so a read
+    never raises on storage that predates the field.
+    """
+    if not object_ref:
+        return {}
+    try:
+        parsed = json.loads(str(object_ref))
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 # ---------------------------------------------------------------------------
@@ -163,43 +181,199 @@ class QueryService:
     # -- entities ----------------------------------------------------------
 
     def entities(self, q: StructuredQuery) -> ProvenanceBearingPage:
+        """Bounded canonical-ENTITY read over ledger/reducer-backed identity.
+
+        Plan S (P2-S1): a canonical entity is read from the reducer ``current_state``
+        ``CANONICAL_IDENTITY`` row (its durable identity metadata) — never the SQL
+        ``entity`` table, which is not an authority. When no identity row exists the
+        read falls back to the ``CANONICAL_ENTITY`` row (alias/legacy canonicals),
+        preserving earlier behavior. ``ref`` matches the opaque ref, ``alias`` resolves
+        an alias surface to its canonical, and ``name``/``name_fuzzy`` match the active
+        display label (exact / case-insensitive substring) — all resolve the same
+        canonical. Historical labels/aliases live in ``row.alternatives`` and the
+        immutable ledger; they are audit-only and never active here.
+        """
         self._scope(q)
-        conds: list[Any] = [
-            (_cs.c.predicate == "CANONICAL_ENTITY"),
-            (sa.or_(_cs.c.object_ref.is_not(None), sa.text("1=1"))),
-        ]
+        base: list[Any] = [(_cs.c.object_ref.is_not(None))]
         if q.confidence_min is not None:
-            conds.append(_cs.c.confidence >= q.confidence_min)
+            base.append(_cs.c.confidence >= q.confidence_min)
         if q.filters.get("ref"):
-            conds.append(_cs.c.entity_ref == q.filters["ref"])
-        if q.filters.get("alias"):
-            alias = q.filters["alias"]
+            base.append(_cs.c.entity_ref == q.filters["ref"])
+        name = q.filters.get("name")
+        fuzzy_name = q.filters.get("name_fuzzy") or q.filters.get("label_contains")
+        alias = q.filters.get("alias")
+
+        if name is not None or fuzzy_name is not None:
+            # Display-label matching applies only to canonical-identity metadata
+            # (labels/aliases live in the reducer row, never the SQL entity table).
+            conds = base + [_cs.c.predicate == CANONICAL_IDENTITY_PREDICATE]
+            filtered: list[Any] = []
+            for r in self._identity_rows(conds):
+                label = str(_identity_metadata(r.object_ref).get("display_label") or "")
+                if name is not None and label != str(name):
+                    continue
+                if fuzzy_name is not None and str(fuzzy_name).lower() not in label.lower():
+                    continue
+                filtered.append(r)
+            ordered = sorted(filtered, key=lambda r: str(r.entity_ref))
+            total = len(ordered)
+        elif alias is not None:
+            # Resolve the alias surface to its canonical(s): id-based resolution
+            # (mention ids, current_entity_map, ALIAS events) union the canonical's
+            # active aliases carried in identity metadata. Reads identity + entity
+            # rows so a legacy/alias canonical with no identity row still resolves.
             ids = self._alias_entity_ids(alias)
-            conds.append(_cs.c.entity_ref.in_(ids) if ids else sa.literal(False))
-        page = self._run(
-            q,
-            _cs,
-            [
-                (_cs.c.entity_ref, "entity_ref"),
-                (_cs.c.object_ref, "object_ref"),
-                (_cs.c.confidence, "confidence"),
-                (_cs.c.authority, "authority"),
-                (_cs.c.seq, "seq"),
-            ],
-            conds,
-            lambda r: QueryResultHit(
-                ref=r.entity_ref,
-                kind=_CE,
-                label="canonical entity",
-                predicate="CANONICAL_ENTITY",
-                value=r.object_ref,
-                score=None,
-                confidence=r.confidence,
-                data={"seq": r.seq, "authority": r.authority},
-            ),
+            ids += self._identity_alias_refs(alias)
+            refs = list(dict.fromkeys(ids))
+            conds = base + [_cs.c.predicate.in_(["CANONICAL_ENTITY", CANONICAL_IDENTITY_PREDICATE])]
+            if refs:
+                conds.append(_cs.c.entity_ref.in_(refs))
+            else:
+                conds.append(sa.literal(False))
+            ordered, total = self._entity_ordered(conds, q)
+        else:
+            # General / ref path: canonical identities + legacy CANONICAL_ENTITY rows
+            # keyed by a canonical-like ref (contains ':') — never a raw UUID alias
+            # surface (a mention marker, not an entity). Dedup by ref, identity wins.
+            conds = base + [
+                sa.or_(
+                    _cs.c.predicate == CANONICAL_IDENTITY_PREDICATE,
+                    sa.and_(_cs.c.predicate == "CANONICAL_ENTITY", _cs.c.entity_ref.contains(":")),
+                )
+            ]
+            ordered, total = self._entity_ordered(conds, q)
+        results = [self._entity_hit(r) for r in ordered[q.offset : q.offset + q.limit]]
+        return ProvenanceBearingPage(
+            query=q.kind,
+            results=results,
+            total=total,
+            limit=q.limit,
+            offset=q.offset,
+            result_kinds=[_CE],
+            provenance={"authority": "postgres typed relational projection"},
         )
-        page.result_kinds = [_CE]
-        return page
+
+    def _entity_rows(self, conds: list[Any], q: StructuredQuery) -> list[Any]:
+        """Fetch candidate entity/identity rows, bounded so pagination+dedup suffice.
+
+        Each distinct ref contributes at most two rows (CANONICAL_IDENTITY +
+        CANONICAL_ENTITY), adjacent under the ``entity_ref`` ordering, so fetching
+        ``2 * (offset + limit)`` rows guarantees at least ``limit`` distinct refs.
+        """
+        cols = [
+            (_cs.c.entity_ref, "entity_ref"),
+            (_cs.c.predicate, "predicate"),
+            (_cs.c.object_ref, "object_ref"),
+            (_cs.c.confidence, "confidence"),
+            (_cs.c.authority, "authority"),
+            (_cs.c.seq, "seq"),
+            (_cs.c.state, "state"),
+        ]
+        stmt = (
+            sa.select(*[c.label(n) for c, n in cols])
+            .where(*conds)
+            .order_by(_cs.c.entity_ref)
+            .limit((q.limit + q.offset) * 2 + 4)
+        )
+        with self._engine.connect() as conn:
+            return list(conn.execute(stmt).fetchall())
+
+    def _identity_rows(self, conds: list[Any]) -> list[Any]:
+        cols = [
+            (_cs.c.entity_ref, "entity_ref"),
+            (_cs.c.predicate, "predicate"),
+            (_cs.c.object_ref, "object_ref"),
+            (_cs.c.confidence, "confidence"),
+            (_cs.c.authority, "authority"),
+            (_cs.c.seq, "seq"),
+            (_cs.c.state, "state"),
+        ]
+        stmt = sa.select(*[c.label(n) for c, n in cols]).where(*conds)
+        with self._engine.connect() as conn:
+            return list(conn.execute(stmt).fetchall())
+
+    def _identity_alias_refs(self, alias: Any) -> list[str]:
+        """Canonical refs whose active identity metadata lists ``alias`` as an alias."""
+        rows = self._identity_rows([_cs.c.predicate == CANONICAL_IDENTITY_PREDICATE])
+        result: list[str] = []
+        for r in rows:
+            aliases = _identity_metadata(r.object_ref).get("aliases") or []
+            if str(alias) in {str(a) for a in aliases}:
+                result.append(str(r.entity_ref))
+        return result
+
+    def _entity_ordered(self, conds: list[Any], q: StructuredQuery) -> tuple[list[Any], int]:
+        """Fetch entity/identity rows, dedup by ref (identity wins), and paginate."""
+        best: dict[str, Any] = {}
+        for r in self._entity_rows(conds, q):
+            key = str(r.entity_ref)
+            if r.predicate == CANONICAL_IDENTITY_PREDICATE or key not in best:
+                best[key] = r
+        ordered = sorted(best.values(), key=lambda r: str(r.entity_ref))
+        return ordered, self._entity_total(conds)
+
+    def _entity_total(self, conds: list[Any]) -> int:
+        with self._engine.connect() as c:
+            val = c.execute(
+                sa.select(sa.func.count(sa.distinct(_cs.c.entity_ref)))
+                .select_from(_cs)
+                .where(*conds)
+            ).scalar()
+        return int(val or 0)
+
+    def _entity_hit(self, r: Any) -> QueryResultHit:
+        if r.predicate == CANONICAL_IDENTITY_PREDICATE:
+            meta = _identity_metadata(r.object_ref)
+            label = meta.get("display_label") or str(r.entity_ref)
+            conf = meta.get("confidence")
+            if conf is None:
+                conf = r.confidence
+            state = meta.get("state") or r.state or "UNKNOWN"
+            aliases = list(meta.get("aliases") or [])
+            support = list(meta.get("support_refs") or [])
+            memberships = dict(meta.get("memberships") or {})
+            ctype = meta.get("canonical_type")
+            return QueryResultHit(
+                ref=str(r.entity_ref),
+                kind=_CE,
+                label=label,
+                predicate="CANONICAL_ENTITY",
+                value=label,
+                confidence=conf,
+                provenance={
+                    "predicate": CANONICAL_IDENTITY_PREDICATE,
+                    "support_refs": support,
+                    "state": state,
+                },
+                capabilities={
+                    "canonical_type": ctype,
+                    "aliases": aliases,
+                    "state": state,
+                    "memberships": memberships,
+                    "display_label": label,
+                },
+                data={
+                    "seq": r.seq,
+                    "authority": r.authority,
+                    "canonical_type": ctype,
+                    "aliases": aliases,
+                    "state": state,
+                    "confidence": conf,
+                    "support_refs": support,
+                    "memberships": memberships,
+                    "display_label": label,
+                },
+            )
+        # Fallback: a CANONICAL_ENTITY row without identity metadata (alias/legacy).
+        return QueryResultHit(
+            ref=str(r.entity_ref),
+            kind=_CE,
+            label="canonical entity",
+            predicate="CANONICAL_ENTITY",
+            value=r.object_ref,
+            confidence=r.confidence,
+            data={"seq": r.seq, "authority": r.authority},
+        )
 
     # -- utterances --------------------------------------------------------
 
