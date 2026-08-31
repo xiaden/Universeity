@@ -51,8 +51,8 @@ appended, and a decomposable job is submitted. Returns `source_id`, `work_id`,
 
 | Method + path | Auth | Body / params | Response |
 |---|---|---|---|
-| `GET /v1/entities` | read | `limit`, `cursor` | `EntityListResponse` |
-| `GET /v1/entities/{ref}` | read | — | `EntityResponse` |
+| `GET /v1/entities` | read | `limit`, `cursor`, `name`, `name_fuzzy`, `alias`, `work_id`, `source_id`, `continuity_id` | `EntityListResponse` |
+| `GET /v1/entities/{ref}` | read | `work_id`, `source_id`, `continuity_id` | `EntityResponse` |
 | `POST /v1/entities` | write | `EntityCreateRequest` | `201` `EntityActionResponse` |
 | `POST /v1/entities/{ref}/lock` | write | — | `EntityActionResponse` |
 | `POST /v1/entities/{ref}/unlock` | write | — | `EntityActionResponse` |
@@ -63,6 +63,34 @@ appended, and a decomposable job is submitted. Returns `source_id`, `work_id`,
 `consistency_token` (and `detail` on merge/split). MERGE/SPLIT reach the full
 reversible resolver (ledger + mention rebind + quarantine), returning
 `422 invalid_merge` / `422 invalid_split` on rejection.
+
+**Membership filters.** `GET /v1/entities` and `GET /v1/entities/{ref}` accept
+bounded replay-derived membership query params `work_id`, `source_id`, and
+`continuity_id`, restricting the read to **active** canonicals whose memberships
+intersect the requested scope. A malformed `work_id`/`continuity_id` (not a valid
+UUID) is an explicit RFC 7807 `422 unmappable_scope` — never silently unfiltered.
+A by-ref read with no in-scope match returns `404`.
+
+**`EntityCreateRequest`** (POST /v1/entities) carries the canonical's identity
+metadata and routes through the **same resolution authority** as machine
+resolution (`Resolver.establish`): `ref` (the opaque canonical ref,
+`min_length=1`), `display_label` (active display label; legacy `label` kept as an
+alias, `display_label` wins when both set), `canonical_type`, `aliases`,
+`memberships` (replay-derived source/work/continuity), `support_refs`, `state`
+(defaults to `CONFIRMED`), `authority` (`operator` | `human`, default
+`operator`), `confidence` (0–1, default 1.0), `reason`, and `actor`. A non-
+`operator|human` `authority` is `422 invalid_authority`. No SQL `entity` row is
+fabricated (Plan N Option B); a non-UUID ref keeps `entity_id` NULL on any
+mention rows.
+
+**`EntityResponse` metadata.** Canonical identity hits surface the exact
+`provenance`, `generated_by`, and `capabilities` computed by the query layer on
+list, by-ref, and structured `ENTITY` reads (empty dicts for legacy
+`CANONICAL_ENTITY` fallback hits), alongside `canonical_type`, `display_label`,
+`aliases`, `state`, `confidence`, `support_refs`, and `memberships`. The identity
+`classification` is not part of this public read surface: it is carried only by the
+`EntityResolved` ESTABLISH event payload and persisted in the canonical-identity
+metadata, never surfaced on `EntityResponse`.
 
 ## Claims
 
@@ -151,7 +179,7 @@ Every failure returns `application/problem+json` with a `type` under
 | `not_found` | 404 | no |
 | `conflict` / `retry_failed` / `rerun_failed` | 409 | yes / no |
 | `validation_error` | 422 | no |
-| `invalid_query` / `unmappable_scope` / `invalid_merge` / `invalid_split` | 422 | no |
+| `invalid_query` / `unmappable_scope` / `invalid_authority` / `invalid_merge` / `invalid_split` | 422 | no |
 | `rate_limited` | 429 | yes |
 | `consistency_transient_lag` / `consistency_rebuild` | 503 | yes |
 | `not_ready` | 503 | yes |

@@ -71,6 +71,9 @@ Alembic chain (applied `alembic upgrade head`):
 | `0004_projections` | projection checkpoints, search/vector projections |
 | `0005_scope_filters` | structured-query scope filter support (continuity/temporal/spatial) |
 | `0006_projection_wipe_gate` | transaction-scoped GUC opt-in for the single-writer vector projection wipe-and-replay reset |
+| `0007_stage_run_evidence_refs` | authoritative evidence/artifact refs persisted on `stage_run` for atomic durable stage completion |
+| `0008_active_semantic_edge` | active multi-edge relationship projection table (replay-built, single-writer) |
+| `0009_search_scope` | `search_document` `work_id`/`continuity_id` scope columns for scoped canonical search |
 
 Migrations ship in the image and run against the live DSN at startup — never a
 baked offline schema that could silently diverge.

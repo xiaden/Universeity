@@ -12,6 +12,10 @@ The request carries a typed `kind`, optional `ref`, typed `filters`, an optional
 - `ref`, `filters` (JSONB), `confidence_min`, `result_kind`, `max_depth`
   (0–8, clamped to the configured cap), `limit`, `offset`,
   `continuity_id`, `temporal_from`, `temporal_to`, `spatial`.
+- On `ENTITY` reads, bounded replay-derived membership filters `work_id` and
+  `source_id` may be supplied (merged into `filters` by the router); membership
+  continuity is expressed via the top-level `continuity_id` or
+  `filters.continuity_id`.
 
 ### Relationship edges — `RELATIONSHIP_EDGES`
 
@@ -29,6 +33,9 @@ is the read side; the projection builder is the **sole writer** of
 
 - `filters.subject` narrows to edges anchored on that subject (or, when the
   query has a `ref`, edges where `ref` is the subject or object).
+- `filters.relationship_type` narrows to active edges carrying that validated
+  normalized relationship type (a `RELATED_TO` edge's `relationship_type`, e.g.
+  `MENTOR_OF`); see [data-model.md](data-model.md) for the promotion rule.
 - Each public edge hit carries `provenance` = {`fact_id` (the content-
   addressable edge identity), `state`, `scope`, `seq`} plus `data` =
   {`authority` (`machine` | `USER_OVERRIDE`), `state`, `scope`}, and exposes
@@ -76,8 +83,12 @@ its result kind and evidence support.
 ## Exact / fuzzy / hybrid search — `POST /v1/search`
 
 `SearchRequest`: `query`, `mode` (`exact|fuzzy|hybrid`, default `hybrid`), and
-optional `source_id`, `segment_id`, `entity_ref`, `kind`, `language`,
-`locator_prefix`, `limit`, `offset`, `consistency_token`.
+optional `source_id`, `work_id`, `continuity_id`, `segment_id`, `entity_ref`,
+`kind`, `language`, `locator_prefix`, `limit`, `offset`, `consistency_token`.
+
+`work_id` / `continuity_id` (like `source_id`) scope the search to a canonical's
+replay-derived memberships: global/source/work/continuity searches include only
+active in-scope canonicals and exclude unrelated scopes.
 
 - **exact** — PostgreSQL `tsvector`/`pg_trgm` exact phrase/name matching.
 - **fuzzy** — `pg_trgm` fuzzy matching.

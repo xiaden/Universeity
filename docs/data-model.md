@@ -15,6 +15,14 @@ new predicates without a migration. High-value relationships (`SPEAKS`,
 `ALTERNATE_REALIZATION`) are validated vocabulary entries, not a closed
 ontology.
 
+Registered `RELATED_TO` is the generic typed relationship predicate: it carries a
+validated, normalized `relationship_type` naming the specific relationship. A
+valid unanticipated relationship predicate such as `MENTOR_OF` is promoted to a
+typed `RELATED_TO`, while registered `SIBLING_OF` remains its own predicate.
+Malformed/unregistered relationship types (including malformed sibling-of) stay
+evidence/warnings and never become assertions — the trusted vocabulary is not
+inventable by model/API input.
+
 The typed vocabulary covers work, continuity, source, edition, adaptation,
 translation, character, person, organization, location, object, concept, scene,
 event, action, utterance, relationship, state, emotion, goal, belief/knowledge,
@@ -55,6 +63,14 @@ Event types include `SourceIngested`, `SourceAliased`, `FormatAnalyzed`,
 `HallucinationFiltered`. `JobRunAudit` is committed as an auditable
 event/record but **excluded from semantic-state replay** to avoid sequence
 inflation; the projector policy handles this type explicitly.
+
+`EntityResolved` v2 adds additive canonical-identity metadata plus an optional
+`classification` (`accepted | probable | unresolved | ambiguous`), carried in the
+ESTABLISH event payload and folded into the persisted canonical-identity metadata
+(never fabricated). `SemanticAsserted`
+v3 adds an optional validated `relationship_type` carried by a typed `RELATED_TO`
+(pattern `^[A-Z][A-Z0-9_]{0,63}$` or `null`). Retained rows replay through pure
+upcasters (`EntityResolved` v1→v2, `SemanticAsserted` v1→v2→v3) without mutation.
 
 ### Merge / split semantics (reversible, never destructive)
 
@@ -133,6 +149,10 @@ typed relation/emotion predicates from the semantic reconciliation vocabulary.
   utterance or edge is superseded on the search surface and the corrected value
   is indexed; the immutable assertion stream is no longer a search-doc source
   for utterances.
+- **Scoped canonical search** — each `search_document` canonical row carries
+  replay-derived `work_id` and `continuity_id` scope columns (beside
+  `source_id`) so global / source / work / continuity exact/fuzzy/hybrid search
+  includes only active in-scope canonicals and excludes unrelated scopes.
 
 See [query-search.md](query-search.md) for the read surface and freshness
 gating, and [consistency.md](consistency.md) for the per-projection guards.

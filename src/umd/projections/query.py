@@ -227,6 +227,8 @@ class QueryService:
             # Display-label matching applies only to canonical-identity metadata
             # (labels/aliases live in the reducer row, never the SQL entity table).
             conds = base + [_cs.c.predicate == CANONICAL_IDENTITY_PREDICATE]
+            if scope:
+                conds.append(self._membership_scope_pred(scope))
             filtered: list[Any] = []
             for r in self._identity_rows(conds):
                 if not self._in_membership_scope(r, scope):
@@ -247,14 +249,29 @@ class QueryService:
             ids = self._alias_entity_ids(alias)
             ids += self._identity_alias_refs(alias)
             refs = list(dict.fromkeys(ids))
-            conds = base + [_cs.c.predicate.in_(["CANONICAL_ENTITY", CANONICAL_IDENTITY_PREDICATE])]
+            conditions = base + [
+                _cs.c.predicate.in_(["CANONICAL_ENTITY", CANONICAL_IDENTITY_PREDICATE])
+            ]
             if refs:
-                conds.append(_cs.c.entity_ref.in_(refs))
+                conditions.append(_cs.c.entity_ref.in_(refs))
             else:
-                conds.append(sa.literal(False))
-            ordered, _total = self._entity_ordered(conds, q)
+                conditions.append(sa.literal(False))
+            if scope:
+                # Scope becomes part of candidate SELECTION: only identity rows whose
+                # persisted memberships intersect the scope can be an alias hit.
+                conditions = base + [
+                    sa.and_(
+                        _cs.c.predicate == CANONICAL_IDENTITY_PREDICATE,
+                        self._membership_scope_pred(scope),
+                    )
+                ]
+                if refs:
+                    conditions.append(_cs.c.entity_ref.in_(refs))
+                else:
+                    conditions.append(sa.literal(False))
+            ordered, total = self._entity_ordered(conditions, q)
             ordered = [r for r in ordered if self._in_membership_scope(r, scope)]
-            total = len(ordered)
+            total = len(ordered) if not scope else total
         else:
             # General / ref path: canonical identities + legacy CANONICAL_ENTITY rows
             # keyed by a canonical-like ref (contains ':') — never a raw UUID alias
@@ -265,9 +282,21 @@ class QueryService:
                     sa.and_(_cs.c.predicate == "CANONICAL_ENTITY", _cs.c.entity_ref.contains(":")),
                 )
             ]
-            ordered, _total = self._entity_ordered(conds, q)
+            if scope:
+                # Scope becomes part of candidate SELECTION: only identity rows whose
+                # persisted memberships intersect the scope are fetched, so the bounded
+                # raw-fetch window and the count are computed over the scoped set. The
+                # CANONICAL_ENTITY-only fallback never carries identity metadata and is
+                # correctly excluded when scoped (matching the Python post-filter below).
+                conds = base + [
+                    sa.and_(
+                        _cs.c.predicate == CANONICAL_IDENTITY_PREDICATE,
+                        self._membership_scope_pred(scope),
+                    )
+                ]
+            ordered, total = self._entity_ordered(conds, q)
             ordered = [r for r in ordered if self._in_membership_scope(r, scope)]
-            total = len(ordered)
+            total = len(ordered) if not scope else total
         results = [self._entity_hit(r) for r in ordered[q.offset : q.offset + q.limit]]
         return ProvenanceBearingPage(
             query=q.kind,
@@ -304,6 +333,40 @@ class QueryService:
                 raise ScopeUnmappableError("continuity_id is not a valid UUID")
             scope["continuity_ids"] = {str(continuity)}
         return scope
+
+    def _membership_scope_pred(self, scope: dict[str, set[str]]) -> Any:
+        """SQL predicate restricting candidate rows to those whose memberships intersect ``scope``.
+
+        Mirrors :meth:`_in_membership_scope` (AND-of-intersections per scope key) as a
+        PostgreSQL predicate over the reducer ``CANONICAL_IDENTITY`` metadata so the scope
+        participates in candidate SELECTION BEFORE any LIMIT/dedup/page-slicing — the bounded
+        raw-fetch window is computed over rows that can match the scope (Plan T fix cycle 2).
+
+        ``current_state.object_ref`` is a ``VARCHAR`` holding the JSON-serialized metadata, so
+        it is cast to ``JSONB`` at query time and the membership list for each key is tested with
+        the array-overlap operator ``?|`` (``text[]`` rhs) — ``owned ?| ARRAY[...]`` is true when
+        ANY requested value is a top-level element, matching the intersection semantics exactly
+        (including a future multi-value scope; ``@>`` would wrongly require ALL values present). A
+        missing ``memberships`` block or key yields ``NULL`` and the row is excluded — the same
+        honest outcome as :meth:`_in_membership_scope`` returning ``False``.
+
+        Only valid on identity rows (a ``CANONICAL_ENTITY``-only fallback row's ``object_ref`` is
+        not the identity metadata JSON); callers must combine it with
+        ``predicate == CANONICAL_IDENTITY_PREDICATE``.
+        """
+        if not scope:
+            return sa.true()
+        body = sa.cast(_cs.c.object_ref, postgresql.JSONB())
+        memberships = body.op("->")("memberships")
+        clauses: list[Any] = []
+        for key, requested in scope.items():
+            if not requested:
+                continue
+            owned = memberships.op("->")(key)
+            requested_values = [str(x) for x in requested]
+            rhs = sa.cast(postgresql.array(requested_values), sa.ARRAY(sa.Text()))
+            clauses.append(owned.op("?|")(rhs))
+        return sa.and_(*clauses) if clauses else sa.true()
 
     def _in_membership_scope(self, r: Any, scope: dict[str, set[str]]) -> bool:
         """Whether a candidate identity/entity row's memberships intersect ``scope``.

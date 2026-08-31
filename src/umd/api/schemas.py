@@ -123,6 +123,8 @@ class EvidenceListResponse(BaseModel):
 
 
 class EntityResponse(BaseModel):
+    """Canonical-entity read result: identity metadata plus exact support/provenance."""
+
     ref: str
     label: str
     kind: str

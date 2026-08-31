@@ -520,6 +520,86 @@ def test_operator_establish_rejects_invalid_authority(umd_db: sa.Engine) -> None
         assert r.json()["code"] == "invalid_authority"
 
 
+def test_scoped_entity_read_survives_server_side_cardinality(umd_db: sa.Engine) -> None:
+    """Plan T fix cycle 2: scoped ENTITY reads are NOT bounded-prefetch-then-filter.
+
+    On a populated database a canonical whose memberships sort beyond the old raw-fetch
+    window (``(limit+offset)*2+4`` rows with the API default limit=20 -> 44 rows) used to
+    be silently MISSING from a scoped read even though it is in scope, because membership
+    filtering happened in Python AFTER a bounded prefetch. The fix moves the membership
+    scope into candidate SELECTION (a SQL predicate over the persisted membership
+    metadata) so the raw-fetch window is computed over in-scope rows.
+
+    The test seeds 56 unrelated canonicals that sort BEFORE a 3-canonical target source, so
+    every target canonical sorts beyond the old 44-row window in the unscoped ordering yet
+    must still surface (with a correct ``total`` and cursor pagination) in a source-scoped
+    read at the API-default limit=20.
+    """
+    app = create_app(engine=umd_db, source_store=None, settings=_client_settings())
+
+    def _post(ref: str, label: str, src: str) -> None:
+        with TestClient(app) as client:
+            r = client.post(
+                "/v1/entities",
+                json={
+                    "ref": ref,
+                    "display_label": label,
+                    "canonical_type": "character",
+                    "aliases": [],
+                    "memberships": {"source_ids": [src], "work_ids": [], "continuity_ids": []},
+                    "state": "CONFIRMED",
+                    "authority": "operator",
+                    "actor": "plan-t-fix-2",
+                },
+                headers=W,
+            )
+            assert r.status_code == 201, r.text
+
+    # 56 unrelated canonicals whose refs sort AFTER 'a' but BEFORE any 'z'-prefixed target.
+    for i in range(56):
+        _post(f"entity:canonical:aa:fill:{i:04d}", f"Filler{i}", "src:filler")
+    # Target source: 3 canonicals with high-sorting refs so, in UNscoped ordering, all 56
+    # fillers (plus the cast's 3 hex-tail refs, which sort below 'z') precede them -> every
+    # target sits beyond the old 44-row window.
+    target_refs = [f"entity:canonical:zz:target:{i}" for i in range(1, 4)]
+    for ref in target_refs:
+        _post(ref, f"Target{ref[-1]}", "src:target")
+
+    with TestClient(app) as client:
+        # (1) The in-scope target canonicals ARE returned at the API-default limit (no
+        # explicit limit param), even though they sort beyond the old raw window.
+        r = client.get("/v1/entities", params={"source_id": "src:target"}, headers=R)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        returned = {item["ref"] for item in body["items"]}
+        assert target_refs[0] in returned
+        assert target_refs[1] in returned
+        assert target_refs[2] in returned
+        # (2) total reflects the SCOPED set (the 3 target canonicals, nothing else).
+        assert body["total"] == 3
+        # (3) Cursor pagination across the scoped set: walk pages, no duplicates/gaps, all
+        # in-scope targets eventually returned, out-of-scope fillers never returned.
+        seen: set[str] = set()
+        cursor: str | None = None
+        for _ in range(10):
+            params: dict[str, Any] = {"source_id": "src:target", "limit": 2}
+            if cursor:
+                params["cursor"] = cursor
+            page = client.get("/v1/entities", params=params, headers=R)
+            assert page.status_code == 200, page.text
+            p = page.json()
+            assert p["total"] == 3
+            for item in p["items"]:
+                assert item["ref"].startswith("entity:canonical:zz:target:"), item["ref"]
+                assert item["ref"] not in seen, f"duplicate across pages: {item['ref']}"
+                seen.add(item["ref"])
+            if p["next_cursor"] is None:
+                break
+            cursor = p["next_cursor"]
+        # Pagination covered every in-scope canonical exactly once, nothing extra.
+        assert seen == set(target_refs)
+
+
 def test_search_source_scoped_excludes_unrelated_source(umd_db: sa.Engine) -> None:
     """P2-S2: source-scoped canonical search includes only in-scope canonicals — a
     canonical belonging to source C never surfaces in source A's scoped search."""
