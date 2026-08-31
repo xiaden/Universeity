@@ -147,6 +147,12 @@ class SourceMention(BaseModel):
     candidates: list[MentionCandidate] = Field(default_factory=list)
     provenance: dict[str, Any] = Field(default_factory=dict)
     metadata_: dict[str, Any] = Field(default_factory=dict)
+    #: Normalized paragraph/context text surrounding the mention (Plan T P1-S2).
+    #: When present, its content digest participates in the evidence anchor so
+    #: coincident-structural same-name mentions with DIFFERENT surrounding text
+    #: resolve to DISTINCT opaque refs (never merged by name/work/locator alone),
+    #: and identical surrounding text is treated as same-character co-reference.
+    context_text: str | None = None
     #: Optional work/continuity membership scope (Plan S P1-S1): the mention
     #: stays source-local; these carry the scope a canonical cluster aggregates.
     work_id: str | None = None
@@ -329,6 +335,7 @@ def mentions_from_semantic(result: SemanticAnalysisResult) -> list[SourceMention
                 confidence=em.confidence,
                 provenance=_mention_provenance(em),
                 metadata_=_mention_metadata(em, co_occurrence.get(em.segment.locator, [])),
+                context_text=em.context_text,
             )
         )
 

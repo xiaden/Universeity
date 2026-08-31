@@ -503,8 +503,20 @@ def _seed_named(
     locator: str,
     confidence: float = 0.85,
     state: str = "CONFIRMED",
+    context_text: str | None = None,
 ) -> None:
     """Seed a single entity-candidate evidence record (John/Moss in isolation)."""
+    quality: dict = {
+        "candidate_kind": "entity",
+        "mention_text": name,
+        "entity_type": "CHARACTER",
+        "confidence": confidence,
+        "confidence_state": state,
+        "co_occurring": [],
+        "normalized_forms": [name],
+    }
+    if context_text is not None:
+        quality["context_text"] = context_text
     composer._evidence.record(  # noqa: SLF001
         EvidenceBatch(
             records=[
@@ -516,15 +528,7 @@ def _seed_named(
                     tool_versions={},
                     config_digest="umd-entity-resolution@1",
                     confidence=confidence,
-                    quality={
-                        "candidate_kind": "entity",
-                        "mention_text": name,
-                        "entity_type": "CHARACTER",
-                        "confidence": confidence,
-                        "confidence_state": state,
-                        "co_occurring": [],
-                        "normalized_forms": [name],
-                    },
+                    quality=quality,
                 )
             ]
         )
@@ -532,15 +536,29 @@ def _seed_named(
 
 
 def test_same_name_same_work_different_evidence_stays_separate(umd_db: sa.Engine) -> None:
-    """Plan T P1-S5/R3: John/C same-name separation at the DB level.
+    """Plan T P1-S5/R3 + P3-S1: John/C same-name separation at the DB level.
 
-    Two sources of the SAME work each contain a "John", but at DIFFERENT evidence
-    locators. Shared work + shared name is NOT proof of identity: each resolves to a
+    Two sources of the SAME work each contain a "John" at the SAME structural
+    position (coincident locator) but with DIFFERENT surrounding paragraph content.
+    Shared work + shared name + coincident structure is NOT proof of identity when
+    the content differs: the content digest keeps them apart. Each resolves to a
     DISTINCT opaque ref (no seed, no alias, no merge) and both remain queryable.
     """
     composer, _svc = _setup(umd_db)
-    _seed_named(composer, SOURCE_A, "John", "chapter/1/paragraph/6")
-    _seed_named(composer, SOURCE_B, "John", "chapter/1/paragraph/7")
+    _seed_named(
+        composer,
+        SOURCE_A,
+        "John",
+        "chapter/1/paragraph/6",
+        context_text="The merchant John arrived by dusk and John bought the map.",
+    )
+    _seed_named(
+        composer,
+        SOURCE_B,
+        "John",
+        "chapter/1/paragraph/6",
+        context_text="The courier John rode through the night and John carried a letter.",
+    )
     _run_resolution(composer, SOURCE_A)
     _run_resolution(composer, SOURCE_B)
 
@@ -730,20 +748,20 @@ def _p3_http(umd_db: sa.Engine, source_store):
     from test_api_contract import _client_settings
     from umd.api.app import create_app
 
-    book_a = (
-        "Chapter 1\n\n"
+    # Shared edition content: A and B carry IDENTICAL Mara/Ellis paragraphs (the
+    # supported shared identity, so they unify) while John A/B sit at the SAME
+    # structural position (final paragraph) with DIFFERENT surrounding content —
+    # the content digest, not a locator difference, keeps John A and John B apart.
+    shared_p1 = (
         "The apprentice Mara met the warden Orin and Mara took the lantern. "
-        "Ellis the cartographer watched the flame and Ellis smiled.\n\n"
-        "Mara knelt and the wick caught, burning clean and steady.\n\n"
-        "The merchant John arrived by dusk and John bought the map from Mara.\n"
+        "Ellis the cartographer watched the flame and Ellis smiled."
     )
-    book_b = (
-        "Chapter 1\n\n"
-        "Mara and Ellis climbed the hill and Mara carried the lantern. "
-        "Ellis unrolled a fresh map and Ellis traced the eastern road.\n\n"
-        "At the top Mara looked out over the village lights below.\n\n"
-        "The courier John rode through the night and John carried a sealed letter.\n"
-    )
+    shared_p2 = "Mara knelt and the wick caught, burning clean and steady."
+    shared_p3 = "Ellis unrolled a fresh map and Ellis traced the eastern road."
+    john_a = "The merchant John arrived by dusk and John bought the map from Mara."
+    john_b = "The courier John rode through the night and John carried a sealed letter."
+    book_a = f"Chapter 1\n\n{shared_p1}\n\n{shared_p2}\n\n{shared_p3}\n\n{john_a}\n"
+    book_b = f"Chapter 1\n\n{shared_p1}\n\n{shared_p2}\n\n{shared_p3}\n\n{john_b}\n"
     book_c = (
         "Chapter 1\n\nThe sailor Mara knew the harbor well and Mara guided the ship at night.\n"
     )
@@ -925,7 +943,12 @@ def test_http_public_identity_abc(_p3_http) -> None:
     """P3-S2/R9: real nine-stage HTTP ingestion (POST /v1/sources + poll /v1/jobs)
     through the production DAG runner proves Mara unifies into ONE canonical
     spanning A+B, the other-work Mara (C) is a DISTINCT ref, scoped reads return
-    only the right canonicals, and no duplicate canonical is established."""
+    only the right canonicals, and no duplicate canonical is established.
+
+    P3-S3: the same-work same-name John pair at COINCIDENT structure with
+    DIFFERENT surrounding content stays TWO source-local canonicals (no cross
+    alias), and every public ENTITY item carries exact provenance/generated-by/
+    capabilities metadata (the P2-S1 fix)."""
     client = _p3_http.client
     by_label = _p3_http.by_label
     a, b, c = _p3_http.a, _p3_http.b, _p3_http.c
@@ -933,6 +956,13 @@ def test_http_public_identity_abc(_p3_http) -> None:
 
     def _memb(source_ids):
         return {_dashless(s) for s in source_ids}
+
+    required_metadata = ("provenance", "confidence", "generated_by", "capabilities")
+
+    def _assert_meta(items, context):
+        for it in items:
+            for key in required_metadata:
+                assert key in it, (context, key, it)
 
     mara = by_label.get("Mara", [])
     mara_a = [m for m in mara if sa_id in _memb(m["memberships"]["source_ids"])]
@@ -945,6 +975,39 @@ def test_http_public_identity_abc(_p3_http) -> None:
     assert mara_c[0]["ref"] != mara_a[0]["ref"]
     # No duplicate: exactly one Mara canonical carries source A's membership.
     assert len([m for m in mara if sa_id in _memb(m["memberships"]["source_ids"])]) == 1
+
+    # P3-S3: coincident-structure same-work same-name John pair stays TWO
+    # source-local canonicals — content-derived disambiguation, not locator.
+    john = by_label.get(SAME_NAME_COLLISION, [])
+    john_a = [j for j in john if sa_id in _memb(j["memberships"]["source_ids"])]
+    john_b = [j for j in john if sb_id in _memb(j["memberships"]["source_ids"])]
+    assert len(john_a) == 1, john_a
+    assert len(john_b) == 1, john_b
+    # Distinct opaque refs, each source-local (memberships exactly {A} / {B}).
+    assert john_a[0]["ref"] != john_b[0]["ref"]
+    assert _memb(john_a[0]["memberships"]["source_ids"]) == {sa_id}
+    assert _memb(john_b[0]["memberships"]["source_ids"]) == {sb_id}
+    for j in john_a + john_b:
+        assert j["ref"].startswith("entity:canonical:")
+        # No cross-alias links the two Johns together.
+        assert SAME_NAME_COLLISION not in (j.get("aliases") or [])
+
+    # Provenance/generated-by/capabilities metadata on the list ENTITY read.
+    _assert_meta(mara_a + mara_c + john_a + john_b, "entity-list-item")
+
+    # Scoped reads: source A sees only A's John; source B only B's John; C only C's.
+    for sid, expected in ((sa_id, john_a[0]), (sb_id, john_b[0])):
+        r = client.get(
+            f"/v1/entities?source_id={_dashed(sid)}", headers={"Authorization": "Bearer read-key"}
+        )
+        assert r.status_code == 200, r.text
+        items = r.json()["items"]
+        _assert_meta(items, f"entity-scoped:{sid}")
+        john_scoped = [
+            it for it in items if (it.get("display_label") or it["label"]) == SAME_NAME_COLLISION
+        ]
+        assert len(john_scoped) == 1, (sid, john_scoped)
+        assert john_scoped[0]["ref"] == expected["ref"]
 
     # Scoped public read: source A sees only A's Mara; source C only C's.
     for sid, expected in ((sa_id, mara_a[0]), (sc_id, mara_c[0])):

@@ -35,9 +35,17 @@ Semantics
     state is ``AMBIGUOUS`` or whose candidates name several distinct canonicals
     with no clear winner keeps ``entity_id=None`` and is emitted as
     ``unresolved`` — the resolver never guesses a target.
-  * **Deterministic canonical refs** — new canonical refs are derived from the
-    sorted member mention ids, so a rerun over the same mentions converges to
-    the same refs.
+  * **Evidence-anchored canonical refs** — new canonical refs are derived from
+    an opaque, deterministic anchor over the canonicalized display label, the
+    work/continuity scope, and the content-derived evidence tokens (structural
+    locator/segment plus a normalized paragraph/context-content digest) of every
+    member — NOT from sorted member mention ids. The anchor is independent of
+    source/transient ids, filename, job, ingest order, and first establisher, so
+    a rerun over the same accepted evidence converges to the same ref. Same-name
+    text alone never merges: coincident structural positions with identical
+    content are same-character co-references; coincident positions with
+    differing (or absent) content are kept distinct and, when no content is
+    available, classified AMBIGUOUS/reviewable and never ESTABLISHed.
 
 Plan N canonical-reference representation (v1 — Option B, CONTRACTS.md:77):
   the canonical refs produced here are deterministic STRINGS
@@ -58,6 +66,7 @@ Plan N canonical-reference representation (v1 — Option B, CONTRACTS.md:77):
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -480,14 +489,65 @@ def _entity_type_of(members: list[SourceMention]) -> str | None:
     return sorted(types)[0] if len(types) == 1 else (next(iter(types)) if types else None)
 
 
+def _content_digest(m: SourceMention) -> str | None:
+    """A deterministic content digest of a mention's paragraph/context text.
+
+    Plan T P1-S2/R3: normalized surrounding content participates in the evidence
+    anchor, so two same-work same-name mentions at a coincident structural
+    locator resolve to DISTINCT opaque refs when their surrounding text differs
+    (and to one same-character ref when it is identical). Returns ``None`` when
+    no content is available (the risky coincident-locator case).
+    """
+    ct = m.context_text
+    if not ct:
+        return None
+    norm = normalize_name(ct) or ct.casefold()
+    return hashlib.sha256(norm.encode()).hexdigest()
+
+
+def _structural_locator(m: SourceMention) -> str | None:
+    """The deterministic structural position of a mention (locator or segment).
+
+    Used to detect coincident structural positions. Prefers the evidence
+    locator (the structural path the STRUCTURAL_ANALYSIS stream carries); falls
+    back to the registered segment id. Returns ``None`` when neither is present.
+    """
+    loc = (m.provenance or {}).get("locator")
+    if loc:
+        return f"loc:{loc}"
+    if m.segment_id:
+        return f"seg:{m.segment_id}"
+    return None
+
+
+def _coincident_no_shared_content(a: SourceMention, b: SourceMention) -> bool:
+    """True when two mentions share a structural position without identical content.
+
+    Plan T P1-S2/R3: at a coincident structural locator, only identical content
+    is treated as same-character co-reference (union). Different content means
+    two DISTINCT characters (they stay separate); absent content on either side
+    is a no-content coincidence collision that must not auto-unify (it is
+    classified AMBIGUOUS downstream, never merged by name/work/locator alone).
+    """
+    la = _structural_locator(a)
+    if la is None or la != _structural_locator(b):
+        return False  # different (or no) structural positions -> normal linkage
+    da = _content_digest(a)
+    db = _content_digest(b)
+    # Identical surrounding content is same-character co-reference (auto-union);
+    # coincident-but-no-shared-content (different or absent) must not auto-union.
+    return not (da is not None and db is not None and da == db)
+
+
 def _evidence_tokens(m: SourceMention) -> list[str]:
     """Content-derived evidence tokens for a mention (Plan T P1-S2).
 
     The anchor is deliberately source-independent: it uses the deterministic
-    structural evidence (segment id / locator), never the source id, transient
-    mention id, filename, job, or any per-source UUID. A mention with no
-    registered segment falls back to its canonicalized surface form only so the
-    anchor stays non-empty (the work/continuity scope still disambiguates).
+    structural evidence (segment id / locator) plus a digest of the normalized
+    paragraph/context content, never the source id, transient mention id,
+    filename, job, or any per-source UUID. A mention with no registered segment
+    falls back to its canonicalized surface form only so the anchor stays
+    non-empty (the work/continuity scope still disambiguates).
     """
     tokens: list[str] = []
     if m.segment_id:
@@ -495,10 +555,39 @@ def _evidence_tokens(m: SourceMention) -> list[str]:
     loc = (m.provenance or {}).get("locator")
     if loc:
         tokens.append(f"loc:{loc}")
+    cd = _content_digest(m)
+    if cd:
+        tokens.append(f"ctx:{cd[:16]}")
     if not tokens:
         norm = normalize_name(m.mention_text) or m.mention_text.casefold()
         tokens.append(f"text:{norm}")
     return tokens
+
+
+def _cluster_memberships(
+    members: list[SourceMention],
+    *,
+    work_id: str | None,
+    continuity_id: str | None,
+    scope: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    """Aggregate a cluster's work/source/continuity membership context.
+
+    Carries the explicit source-level work/continuity scope (P3-S1) when a member
+    did not annotate it directly, so the canonical stays scoped.
+    """
+    memberships = {
+        "source_ids": sorted({m.source_id for m in members if m.source_id}),
+        "work_ids": sorted({m.work_id for m in members if m.work_id}),
+        "continuity_ids": sorted({m.continuity_id for m in members if m.continuity_id}),
+    }
+    if work_id and not memberships["work_ids"]:
+        memberships["work_ids"] = [work_id]
+    if continuity_id and not memberships["continuity_ids"]:
+        memberships["continuity_ids"] = [continuity_id]
+    if not memberships["source_ids"] and scope.get("source_ids"):
+        memberships["source_ids"] = list(scope["source_ids"])
+    return memberships
 
 
 def _evidence_canonical_ref(
@@ -606,6 +695,12 @@ class EntityResolutionService:
                 target = _candidate_target(cand.entity_ref, mention_by_id)
                 if target is None:
                     continue
+                # Plan T P1-S2/R3: at a coincident structural position only
+                # identical content is same-character co-reference. Different (or
+                # absent) content is NOT auto-unioned — those mentions stay
+                # separate and (when content is absent) surface as AMBIGUOUS.
+                if _coincident_no_shared_content(m, mention_by_id[target]):
+                    continue
                 uf.union(m.mention_id, target, candidate_ref=m.mention_id)
 
         # Pass 2b — link provider-declared aliases to their canonical cluster by
@@ -655,6 +750,34 @@ class EntityResolutionService:
         for m in mentions:
             roots.setdefault(uf.find(m.mention_id), []).append(m)
 
+        # Plan T P1-S2/R3 — coincidence-collision detection: compute the evidence
+        # anchor ref for every NEW (unseeded) cluster up front so that two DISTINCT
+        # clusters deriving the SAME opaque ref (same name + work + coincident
+        # structural locator, no content to disambiguate) are never both established.
+        # Such a collision is a no-content coincidence -> AMBIGUOUS/reviewable, with
+        # NO ESTABLISH (the resolver never merges distinct mentions by name/work/
+        # locator alone). Seeded clusters reuse their existing ref and never collide.
+        new_ref_by_root: dict[str, str] = {}
+        for root in roots:
+            if uf.seed_of(root) is not None:
+                continue
+            rmembers = sorted(roots[root], key=lambda m: m.mention_id)
+            rlabel = _canonical_label(rmembers)
+            new_ref_by_root[root] = _evidence_canonical_ref(
+                rmembers,
+                rlabel,
+                _cluster_memberships(
+                    rmembers,
+                    work_id=input_work_id,
+                    continuity_id=input_continuity_id,
+                    scope=input_scope,
+                ),
+            )
+        _ref_counts: dict[str, int] = {}
+        for ref in new_ref_by_root.values():
+            _ref_counts[ref] = _ref_counts.get(ref, 0) + 1
+        _collided_refs = {ref for ref, n in _ref_counts.items() if n > 1}
+
         canonical_entities: list[CanonicalEntity] = []
         alias_mappings: list[AliasMapping] = []
         assignments: dict[str, str] = {}
@@ -680,19 +803,12 @@ class EntityResolutionService:
             entity_type = _entity_type_of(members)
             member_ids = [m.mention_id for m in members]
             aliases = sorted({m.mention_text for m in members} - {label})
-            memberships = {
-                "source_ids": sorted({m.source_id for m in members if m.source_id}),
-                "work_ids": sorted({m.work_id for m in members if m.work_id}),
-                "continuity_ids": sorted({m.continuity_id for m in members if m.continuity_id}),
-            }
-            # Carry the explicit source-level work/continuity scope (P3-S1) when a
-            # member did not annotate it directly, so the canonical stays scoped.
-            if input_work_id and not memberships["work_ids"]:
-                memberships["work_ids"] = [input_work_id]
-            if input_continuity_id and not memberships["continuity_ids"]:
-                memberships["continuity_ids"] = [input_continuity_id]
-            if not memberships["source_ids"] and input_scope.get("source_ids"):
-                memberships["source_ids"] = list(input_scope["source_ids"])
+            memberships = _cluster_memberships(
+                members,
+                work_id=input_work_id,
+                continuity_id=input_continuity_id,
+                scope=input_scope,
+            )
 
             if seed is not None:
                 canonical_ref = seed
@@ -700,6 +816,20 @@ class EntityResolutionService:
             else:
                 canonical_ref = _evidence_canonical_ref(members, label, memberships)
                 entity_state = ConfidenceState.PROBABLE.value
+                if canonical_ref in _collided_refs:
+                    # No-content coincidence collision (same name + work +
+                    # coincident structural locator, no content to disambiguate):
+                    # keep the mentions AMBIGUOUS/reviewable and do NOT ESTABLISH.
+                    for m in members:
+                        unresolved.append(
+                            UnresolvedMention(
+                                mention_id=m.mention_id,
+                                text=m.mention_text,
+                                reason="ambiguous",
+                                classification=IdentityClassification.AMBIGUOUS.value,
+                            )
+                        )
+                    continue
             classification = (
                 IdentityClassification.ACCEPTED.value
                 if seed is not None

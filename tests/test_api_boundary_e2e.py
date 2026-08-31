@@ -683,17 +683,24 @@ def _memb(source_ids: list[str] | None) -> set[str]:
     return {_dashless(s) for s in (source_ids or [])}
 
 
-_BOOK_A = (
-    "Chapter 1\n\n"
+# A and B are two realizations of the SAME work: they share IDENTICAL Mara/Ellis
+# paragraphs (the supported shared identity, so those characters unify across A+B)
+# while John A and John B sit at the SAME structural position (final paragraph)
+# with DIFFERENT surrounding content. Plan T P3-S1: the content digest (not a
+# locator difference) is what keeps the same-name same-work John pair apart.
+_BOOK_SHARED_P1 = (
     "The apprentice Mara met the warden Orin and Mara took the lantern. "
-    "Ellis the cartographer watched the flame and Ellis smiled.\n\n"
-    "Mara knelt and the wick caught, burning clean and steady.\n"
+    "Ellis the cartographer watched the flame and Ellis smiled."
+)
+_BOOK_SHARED_P2 = "Mara knelt and the wick caught, burning clean and steady."
+_BOOK_SHARED_P3 = "Ellis unrolled a fresh map and Ellis traced the eastern road."
+_BOOK_JOHN_A = "The merchant John arrived by dusk and John bought the map from Mara."
+_BOOK_JOHN_B = "The courier John rode through the night and John carried a sealed letter."
+_BOOK_A = (
+    f"Chapter 1\n\n{_BOOK_SHARED_P1}\n\n{_BOOK_SHARED_P2}\n\n{_BOOK_SHARED_P3}\n\n{_BOOK_JOHN_A}\n"
 )
 _BOOK_B = (
-    "Chapter 1\n\n"
-    "Mara and Ellis climbed the hill and Mara carried the lantern. "
-    "Ellis unrolled a fresh map and Ellis traced the eastern road.\n\n"
-    "At the top Mara looked out over the village lights below.\n"
+    f"Chapter 1\n\n{_BOOK_SHARED_P1}\n\n{_BOOK_SHARED_P2}\n\n{_BOOK_SHARED_P3}\n\n{_BOOK_JOHN_B}\n"
 )
 _BOOK_C = "Chapter 1\n\nThe sailor Mara knew the harbor well and Mara guided the ship at night.\n"
 
@@ -713,6 +720,11 @@ def test_boundary_identity_abc_full_dag(api_ctx: ApiCtx) -> None:
         ONE active canonical spanning BOTH source memberships (R1/R9);
       * the other-work Mara (source C) stays a DISTINCT ref -- no cross-work merge
         and no duplicate canonical established (R1/R3);
+      * the same-work same-name John pair, at COINCIDENT structure with DIFFERENT
+        content, stays TWO source-local canonicals with no cross-alias -- the
+        content digest separates them, not a locator difference (R3/P3-S1);
+      * exact support/provenance + generated_by + capability metadata is present
+        on every public ENTITY read surface (list, scoped, by-ref) (P2-S1 fix);
       * bounded scoped reads return only the right canonicals per source (R4);
       * a re-ingest of the same bytes is idempotent -- the same Mara canonical and
         the same auto-created work (no duplicate establishment) (R1/R2).
@@ -753,6 +765,22 @@ def test_boundary_identity_abc_full_dag(api_ctx: ApiCtx) -> None:
     # No duplicate canonical carries source A's membership.
     assert len([m for m in mara if sa_id in _memb(m["memberships"].get("source_ids"))]) == 1
 
+    # P3-S3: the coincident-structure same-work same-name John pair stays TWO
+    # source-local canonicals (real-content disambiguation, not a locator gap).
+    john = by_label.get("John", [])
+    john_a = [j for j in john if sa_id in _memb(j["memberships"].get("source_ids"))]
+    john_b = [j for j in john if sb_id in _memb(j["memberships"].get("source_ids"))]
+    assert len(john_a) == 1, john_a
+    assert len(john_b) == 1, john_b
+    assert john_a[0]["ref"] != john_b[0]["ref"]
+    assert _memb(john_a[0]["memberships"].get("source_ids")) == {sa_id}
+    assert _memb(john_b[0]["memberships"].get("source_ids")) == {sb_id}
+    for j in john_a + john_b:
+        assert j["ref"].startswith("entity:canonical:")
+        assert "John" not in (j.get("aliases") or [])
+        _assert_metadata_contract(j, context=f"entity-john-{_dashless(j['ref'])[-8:]}")
+    _assert_metadata_contract(mara_a[0], context="entity-mara-a")
+
     # Bounded scoped reads return only the right canonicals per source (R4).
     for sid, expected in ((sa_id, mara_a[0]), (sc_id, mara_c[0])):
         scoped = _entities(client, source_id=sid)
@@ -760,6 +788,14 @@ def test_boundary_identity_abc_full_dag(api_ctx: ApiCtx) -> None:
         assert len(mara_here) == 1, (sid, mara_here)
         assert mara_here[0]["ref"] == expected["ref"]
         _assert_metadata_contract(mara_here[0], context=f"scoped-entity-{sid[:8]}")
+
+    # Scoped reads also surface the correct source-local John, never the other.
+    for sid, expected in ((sa_id, john_a[0]), (sb_id, john_b[0])):
+        scoped = _entities(client, source_id=sid)
+        john_here = [i for i in scoped if (i.get("display_label") or i["label"]) == "John"]
+        assert len(john_here) == 1, (sid, john_here)
+        assert john_here[0]["ref"] == expected["ref"]
+        _assert_metadata_contract(john_here[0], context=f"scoped-john-{sid[:8]}")
 
     # Re-ingest of the same bytes is idempotent: the same Mara canonical and the
     # same auto-created work result (no duplicate establishment) (R1/R2).

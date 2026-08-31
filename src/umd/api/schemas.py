@@ -138,6 +138,13 @@ class EntityResponse(BaseModel):
     confidence: float | None = None
     support_refs: list[str] = Field(default_factory=list)
     memberships: dict[str, Any] = Field(default_factory=dict)
+    # Plan T (P2-S1 / R4/R5/R9): exact support/provenance metadata already
+    # computed by ``QueryService._entity_hit`` for canonical identity hits, surfaced
+    # on list, by-ref, and structured ENTITY reads. Always present (empty dicts for
+    # legacy CANONICAL_ENTITY fallback hits) so the metadata contract holds.
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    generated_by: dict[str, Any] = Field(default_factory=dict)
+    capabilities: dict[str, Any] = Field(default_factory=dict)
 
 
 class EntityListResponse(BaseModel):

@@ -124,6 +124,10 @@ class EntityMention(SemanticCandidate):
 
     mention: str = Field(min_length=1)
     entity_type: str = Field(default="character", min_length=1)
+    #: The full surrounding paragraph/context text (Plan T P3-S1). Its content
+    #: digest feeds the resolution evidence anchor (``ctx:``), so coincident-
+    #: structural same-name mentions with different surrounding text stay distinct.
+    context_text: str | None = None
 
 
 class NormalizedAlias(SemanticCandidate):

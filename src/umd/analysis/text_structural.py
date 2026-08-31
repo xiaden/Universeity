@@ -313,6 +313,11 @@ def _record_candidates(
                     "candidate_kind": "entity",
                     "mention_text": run,
                     "sentence_offset": token_offset,
+                    # Plan T (P3-S1): carry the full surrounding paragraph so the
+                    # production resolution anchor can include a content digest
+                    # (ctx:) that separates coincident-structural same-name
+                    # mentions (John A/B) instead of merging by name/work/locator.
+                    "context_text": paragraph,
                 },
             )
             result.evidence.append(ev)
@@ -325,6 +330,7 @@ def _record_candidates(
                     state=ConfidenceState.PROBABLE,
                     segment=candidate_ref,
                     generated_by=generated_by,
+                    context_text=paragraph,
                 )
             )
             result.presence.append(

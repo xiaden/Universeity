@@ -804,6 +804,15 @@ class _Composer:
                 meta["entity_type"] = str(quality["entity_type"])
             if quality.get("co_occurring"):
                 meta["co_occurring"] = list(quality["co_occurring"])
+            # Plan T (P3-S1): carry the surrounding paragraph/context text onto the
+            # SourceMention so content-derived disambiguation is REAL through the
+            # nine-stage DAG — not just a test-helper artifact. STRUCTURAL_ANALYSIS
+            # emits the entity-candidate evidence with ``context_text`` = the full
+            # paragraph the mention was found in; the resolution anchor's ``ctx:``
+            # digest then distinguishes coincident-structural same-name mentions
+            # (John A/B) while an explicit correspondence still unifies supported
+            # shared identities (Mara across A/B).
+            context_text = quality.get("context_text")
             forms = quality.get("normalized_forms")
             if isinstance(forms, list) and forms:
                 normalized_forms = [f for f in (normalize_name(f) for f in forms) if f]
@@ -839,6 +848,7 @@ class _Composer:
                     work_id=src.get("work_id"),
                     continuity_id=src.get("continuity_id"),
                     metadata_=meta,
+                    context_text=context_text,
                 )
             )
         return out

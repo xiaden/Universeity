@@ -48,6 +48,13 @@ def _entity(h: Any) -> EntityResponse:
         confidence=data.get("confidence"),
         support_refs=list(data.get("support_refs") or []),
         memberships=dict(data.get("memberships") or {}),
+        # Plan T (P2-S1): surface the exact support/provenance metadata already
+        # computed by QueryService._entity_hit on canonical identity hits (list,
+        # by-ref, and structured ENTITY reads). Legacy CANONICAL_ENTITY fallback
+        # hits carry empty dicts, preserving prior behavior.
+        provenance=h.provenance,
+        generated_by=h.generated_by,
+        capabilities=h.capabilities,
     )
 
 

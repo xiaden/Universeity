@@ -205,8 +205,15 @@ def _m2(
     entity_id: str | None = None,
     conf: float = 0.85,
     state: str = ConfidenceState.CONFIRMED.value,
+    context: str | None = None,
 ) -> SourceMention:
-    """A mention with content-derived evidence (segment) and an optional work scope."""
+    """A mention with content-derived evidence (segment) and an optional work scope.
+
+    ``context`` is the normalized paragraph/context text (Plan T P1-S2): when
+    present its content digest participates in the evidence anchor, so
+    coincident-structural same-name mentions with different surrounding text
+    resolve to DISTINCT opaque refs.
+    """
     return SourceMention(
         id=uuid.UUID(mid),
         source_id=source,
@@ -219,6 +226,7 @@ def _m2(
         provenance={"locator": f"chapter/1/{segment}"},
         metadata_={"entity_type": "character"},
         work_id=work_id,
+        context_text=context,
     )
 
 
@@ -378,3 +386,128 @@ def test_human_support_build_narrowing_seeds_accepted():
     assert ent.ref == human_ref
     assert ent.classification == "accepted"
     assert ent.state == ConfidenceState.CONFIRMED.value
+
+
+def test_coincident_locator_different_content_stays_separate():
+    """Plan T P1-S2/P1-S5/R3: coincident structure + different content => distinct.
+
+    Two same-work same-name mentions at the SAME structural locator whose
+    surrounding paragraph/context text differs are TWO distinct characters: they
+    must NOT be merged by name/work/locator alone. Content disambiguates them
+    into distinct opaque refs (the content digest is part of the anchor).
+    """
+    service = EntityResolutionService(resolve_floor=0.4)
+    batch = service.resolve_mentions(
+        [
+            _m2(
+                text="John",
+                mid="30000000-0000-0000-0000-000000000010",
+                source="A",
+                segment="p/6",
+                context="The merchant John arrived at the fair",
+            ),
+            _m2(
+                text="John",
+                mid="40000000-0000-0000-0000-000000000011",
+                source="B",
+                segment="p/6",
+                context="The courier John rode through the night",
+            ),
+        ]
+    )
+    # Coincident structural position + differing content -> distinct canonicals,
+    # never one merged character, and never a fabricated alias link between them.
+    assert len(batch.canonical_entities) == 2
+    refs = [e.ref for e in batch.canonical_entities]
+    assert len(set(refs)) == 2, "coincident structure + different content must not merge"
+    assert not batch.alias_mappings
+    for e in batch.canonical_entities:
+        assert e.ref.startswith("entity:canonical:")
+        tail = e.ref[len("entity:canonical:") :]
+        assert ":" not in tail, e.ref  # opaque, no structural token leaks into the ref
+
+
+def test_coincident_locator_identical_content_is_co_reference():
+    """Plan T P1-S2: coincident structure + identical content is ONE character.
+
+    Guard against the opposite regression: two mentions of the SAME character at
+    a coincident structural position with identical surrounding content must
+    still union into ONE canonical (not be spuriously split).
+    """
+    batch = EntityResolutionService(resolve_floor=0.4).resolve_mentions(
+        [
+            _m2(
+                text="John",
+                mid="30000000-0000-0000-0000-000000000012",
+                source="A",
+                segment="p/6",
+                context="The merchant John arrived at the fair",
+            ),
+            _m2(
+                text="John",
+                mid="30000000-0000-0000-0000-000000000013",
+                source="A",
+                segment="p/6",
+                context="The merchant John arrived at the fair",
+            ),
+        ]
+    )
+    assert len(batch.canonical_entities) == 1
+    ent = batch.canonical_entities[0]
+    assert len(ent.member_mention_ids) == 2
+    assert ent.ref.startswith("entity:canonical:")
+
+
+def test_coincident_locator_no_content_is_ambiguous_no_establish():
+    """Plan T P1-S2/P1-S5/R3: no-content coincidence collision is AMBIGUOUS.
+
+    Two same-work same-name mentions at a coincident structural locator with NO
+    content evidence cannot be proven distinct OR identical -> they must be
+    classified AMBIGUOUS/reviewable and NEVER established. No canonical ref is
+    fabricated and no ESTABLISH command is emitted (the resolver never merges by
+    name/work/locator alone).
+    """
+    batch = EntityResolutionService(resolve_floor=0.4).resolve_mentions(
+        [
+            _m2(text="John", mid="30000000-0000-0000-0000-000000000014", source="A", segment="p/6"),
+            _m2(text="John", mid="40000000-0000-0000-0000-000000000015", source="B", segment="p/6"),
+        ]
+    )
+    # No canonical established, both mentions AMBIGUOUS/reviewable, no ESTABLISH.
+    assert len(batch.canonical_entities) == 0
+    assert batch.classification == "ambiguous"
+    assert batch.state == ConfidenceState.AMBIGUOUS.value
+    assert len(batch.unresolved) == 2
+    assert all(u.reason == "ambiguous" for u in batch.unresolved)
+    assert not any(c.kind == "ESTABLISH" for c in batch.commands)
+    assert not batch.assignments
+
+
+def test_accepted_join_still_requires_explicit_evidence():
+    """Plan T P1-S5: accepted joins still require explicit correspondence/evidence.
+
+    A seeded (already-committed) canonical ref is reused ONLY when the builder
+    supplies the explicit correspondence; without it, name+work strings alone
+    never join two mentions into one accepted canonical.
+    """
+    service = EntityResolutionService(resolve_floor=0.4)
+    john_a = _m2(text="John", mid="30000000-0000-0000-0000-000000000016", source="A", segment="p/6")
+    john_b = _m2(text="John", mid="40000000-0000-0000-0000-000000000017", source="B", segment="p/6")
+    # No explicit correspondence -> the two mentions stay separate (probable) and
+    # neither is an ACCEPTED join.
+    plain = service.resolve_mentions([john_a, john_b])
+    assert len(plain.canonical_entities) == 0  # coincident no-content -> ambiguous
+    assert plain.classification == "ambiguous"
+
+    # Explicit human confirmation/lock IS a legitimate accepted join that reuses
+    # the confirmed ref (never a name+work guess).
+    human_ref = "entity:canonical:beef000000000002"
+    built = ResolutionInputBuilder().build(
+        source={"source_id": "B", "work_id": NOVEL},
+        evidence=[john_b],
+        human_support={john_b.mention_id: human_ref},
+    )
+    accepted = service.resolve_mentions(built)
+    assert len(accepted.canonical_entities) == 1
+    assert accepted.canonical_entities[0].ref == human_ref
+    assert accepted.canonical_entities[0].classification == "accepted"
