@@ -90,8 +90,12 @@ def rerun_segment(
             causation="api:segment-rerun",
             dag_universe="base",
             work_registry=ctx.work_registry,
-            job_id=f"job-{segment_id[:12]}",
+            job_id=f"job-{segment_id.replace('-', '')[:12]}",
         )
     except Exception as exc:  # noqa: BLE001
         raise ApiError(f"segment rerun failed: {exc}", code="rerun_failed", status=409) from exc
-    return {"segment_id": segment_id, "action": "rerun", "job_id": f"job-{segment_id[:12]}"}
+    return {
+        "segment_id": segment_id,
+        "action": "rerun",
+        "job_id": f"job-{segment_id.replace('-', '')[:12]}",
+    }

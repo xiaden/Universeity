@@ -167,12 +167,18 @@ def create_entity(
         "confidence": body.confidence if body.confidence is not None else 1.0,
         "classification": "ACCEPTED",
     }
+    # P4-S5: the authenticated principal (``get_write_principal``) is ALWAYS the
+    # authoritative ``created_by``/actor — a request-supplied ``actor`` can never
+    # spoof event/audit provenance. ``actor`` is retained only as delegated,
+    # NON-authoritative attribution in a separate metadata field.
+    if body.actor:
+        metadata["attributed_actor"] = body.actor
     commit = ctx.resolver.establish(
         canonical=body.ref,
         metadata=metadata,
         reason=body.reason or "operator entity establishment",
         authority=body.authority,
-        created_by=body.actor or _p.key,
+        created_by=_p.key,
     )
     return EntityActionResponse(
         entity_ref=body.ref,

@@ -175,7 +175,7 @@ class EntityCreateRequest(BaseModel):
     label: str | None = None
     canonical_type: str | None = Field(default=None, description="canonical type (e.g. character)")
     aliases: list[str] = Field(default_factory=list, description="active alias surfaces")
-    memberships: dict[str, list[str]] = Field(
+    memberships: dict[str, list[Any]] = Field(
         default_factory=dict, description="replay-derived source/work/continuity memberships"
     )
     support_refs: list[str] = Field(default_factory=list, description="evidence/segment support")
@@ -183,7 +183,14 @@ class EntityCreateRequest(BaseModel):
     authority: str = Field(default="operator", description="operator | human")
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     reason: str | None = None
-    actor: str | None = None
+    actor: str | None = Field(
+        default=None,
+        description=(
+            "Delegated, NON-authoritative attribution only (P4-S5): the authoritative "
+            "created_by/actor is always the authenticated principal; this field can "
+            "never spoof event/audit provenance."
+        ),
+    )
 
 
 class EntityActionResponse(BaseModel):
@@ -206,6 +213,10 @@ class ClaimCreateRequest(BaseModel):
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     scope: str = "GLOBAL"
     support_refs: list[str] = Field(default_factory=list)
+    # Plan U (P2-S4/P2-S5): the normalized relationship type carried by a RELATED_TO
+    # predicate, so a typed claim is admitted with its full typed identity. Bounded by
+    # the schema (^[A-Z][A-Z0-9_]{0,63}$ / null).
+    relationship_type: str | None = None
 
 
 class ClaimResponse(BaseModel):
@@ -226,6 +237,10 @@ class ClaimMutationRequest(BaseModel):
     scope: str | None = None
     stage: str | None = None
     refs: list[str] = Field(default_factory=list)
+    # Plan U (P2-S4): target relationship type for typed-edge mutations — an override /
+    # invalidation / correction carrying this targets ONLY the edge with this type,
+    # leaving a sibling typed edge active.
+    relationship_type: str | None = None
 
 
 class ProvenanceResponse(BaseModel):

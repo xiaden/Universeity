@@ -241,7 +241,9 @@ def run_demo(api: PublicContractClient, *, stage: _STAGE | None = None) -> dict[
     result["source_id"] = sid
 
     # -- 3. job polling (API job facade; no provider coupling) ---------------
-    job = api.wait_job(f"job-{sid[:12]}")
+    # POST /v1/sources returns canonical DASHED ids (Plan U P4-S1); the job id
+    # derives from the dashless hex form, so strip dashes before truncating.
+    job = api.wait_job(f"job-{sid.replace('-', '')[:12]}")
     assert job["status"] == "complete"
     result["job_status"] = job["status"]
 

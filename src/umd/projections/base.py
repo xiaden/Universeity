@@ -287,6 +287,8 @@ class ReplayDriver:
                 _event_t.c.payload,
                 _event_t.c.authority,
                 _event_t.c.confidence,
+                _event_t.c.generated_by,
+                _event_t.c.created_by,
             )
             .where(_event_t.c.seq > after)
             .order_by(_event_t.c.seq)
@@ -301,6 +303,11 @@ class ReplayDriver:
             payload=payload,
             authority=row.authority,
             confidence=row.confidence,
+            # Plan U (P3-S3): replay must retain exact provenance — generated_by
+            # (machine provider/config or human override) and created_by/actor — so
+            # wipe-and-replay reproduces the same active canonical metadata.
+            generated_by=dict(row.generated_by or {}),
+            created_by=row.created_by,
             seq=int(row.seq),
         )
 

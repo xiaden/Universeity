@@ -28,6 +28,19 @@ or that resolve to a contradicting canonical, -> ``AMBIGUOUS``/``CONFLICTING``.
 User-confirmed and locked values are never weakened here: the reconciler emits
 only ``machine``-authority events and the shared reducer's USER_OVERRIDE/lock
 semantics win (``reducer.py`` is unchanged).
+
+Identity certainty constrains dependent assertions (Plan U P3-S2)
+-----------------------------------------------------------------
+Canonical identity certainty caps the semantic state an assertion may carry.
+An assertion whose subject is a canonical identity that is only PROBABLE (not
+human-confirmed) or AMBIGUOUS/UNRESOLVED can never carry a CONFIRMED (or
+USER_CONFIRMED) state — it is capped at PROBABLE. ACCEPTED identities follow
+normal observation promotion. Surfaces with no resolution-derived
+classification (deterministic fallback refs with no known identity certainty)
+are left untouched so ordinary strong-observation promotion is preserved. This
+keeps uncertain identities from reading as confirmed canonical assertions while
+preserving surface mentions, evidence, unresolved candidates and reviewability
+without fabricating a confirmed pseudo-canonical.
 """
 
 from __future__ import annotations
@@ -41,7 +54,7 @@ from pydantic import BaseModel, Field
 
 from umd.analysis.semantic import ConfidenceState, GeneratedBy, SemanticAnalysisResult
 from umd.domain.events import EventType, SemanticEvent
-from umd.domain.models import is_known_predicate
+from umd.domain.models import IdentityClassification, is_known_predicate
 from umd.resolution.service import ResolutionBatch
 
 #: Reconciliation binding config digest (provenance).
@@ -84,13 +97,6 @@ class _Emit:
 
 _REL_TYPE_RE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 
-#: Recognized semantic relationship types that are NOT registered predicates but are
-#: valid to promote to a typed ``RELATED_TO`` (Plan T P2-S4 / R7). The DD names a
-#: valid unanticipated ``MENTOR_OF``; arbitrary well-formed but unknown predicates
-#: (e.g. ``QUX_LINK``) are NOT in this set and stay evidence-only — the trusted
-#: vocabulary is never invented by input.
-_SEMANTIC_RELATIONSHIP_TYPES = frozenset({"MENTOR_OF"})
-
 
 def _normalize_relationship_type(value: str | None) -> str | None:
     """Validate + normalize a relationship type (Plan T P2-S4 / R7).
@@ -110,19 +116,25 @@ def _normalize_relationship_type(value: str | None) -> str | None:
 def _relationship_target(rel: Any) -> tuple[str, str | None] | None:
     """Resolve a relationship observation's predicate + validated relationship type.
 
-    Plan T (P2-S4 / R7) — the generic relationship fallback that keeps the trusted
-    predicate vocabulary immutable:
+    Plan U (P2-S2) — the generic relationship fallback that keeps the trusted
+    predicate vocabulary immutable. The previously hardcoded recognized-type set
+    (``_SEMANTIC_RELATIONSHIP_TYPES``) is REMOVED; admission is now the bounded syntax
+    gate ``^[A-Z][A-Z0-9_]{0,63}$`` over the observation's own semantic field
+    (provenance), so a well-formed data-driven type (``MENTOR_OF``, ``RIVAL_OF``,
+    ``PARENT_OF``, ``MARRIED_TO``, ``COMMANDS``, ...) is promoted to a typed
+    ``RELATED_TO`` while a malformed / empty value stays evidence-only:
 
     * ``RELATED_TO`` with a valid normalized ``relationship_type`` -> emit as
       ``RELATED_TO`` carrying that type.
     * a registered predicate (e.g. the Lantern Keeper ``SIBLING_OF``) -> emit as
-      itself, its own predicate preserved (no relationship_type).
-    * a valid unanticipated relationship predicate (e.g. ``MENTOR_OF``) -> emit as
-      a typed ``RELATED_TO`` preserving the semantic predicate as its
-      ``relationship_type``.
-    * malformed sibling-of (a registered sibling carrying a conflicting type),
-      unregistered / type-invalid input -> ``None`` (evidence-only, never an
-      assertion).
+      itself, its own predicate preserved (no relationship_type) — independent of the
+      generic fallback.
+    * a well-formed unregistered relationship predicate (e.g. ``MENTOR_OF``) -> emit
+      as a typed ``RELATED_TO`` preserving the semantic predicate as its
+      ``relationship_type`` (an explicit valid ``relationship_type`` wins).
+    * malformed sibling-of (a registered sibling carrying a conflicting type) /
+      malformed / type-invalid input -> ``None`` (evidence-only, never an assertion).
+      No payload ever mutates the registered predicate vocabulary.
     """
     predicate = (rel.predicate or "").strip().upper()
     rt = _normalize_relationship_type(getattr(rel, "relationship_type", None))
@@ -140,14 +152,16 @@ def _relationship_target(rel: Any) -> tuple[str, str | None] | None:
     if is_known_predicate(predicate):
         # any other registered predicate (e.g. HAS_EMOTION) -> as-is, no type
         return (predicate, None)
-    # An unregistered but recognized semantic relationship type (e.g. MENTOR_OF)
-    # becomes a typed RELATED_TO preserving the semantic predicate. An explicit
-    # valid relationship_type wins; otherwise the recognized predicate is the type.
+    # An unregistered relationship predicate (Plan U P2-S2): an explicit valid
+    # relationship_type wins and is promoted to a typed RELATED_TO; otherwise a
+    # WELL-FORMED predicate is admitted by the bounded syntax gate as its own
+    # relationship type. Malformed / type-invalid input stays evidence-only, and
+    # nothing here registers or invents a vocabulary entry.
     if rt is not None:
         return ("RELATED_TO", rt)
-    if predicate in _SEMANTIC_RELATIONSHIP_TYPES:
+    if _normalize_relationship_type(predicate) is not None:
         return ("RELATED_TO", predicate)
-    return None  # unregistered / type-invalid -> evidence-only
+    return None  # malformed / type-invalid -> evidence-only
 
 
 def _promote(confidence: float, obs_state: ConfidenceState) -> str:
@@ -219,6 +233,7 @@ class SemanticReconciler:
     def __init__(self) -> None:
         self._surface_to_ref: dict[str, str] = {}
         self._conflicted: set[str] = set()
+        self._ceiling_refs: set[str] = set()
         self._source_id: str = ""
 
     def reconcile(self, input: ReconciliationInput) -> list[SemanticEvent]:
@@ -228,17 +243,21 @@ class SemanticReconciler:
         """
         self._surface_to_ref = self._build_surface_map(input)
         self._conflicted = self._build_conflicted(input)
+        self._ceiling_refs = self._build_ceiling_refs(input)
         self._source_id = input.source_id
 
         pending: list[_Emit] = []
         pending.extend(self._emit_resolution(input))
         pending.extend(self._emit_observations(input))
 
-        seen: set[tuple[str, str, str | None]] = set()
+        seen: set[tuple[str, str, str | None, str | None]] = set()
         events: list[SemanticEvent] = []
         for e in pending:
             state = self._state_for(e)
-            key = (e.predicate, e.subject_ref, e.object_ref)
+            # Plan U (P2-S3): the deterministic same-batch dedup identity includes the
+            # relationship type so MENTOR_OF and RIVAL_OF on the same (predicate,
+            # subject, object) coexist instead of collapsing into one assertion.
+            key = (e.predicate, e.subject_ref, e.object_ref, e.relationship_type)
             if key in seen:
                 continue
             seen.add(key)
@@ -284,6 +303,33 @@ class SemanticReconciler:
         return surface_to_ref
 
     @staticmethod
+    def _build_ceiling_refs(input: ReconciliationInput) -> set[str]:
+        """Refs whose canonical identity certainty caps dependent assertion states.
+
+        Plan U (P3-S2): identity certainty constrains dependent assertions. A
+        canonical identity that is only PROBABLE (not human-confirmed) or
+        AMBIGUOUS/UNRESOLVED can never yield a CONFIRMED canonical identity
+        assertion, so its subject ref is placed in the ceiling set. ACCEPTED
+        identities (and human-confirmed canonicals) follow normal promotion and
+        are excluded. Ambiguous/unresolved mention surfaces resolve to a
+        deterministic fallback ref; those refs are capped too so an unresolved
+        candidate can never read as a confirmed canonical.
+        """
+        resolution = input.resolution
+        if resolution is None:
+            return set()
+        ceiling: set[str] = set()
+        for ce in resolution.canonical_entities:
+            if ce.classification == IdentityClassification.ACCEPTED.value:
+                continue  # accepted -> normal promotion
+            if ce.state == ConfidenceState.USER_CONFIRMED.value:
+                continue  # human-confirmed probable is accepted-equivalent
+            ceiling.add(ce.ref)
+        for u in resolution.unresolved:
+            ceiling.add(_deterministic_ref(input.source_id, "entity", u.text))
+        return ceiling
+
+    @staticmethod
     def _build_conflicted(input: ReconciliationInput) -> set[str]:
         """Canonical refs surfaced as identity contradictions."""
         resolution = input.resolution
@@ -311,6 +357,13 @@ class SemanticReconciler:
             ConfidenceState.CONFLICTING.value,
         ):
             return ConfidenceState.CONFLICTING.value
+        if e.subject_ref in self._ceiling_refs and state in (
+            ConfidenceState.CONFIRMED.value,
+            ConfidenceState.USER_CONFIRMED.value,
+        ):
+            # Plan U (P3-S2): a PROBABLE/AMBIGUOUS/UNRESOLVED identity caps its
+            # dependent assertions at PROBABLE — never a confirmed canonical.
+            return ConfidenceState.PROBABLE.value
         return state
 
     # -- assertion emission (resolution-driven identity) -------------------

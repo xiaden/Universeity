@@ -37,6 +37,7 @@ from umd.api.deps import (
     serialize_audits,
 )
 from umd.api.errors import ApiError, NotFoundError
+from umd.api.ids import dashed_uuid
 from umd.api.pagination import offset_from, page_cursors
 from umd.api.schemas import (
     EvidenceListResponse,
@@ -240,8 +241,11 @@ def _submit_source(
     _dispatch(ctx, job_id=job_id, source_id=source_id, media_kind=media_kind)
 
     return SourceDescriptorResponse(
-        source_id=source_id,
-        work_id=effective_work_id,
+        # P4-S1 boundary contract: every public UUID id (source, work) is the
+        # standard dashed form, matching the dashed membership/scope values the
+        # rest of the boundary expects. Internal storage keeps the raw form.
+        source_id=dashed_uuid(source_id) or source_id,
+        work_id=dashed_uuid(effective_work_id),
         ocfl_ref=manifest.object_id,
         sha512=manifest.sha512,
         size_bytes=manifest.size_bytes,
@@ -328,14 +332,14 @@ def get_source(
     if rec is None:
         raise NotFoundError(f"unknown source {source_id}")
     return SourceDetailResponse(
-        source_id=rec.source_id,
+        source_id=dashed_uuid(rec.source_id) or rec.source_id,
         ocfl_ref=rec.ocfl_ref,
         sha512=rec.sha512,
         size_bytes=rec.size_bytes,
         media_kind=rec.media_kind,
-        work_id=rec.work_id,
-        continuity_id=getattr(rec, "continuity_id", None),
-        edition_id=getattr(rec, "edition_id", None),
+        work_id=dashed_uuid(getattr(rec, "work_id", None)),
+        continuity_id=dashed_uuid(getattr(rec, "continuity_id", None)),
+        edition_id=dashed_uuid(getattr(rec, "edition_id", None)),
     )
 
 
@@ -455,7 +459,7 @@ def rerun_source(
     ctx: AppContext = Depends(get_context),
     _p: Any = Depends(get_write_principal),
 ) -> dict[str, Any]:
-    job_id = f"job-{source_id[:12]}"
+    job_id = f"job-{source_id.replace('-', '')[:12]}"
     ctx.jobs.rerun_source(
         source_id=source_id,
         scope="SOURCE",
@@ -496,7 +500,7 @@ def source_analysis(
 ) -> dict[str, Any]:
     """Expose REAL durable stage state (P3-S4): status, operational events, and
     per-stage attempts/states from the durable job store — never fake completion."""
-    job_id = f"job-{source_id[:12]}"
+    job_id = f"job-{source_id.replace('-', '')[:12]}"
     status = "unknown"
     events: list[Any] = []
     stages: list[dict[str, Any]] = []

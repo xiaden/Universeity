@@ -350,6 +350,7 @@ def _load_all_events(conn: sa.Connection) -> list[Any]:
             _event_t.c.authority,
             _event_t.c.confidence,
             _event_t.c.created_by,
+            _event_t.c.generated_by,
         ).order_by(_event_t.c.seq)
     ).fetchall()
     events: list[SemanticEvent] = []
@@ -364,6 +365,7 @@ def _load_all_events(conn: sa.Connection) -> list[Any]:
                 authority=r.authority,
                 confidence=r.confidence,
                 created_by=r.created_by,
+                generated_by=dict(r.generated_by or {}),
                 seq=int(r.seq),
             )
         )

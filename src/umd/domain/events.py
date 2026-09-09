@@ -216,6 +216,18 @@ def _upcast_semantic_asserted_2_to_3(payload: dict[str, Any]) -> dict[str, Any]:
     return widened
 
 
+def _upcast_mutation_1_to_2(payload: dict[str, Any]) -> dict[str, Any]:
+    """v1 -> v2 (Plan U P2-S4): the mutation events (OverrideApplied,
+    CorrectionApplied, Invalidated, ContradictionRecorded) gain an optional
+    ``relationship_type`` so a typed edge can be corrected / overridden /
+    invalidated / contradicted independently of its sibling type. The pure
+    upcaster supplies the neutral ``None`` default so retained v1 rows replay
+    unchanged as v2; nothing historical is mutated."""
+    widened = dict(payload)
+    widened.setdefault("relationship_type", None)
+    return widened
+
+
 UPCASTERS: dict[tuple[str, int], Upcaster] = {
     # SemanticAsserted v1 -> v2 (pure upcaster, no I/O).
     ("SemanticAsserted", 1): _upcast_semantic_asserted_1_to_2,
@@ -223,6 +235,11 @@ UPCASTERS: dict[tuple[str, int], Upcaster] = {
     ("EntityResolved", 1): _upcast_entity_resolved_1_to_2,
     # SemanticAsserted v2 -> v3 (Plan T P2-S4 / R7): additive RELATED_TO type.
     ("SemanticAsserted", 2): _upcast_semantic_asserted_2_to_3,
+    # Mutation events v1 -> v2 (Plan U P2-S4): additive typed-target relationship_type.
+    ("OverrideApplied", 1): _upcast_mutation_1_to_2,
+    ("CorrectionApplied", 1): _upcast_mutation_1_to_2,
+    ("Invalidated", 1): _upcast_mutation_1_to_2,
+    ("ContradictionRecorded", 1): _upcast_mutation_1_to_2,
 }
 
 

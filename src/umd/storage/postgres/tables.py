@@ -480,7 +480,10 @@ current_state = sa.Table(
     metadata,
     sa.Column("entity_ref", sa.String(512), nullable=False),
     sa.Column("predicate", sa.String(64), nullable=False),
-    sa.Column("object_ref", sa.String(512), nullable=True),
+    # Plan U (P3-S3): canonical-identity metadata (incl. generated_by, actor,
+    # correspondence/derivation refs) can exceed VARCHAR(512), so the active
+    # winner's object_ref is TEXT (additive migration 0010).
+    sa.Column("object_ref", sa.Text(), nullable=True),
     sa.Column("confidence", sa.Float(), nullable=True),
     sa.Column("authority", sa.String(64), nullable=True),
     sa.Column("state", sa.String(24), nullable=False, server_default="UNKNOWN"),

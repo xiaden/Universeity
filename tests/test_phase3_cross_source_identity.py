@@ -780,7 +780,7 @@ def _p3_http(umd_db: sa.Engine, source_store):
         return r.json()
 
     def _poll(client, sid):
-        job = f"job-{sid[:12]}"
+        job = f"job-{sid.replace('-', '')[:12]}"
         for _ in range(150):
             rj = client.get(f"/v1/jobs/{job}", headers={"Authorization": "Bearer read-key"})
             assert rj.status_code == 200, rj.text
@@ -806,18 +806,6 @@ def _p3_http(umd_db: sa.Engine, source_store):
         for it in items:
             by_label.setdefault(it.get("display_label") or it["label"], []).append(it)
         yield SimpleNamespace(client=client, by_label=by_label, a=a, b=b, c=c, wa=wa)
-
-
-def _dashless(uuid_like: str) -> str:
-    return uuid_like.replace("-", "")
-
-
-def _dashed(uuid_like: str) -> str:
-    """Normalize a 32-hex id (as returned by POST /v1/sources) to dashed UUID form,
-    which is the format the membership filters expect."""
-    return (
-        f"{uuid_like[:8]}-{uuid_like[8:12]}-{uuid_like[12:16]}-{uuid_like[16:20]}-{uuid_like[20:]}"
-    )
 
 
 def test_john_same_work_collision_separate_public(_p3_client) -> None:
@@ -954,9 +942,6 @@ def test_http_public_identity_abc(_p3_http) -> None:
     a, b, c = _p3_http.a, _p3_http.b, _p3_http.c
     sa_id, sb_id, sc_id = a["source_id"], b["source_id"], c["source_id"]
 
-    def _memb(source_ids):
-        return {_dashless(s) for s in source_ids}
-
     required_metadata = ("provenance", "confidence", "generated_by", "capabilities")
 
     def _assert_meta(items, context):
@@ -965,28 +950,28 @@ def test_http_public_identity_abc(_p3_http) -> None:
                 assert key in it, (context, key, it)
 
     mara = by_label.get("Mara", [])
-    mara_a = [m for m in mara if sa_id in _memb(m["memberships"]["source_ids"])]
-    mara_c = [m for m in mara if sc_id in _memb(m["memberships"]["source_ids"])]
+    mara_a = [m for m in mara if sa_id in set(m["memberships"]["source_ids"])]
+    mara_c = [m for m in mara if sc_id in set(m["memberships"]["source_ids"])]
     # Mara unifies across A+B (same work, shared correspondence) into ONE canonical.
     assert len(mara_a) == 1, mara_a
-    assert sb_id in _memb(mara_a[0]["memberships"]["source_ids"]), mara_a
+    assert sb_id in set(mara_a[0]["memberships"]["source_ids"]), mara_a
     # The other-work Mara (C) is a DISTINCT ref (no cross-work merge).
     assert len(mara_c) == 1, mara_c
     assert mara_c[0]["ref"] != mara_a[0]["ref"]
     # No duplicate: exactly one Mara canonical carries source A's membership.
-    assert len([m for m in mara if sa_id in _memb(m["memberships"]["source_ids"])]) == 1
+    assert len([m for m in mara if sa_id in set(m["memberships"]["source_ids"])]) == 1
 
     # P3-S3: coincident-structure same-work same-name John pair stays TWO
     # source-local canonicals — content-derived disambiguation, not locator.
     john = by_label.get(SAME_NAME_COLLISION, [])
-    john_a = [j for j in john if sa_id in _memb(j["memberships"]["source_ids"])]
-    john_b = [j for j in john if sb_id in _memb(j["memberships"]["source_ids"])]
+    john_a = [j for j in john if sa_id in set(j["memberships"]["source_ids"])]
+    john_b = [j for j in john if sb_id in set(j["memberships"]["source_ids"])]
     assert len(john_a) == 1, john_a
     assert len(john_b) == 1, john_b
     # Distinct opaque refs, each source-local (memberships exactly {A} / {B}).
     assert john_a[0]["ref"] != john_b[0]["ref"]
-    assert _memb(john_a[0]["memberships"]["source_ids"]) == {sa_id}
-    assert _memb(john_b[0]["memberships"]["source_ids"]) == {sb_id}
+    assert set(john_a[0]["memberships"]["source_ids"]) == {sa_id}
+    assert set(john_b[0]["memberships"]["source_ids"]) == {sb_id}
     for j in john_a + john_b:
         assert j["ref"].startswith("entity:canonical:")
         # No cross-alias links the two Johns together.
@@ -998,7 +983,7 @@ def test_http_public_identity_abc(_p3_http) -> None:
     # Scoped reads: source A sees only A's John; source B only B's John; C only C's.
     for sid, expected in ((sa_id, john_a[0]), (sb_id, john_b[0])):
         r = client.get(
-            f"/v1/entities?source_id={_dashed(sid)}", headers={"Authorization": "Bearer read-key"}
+            f"/v1/entities?source_id={sid}", headers={"Authorization": "Bearer read-key"}
         )
         assert r.status_code == 200, r.text
         items = r.json()["items"]
@@ -1012,7 +997,7 @@ def test_http_public_identity_abc(_p3_http) -> None:
     # Scoped public read: source A sees only A's Mara; source C only C's.
     for sid, expected in ((sa_id, mara_a[0]), (sc_id, mara_c[0])):
         r = client.get(
-            f"/v1/entities?source_id={_dashed(sid)}", headers={"Authorization": "Bearer read-key"}
+            f"/v1/entities?source_id={sid}", headers={"Authorization": "Bearer read-key"}
         )
         assert r.status_code == 200, r.text
         labels = [it.get("display_label") or it["label"] for it in r.json()["items"]]

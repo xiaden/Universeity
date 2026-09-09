@@ -65,9 +65,16 @@ def _assertion_fact_id(payload: dict[str, Any], event_version: int) -> uuid.UUID
     """Deterministic content-addressable id for one semantic fact.
 
     Derived ONLY from the stable semantic identity (predicate, subject/object
-    refs + entity ids, scope) — never from random evidence ids or seqs — so a
-    rerun asserting the same fact maps to the SAME row (idempotency +
-    wipe-and-replay stability). Distinct facts map to distinct ids.
+    refs + entity ids, scope, continuity + normalized relationship type) — never
+    from random evidence ids or seqs — so a rerun asserting the same fact maps to
+    the SAME row (idempotency + wipe-and-replay stability). Distinct facts map to
+    distinct ids. Plan U (P2-S3): the identity includes the normalized
+    ``relationship_type`` and the ``continuity_id`` so two typed RELATED_TO facts
+    sharing the same predicate/subject/object/scope (MENTOR_OF vs RIVAL_OF) map to
+    DISTINCT rows and independently correct/invalidate/replay/search/query. Retained
+    v1/v2 payloads upcast ``relationship_type``/``continuity_id`` to ``None`` and
+    derive a stable id via the same versioned namespace — historical rows are never
+    rewritten (the ledger is append-only and the mirror is written only at append).
     """
     key = json.dumps(
         {
@@ -81,6 +88,10 @@ def _assertion_fact_id(payload: dict[str, Any], event_version: int) -> uuid.UUID
             if payload.get("object_entity_id")
             else None,
             "scope": payload.get("scope"),
+            "continuity_id": str(payload["continuity_id"])
+            if payload.get("continuity_id")
+            else None,
+            "relationship_type": payload.get("relationship_type"),
         },
         sort_keys=True,
         separators=(",", ":"),

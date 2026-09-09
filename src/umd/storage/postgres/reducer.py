@@ -31,6 +31,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from umd.domain.events import SemanticEvent
+from umd.domain.models import IdentityClassification
 
 #: Authority value that always beats machine inference (see domain authority).
 USER_OVERRIDE = "USER_OVERRIDE"
@@ -402,6 +403,11 @@ def _identity_metadata(event: SemanticEvent) -> dict[str, Any]:
     ``object_ref`` (parsed if valid JSON); otherwise it is assembled from the
     additive payload fields. Only the latest non-invalidated/non-corrected values
     are exposed active; prior values stay immutable in the event stream.
+
+    Plan U (P3-S3): the assembled dict additionally folds the event-level
+    ``generated_by`` provenance, ``created_by``/actor, and ``derived_from``/
+    ``correspondence`` refs so active canonical reads retain exact machine
+    provider/config or human-override provenance through replay.
     """
     payload = event.payload
     if event.event_type in ("OverrideApplied", "CorrectionApplied") and payload.get("object_ref"):
@@ -413,24 +419,62 @@ def _identity_metadata(event: SemanticEvent) -> dict[str, Any]:
         if isinstance(parsed, dict):
             return parsed
     kind = payload.get("kind")
-    return {
+    memberships: dict[str, list[Any]] = dict(payload.get("memberships") or {})
+    # Plan U (P4-S3): fold the correlated ``membership_tuples`` (carried as a
+    # separate event field so the legacy ``memberships`` shape is preserved) into
+    # the additive ``memberships.tuples`` of the current-state identity metadata.
+    # When the caller already placed ``tuples`` inside ``memberships`` (manual
+    # POST), it is retained as-is. Rows without any tuples stay legacy-shaped.
+    mt = payload.get("membership_tuples")
+    if mt:
+        memberships["tuples"] = list(mt)
+    meta: dict[str, Any] = {
         "canonical_type": payload.get("canonical_type"),
         "display_label": payload.get("display_label"),
         "aliases": list(payload.get("aliases") or []),
         "support_refs": list(payload.get("support_refs") or []),
-        "memberships": dict(payload.get("memberships") or {}),
+        "memberships": memberships,
         "state": payload.get("state") or (STATE_CONFIRMED if kind == "ESTABLISH" else None),
         "confidence": payload.get("confidence"),
         "classification": payload.get("classification"),
+        "generated_by": dict(payload.get("generated_by") or event.generated_by or {}),
+        "created_by": payload.get("actor") or event.created_by,
+        "derived_from": list(payload.get("derived_from") or []),
+        "correspondence": list(payload.get("correspondence") or []),
     }
+    # P4-S5: a manual POST entity's ``actor`` field is delegated, NON-authoritative
+    # attribution only — the authoritative ``created_by`` is the authenticated
+    # principal (``event.created_by``). Carry the delegated attribution through
+    # replay as a separate, clearly non-authoritative field when present.
+    if payload.get("attributed_actor") is not None:
+        meta["attributed_actor"] = payload.get("attributed_actor")
+    return meta
+
+
+def _parse_metadata(object_ref: str | None) -> dict[str, Any]:
+    """Parse a canonical-identity metadata JSONB string to a dict (or empty)."""
+    if not object_ref:
+        return {}
+    try:
+        parsed = json.loads(object_ref)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _empty_memberships() -> dict[str, list[str]]:
     return {"source_ids": [], "work_ids": [], "continuity_ids": []}
 
 
-def _memberships_of(row: CurrentStateRow) -> dict[str, list[str]]:
-    """Parse the memberships carried on a row's active metadata (or empty)."""
+def _memberships_of(row: CurrentStateRow) -> dict[str, list[Any]]:
+    """Parse the memberships carried on a row's active metadata (or empty).
+
+    Plan U (P4-S3): the correlated ``tuples`` key is a list of
+    ``[source_id, work_id, continuity_id]`` triples — a list of lists. It is
+    preserved verbatim (never ``str()``-flattened, which would corrupt the
+    nested structure). Scalar sub-lists (source_ids/work_ids/continuity_ids)
+    are normalized to ``str`` for deterministic dedup.
+    """
     if not row.object_ref:
         return _empty_memberships()
     try:
@@ -441,26 +485,35 @@ def _memberships_of(row: CurrentStateRow) -> dict[str, list[str]]:
         return _empty_memberships()
     memberships = parsed.get("memberships")
     if isinstance(memberships, dict):
-        return {
-            str(k): [str(x) for x in (v if isinstance(v, list) else [])]
-            for k, v in memberships.items()
-        }
+        out: dict[str, list[Any]] = {}
+        for k, v in memberships.items():
+            if isinstance(v, list) and v and all(isinstance(x, list) for x in v):
+                # Nested correlated tuples: keep the inner lists verbatim.
+                out[str(k)] = list(v)
+            else:
+                out[str(k)] = [str(x) for x in (v if isinstance(v, list) else [])]
+        return out
     return _empty_memberships()
 
 
 def _union_memberships(
-    prev: dict[str, list[str]], incoming: dict[str, list[str]]
-) -> dict[str, list[str]]:
+    prev: dict[str, list[Any]], incoming: dict[str, list[Any]]
+) -> dict[str, list[Any]]:
     """Deterministically union two membership dicts, per sub-list, deduped.
 
     Plan S (P3-S1/S2): membership is CUMULATIVE across the sources that feed a
     canonical identity — re-establishing a canonical from a second source of the
     same work accumulates that source (and never drops a prior one). Order is
     ``prev`` then ``incoming``, deduplicated, so replay is deterministic.
+
+    Plan U (P4-S3): the correlated ``tuples`` sub-list (list of
+    ``[source, work, continuity]`` triples) unions element-wise identically to
+    any other sub-list — each triple is a list, so membership dedup is
+    structural equality on the inner list.
     """
-    out: dict[str, list[str]] = {}
+    out: dict[str, list[Any]] = {}
     for key in sorted(set(prev) | set(incoming)):
-        seen: list[str] = []
+        seen: list[Any] = []
         for item in list(prev.get(key) or []) + list(incoming.get(key) or []):
             if item not in seen:
                 seen.append(item)
@@ -503,6 +556,21 @@ def _reduce_canonical_identity(row: CurrentStateRow, event: SemanticEvent) -> Cu
         return row
 
     metadata = _identity_metadata(event)
+    if etype in ("OverrideApplied", "CorrectionApplied"):
+        # Plan U (P3-S4): an override/correction replaces ONLY the fields it
+        # explicitly provides, merging over the current winner so unsupported
+        # provenance (support refs, memberships, classification, generated_by)
+        # is retained instead of being wiped. Prior history stays immutable in
+        # the event stream; the override becomes the new current winner.
+        merged = dict(_parse_metadata(row.object_ref))
+        merged.update(metadata)
+        if event.authority == USER_OVERRIDE and not merged.get("classification"):
+            # An authenticated human override/confirmation confirms the identity.
+            merged["classification"] = IdentityClassification.ACCEPTED.value
+        merged["created_by"] = (
+            event.created_by or event.payload.get("actor") or merged.get("created_by")
+        )
+        metadata = merged
     if metadata.get("memberships"):
         metadata["memberships"] = _union_memberships(_memberships_of(row), metadata["memberships"])
     alternatives = list(row.alternatives)
@@ -638,21 +706,32 @@ class CurrentStateReducer:
             # Seed an empty row with its own key so ``reduce_current_state`` can
             # match ``_targets_row`` and apply the change to a brand-new row.
             current = CurrentStateRow(entity_ref=target[0], predicate=target[1])
+
+        # Plan S (P1-S4): a canonical establishment/correction also reduces the
+        # durable identity metadata row. Snapshot the pre-write identity row BEFORE
+        # ``reduce_current_state`` mutates the shared ``(entity_ref, predicate)``
+        # row, so a Plan U (P3-S4) override/correction MERGES over the current
+        # winner's metadata (retaining unsupported provenance: memberships,
+        # support refs, generated_by) instead of reading back the already-
+        # overwritten override blob. The target and identity targets are the same
+        # row for ``CANONICAL_IDENTITY`` overrides/corrections/invalidations, so
+        # ``identity_pre`` must be captured here (pre-write) to seed the merge.
+        identity_target = identity_event_target(event)
+        identity_key: tuple[str, str] | None = None
+        identity_pre: CurrentStateRow | None = None
+        if identity_target is not None and not state.locks.get(identity_target[0]):
+            identity_key = identity_target
+            identity_pre = state.rows.get(identity_key)
+            if identity_pre is None:
+                identity_pre = CurrentStateRow(
+                    entity_ref=identity_key[0], predicate=identity_key[1]
+                )
+
         updated = reduce_current_state(current, event)
         state.rows[target] = updated
 
-        # Plan S (P1-S4): a canonical establishment/correction also reduces the
-        # durable identity metadata row (same lock/authority/LWW rules).
-        identity_target = identity_event_target(event)
-        if identity_target is not None:
-            if state.locks.get(identity_target[0]):
-                return state
-            identity_row = state.rows.get(identity_target)
-            if identity_row is None:
-                identity_row = CurrentStateRow(
-                    entity_ref=identity_target[0], predicate=identity_target[1]
-                )
-            state.rows[identity_target] = _reduce_canonical_identity(identity_row, event)
+        if identity_key is not None and identity_pre is not None:
+            state.rows[identity_key] = _reduce_canonical_identity(identity_pre, event)
         return state
 
     def replay(self, events: list[SemanticEvent]) -> CurrentReducedState:

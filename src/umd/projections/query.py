@@ -22,6 +22,7 @@ import sqlalchemy as sa
 from pydantic import BaseModel, Field
 from sqlalchemy.dialects import postgresql
 
+from umd.api.ids import dashed_uuid
 from umd.projections.tables import (
     RESULT_KIND_CANONICAL_ENTITY,
     RESULT_KIND_INTERPRETATION,
@@ -327,7 +328,11 @@ class QueryService:
                 raise ScopeUnmappableError("work_id is not a valid UUID")
             scope["work_ids"] = {str(work)}
         if source is not None:
-            scope["source_ids"] = {str(source)}
+            # P4-S1 boundary contract: normalize the requested source id to the
+            # canonical dashed form so a raw id from an API response (dashed)
+            # and a dashless client-supplied id both match the dashed stored
+            # membership source ids.
+            scope["source_ids"] = {str(dashed_uuid(source))}
         if continuity is not None:
             if _parse_uuid(continuity) is None:
                 raise ScopeUnmappableError("continuity_id is not a valid UUID")
@@ -353,20 +358,62 @@ class QueryService:
         Only valid on identity rows (a ``CANONICAL_ENTITY``-only fallback row's ``object_ref`` is
         not the identity metadata JSON); callers must combine it with
         ``predicate == CANONICAL_IDENTITY_PREDICATE``.
+
+        Plan U (P4-S3/S4): when the identity metadata carries the correlated
+        ``memberships.tuples`` representation (each tuple is ``[source_id, work_id,
+        continuity_id]``), the scope is matched CORRELATED — a requested dimension
+        combination is true only when a single tuple satisfies every requested
+        dimension simultaneously (so A/X+B/Y matches while A/Y+B/X misses). Rows
+        without ``tuples`` (legacy replay) fall back to the independent-array
+        overlap semantics below, preserving legacy compatibility.
         """
         if not scope:
             return sa.true()
         body = sa.cast(_cs.c.object_ref, postgresql.JSONB())
         memberships = body.op("->")("memberships")
-        clauses: list[Any] = []
+        has_tuples = memberships.op("?")("tuples")
+        # Legacy (independent-array overlap) predicate — a superset fallback for
+        # rows that carry no correlated ``tuples`` block.
+        legacy_clauses: list[Any] = []
         for key, requested in scope.items():
             if not requested:
                 continue
             owned = memberships.op("->")(key)
             requested_values = [str(x) for x in requested]
             rhs = sa.cast(postgresql.array(requested_values), sa.ARRAY(sa.Text()))
-            clauses.append(owned.op("?|")(rhs))
-        return sa.and_(*clauses) if clauses else sa.true()
+            legacy_clauses.append(owned.op("?|")(rhs))
+        legacy_pred = sa.and_(*legacy_clauses) if legacy_clauses else sa.true()
+        tuple_pred = self._tuple_scope_pred(scope)
+        # A row with a ``tuples`` block is scoped exactly by correlated tuple
+        # matching; a row without one uses the legacy array-overlap semantics.
+        return sa.or_(
+            sa.and_(has_tuples, tuple_pred),
+            sa.and_(sa.not_(has_tuples), legacy_pred),
+        )
+
+    def _tuple_scope_pred(self, scope: dict[str, set[str]]) -> Any:
+        """Exact correlated-tuple SQL predicate (Plan U P4-S4).
+
+        True when some ``memberships.tuples`` element ``[source, work, continuity]``
+        satisfies every requested scope dimension at once (each requested id set
+        matches that tuple's element at the matching dimension index).
+        """
+        if not scope:
+            return sa.true()
+        body = sa.cast(_cs.c.object_ref, postgresql.JSONB())
+        tuples = body.op("->")("memberships").op("->")("tuples")
+        elt = sa.func.jsonb_array_elements(tuples).table_valued("value", name="tup_elt")
+        dims = {"source_ids": 0, "work_ids": 1, "continuity_ids": 2}
+        conds: list[Any] = []
+        for key, requested in scope.items():
+            if not requested:
+                continue
+            # ``->>`` needs an INTEGER index for JSONB arrays (a text key like
+            # ``'0'`` returns NULL). ``dims[key]`` is the numeric array index.
+            element = elt.c.value.op("->>")(dims[key])
+            conds.append(element.in_([str(x) for x in requested]))
+        subq = sa.select(1).select_from(elt).where(*conds)
+        return sa.exists(subq)
 
     def _in_membership_scope(self, r: Any, scope: dict[str, set[str]]) -> bool:
         """Whether a candidate identity/entity row's memberships intersect ``scope``.
@@ -375,6 +422,11 @@ class QueryService:
         ``memberships`` dict (accumulated deterministically by the reducer). A
         CANONICAL_ENTITY-only fallback row (no identity metadata) carries no
         memberships and therefore never satisfies a non-empty scope.
+
+        Plan U (P4-S4): when the metadata carries correlated ``memberships.tuples``,
+        the scope is matched CORRELATED (one tuple must satisfy every requested
+        dimension — A/X+B/Y matches, A/Y+B/X misses). Legacy rows without tuples use
+        the independent AND-of-intersections semantics below.
         """
         if not scope:
             return True
@@ -382,11 +434,30 @@ class QueryService:
         memberships = meta.get("memberships") or {}
         if not isinstance(memberships, dict):
             memberships = {}
+        tuples = memberships.get("tuples")
+        if isinstance(tuples, list) and tuples:
+            return any(self._tuple_in_scope(t, scope) for t in tuples)
         for key, requested in scope.items():
             if not requested:
                 continue
             owned = memberships.get(key) or []
             if not (set(str(x) for x in owned) & set(str(x) for x in requested)):
+                return False
+        return True
+
+    @staticmethod
+    def _tuple_in_scope(t: Any, scope: dict[str, set[str]]) -> bool:
+        """Whether a correlated ``[source, work, continuity]`` tuple matches ``scope``."""
+        if not isinstance(t, (list, tuple)) or len(t) < 3:
+            return False
+        dims = {"source_ids": 0, "work_ids": 1, "continuity_ids": 2}
+        for key, requested in scope.items():
+            if not requested:
+                continue
+            val = t[dims[key]]
+            if val is None:
+                return False
+            if str(val) not in {str(x) for x in requested}:
                 return False
         return True
 
@@ -470,6 +541,15 @@ class QueryService:
             support = list(meta.get("support_refs") or [])
             memberships = dict(meta.get("memberships") or {})
             ctype = meta.get("canonical_type")
+            # Plan U (P3-S3): retain exact provenance on active canonical reads —
+            # generated_by (machine provider/config or human-override), identity
+            # classification, created_by/actor, and correspondence/derivation refs.
+            # All additive; Plan T's existing public response shape is preserved.
+            classification = meta.get("classification")
+            gb = meta.get("generated_by") or {}
+            created_by = meta.get("created_by")
+            derived = list(meta.get("derived_from") or [])
+            correspondence = list(meta.get("correspondence") or [])
             return QueryResultHit(
                 ref=str(r.entity_ref),
                 kind=_CE,
@@ -481,6 +561,11 @@ class QueryService:
                     "predicate": CANONICAL_IDENTITY_PREDICATE,
                     "support_refs": support,
                     "state": state,
+                    "classification": classification,
+                    "generated_by": gb,
+                    "created_by": created_by,
+                    "derived_from": derived,
+                    "correspondence": correspondence,
                 },
                 capabilities={
                     "canonical_type": ctype,
@@ -488,6 +573,7 @@ class QueryService:
                     "state": state,
                     "memberships": memberships,
                     "display_label": label,
+                    "classification": classification,
                 },
                 data={
                     "seq": r.seq,
@@ -499,6 +585,11 @@ class QueryService:
                     "support_refs": support,
                     "memberships": memberships,
                     "display_label": label,
+                    "classification": classification,
+                    "generated_by": gb,
+                    "created_by": created_by,
+                    "derived_from": derived,
+                    "correspondence": correspondence,
                 },
             )
         # Fallback: a CANONICAL_ENTITY row without identity metadata (alias/legacy).

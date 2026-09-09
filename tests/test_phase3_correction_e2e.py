@@ -688,7 +688,7 @@ def test_book_fixture_correction_override_survives_rerun_and_edges_update(
         assert r.status_code == 201, r.text
         sid = r.json()["source_id"]
         work_id = r.json()["work_id"]
-        job_id = f"job-{sid[:12]}"
+        job_id = f"job-{sid.replace('-', '')[:12]}"
         status = "running"
         for _ in range(40):
             status = client.get(f"/v1/jobs/{job_id}", headers=auth_r).json()["status"]

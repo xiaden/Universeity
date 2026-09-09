@@ -16,6 +16,7 @@ from typing import Any
 
 import sqlalchemy as sa
 
+from umd.api.ids import dashed_uuid
 from umd.domain.events import SemanticEvent
 from umd.projections.base import ReplayDriver
 from umd.projections.edges import EDGE_PROJECTION_NAME
@@ -244,17 +245,35 @@ class SearchProjectionBuilder:
     def _scope_combos(memberships: dict[str, Any]) -> list[tuple[Any, Any, Any]]:
         """The membership ``(source_id, work_id, continuity_id)`` scope combinations.
 
-        Deterministic cross-product of the canonical's replay-derived memberships so a
-        scoped read (by any dimension) finds exactly one doc per matching scope. An
-        empty dimension collapses to ``None``. A canonical with NO source membership is
-        indexed once globally (all ``None``) so it stays discoverable in global search.
+        Plan U (P4-S3/S4): when the memberships carry the correlated ``tuples``
+        representation (each ``[source, work, continuity]``), the scoped docs are the
+        CORRELATED tuples themselves — so a scoped read by any dimension finds exactly
+        one doc per real membership tuple and never synthesizes a spurious cross-product
+        combination (A/X+B/Y matches, A/Y+B/X misses). Legacy memberships without
+        ``tuples`` fall back to the deterministic cross-product below (preserving
+        legacy replay). A canonical with NO source membership is indexed once globally
+        (all ``None``) so it stays discoverable in global search.
         """
+        tuples = memberships.get("tuples")
+        if isinstance(tuples, list) and tuples:
+            combos: list[tuple[Any, Any, Any]] = []
+            for t in tuples:
+                if not isinstance(t, (list, tuple)) or len(t) < 3:
+                    continue
+                combos.append(
+                    (
+                        str(t[0]) if t[0] else None,
+                        str(t[1]) if t[1] else None,
+                        str(t[2]) if t[2] else None,
+                    )
+                )
+            return combos
         sources = [str(s) for s in (memberships.get("source_ids") or [])]
         works = [str(w) for w in (memberships.get("work_ids") or [])]
         continuities = [str(c) for c in (memberships.get("continuity_ids") or [])]
         if not sources:
             return [(None, None, None)]
-        combos: list[tuple[str, str | None, str | None]] = []
+        combos = []
         source_list = sorted(set(sources))
         work_list: list[str | None] = []
         work_list.extend(sorted(set(works))) if works else work_list.append(None)
@@ -648,12 +667,18 @@ class SearchService:
         t = self._table
         if filters is None:
             return conds
-        if filters.source_id:
-            conds.append(t.c.source_id == filters.source_id)
-        if filters.work_id:
-            conds.append(t.c.work_id == filters.work_id)
-        if filters.continuity_id:
-            conds.append(t.c.continuity_id == filters.continuity_id)
+        # P4-S1 boundary contract: normalize the public scope ids to the canonical
+        # dashed form so a raw id from an API response (dashed) and a dashless
+        # client-supplied id both match the dashed indexed membership values.
+        source_id = dashed_uuid(filters.source_id)
+        work_id = dashed_uuid(filters.work_id)
+        continuity_id = dashed_uuid(filters.continuity_id)
+        if source_id:
+            conds.append(t.c.source_id == source_id)
+        if work_id:
+            conds.append(t.c.work_id == work_id)
+        if continuity_id:
+            conds.append(t.c.continuity_id == continuity_id)
         if filters.segment_id:
             conds.append(t.c.segment_id == filters.segment_id)
         if filters.entity_ref:

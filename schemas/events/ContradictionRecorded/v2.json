@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/events/ContradictionRecorded/v2.json",
+  "title": "ContradictionRecorded",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "subject_ref",
+    "predicate"
+  ],
+  "properties": {
+    "subject_ref": {
+      "type": "string"
+    },
+    "predicate": {
+      "type": "string"
+    },
+    "relationship_type": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]{0,63}$"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Plan U P2-S4: the normalized relationship type this contradiction targets (RELATED_TO edges). Null for untyped predicates."
+    },
+    "contradicting_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

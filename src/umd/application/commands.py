@@ -84,6 +84,7 @@ class SemanticCommandService:
         subject_entity_id: Any | None = None,
         object_entity_id: Any | None = None,
         continuity_id: Any | None = None,
+        relationship_type: str | None = None,
         narrative_time: dict[str, Any] | None = None,
         spatial: dict[str, Any] | None = None,
         generated_by: dict[str, Any] | None = None,
@@ -102,6 +103,7 @@ class SemanticCommandService:
             "state": state,
             "scope": scope,
             "continuity_id": continuity_id,
+            "relationship_type": relationship_type,
             "support_refs": support_refs or [],
             "contradiction_refs": contradiction_refs or [],
             "derived_from": derived_from or [],
@@ -138,6 +140,7 @@ class SemanticCommandService:
         actor: str,
         evidence: list[str] | None = None,
         reason: str | None = None,
+        relationship_type: str | None = None,
         correlation_id: Any | None = None,
     ) -> CommitResult:
         return self._ledger.append(
@@ -153,6 +156,7 @@ class SemanticCommandService:
                         "evidence": evidence or [],
                         "actor": actor,
                         "reason": reason,
+                        "relationship_type": relationship_type,
                     },
                     authority="USER_OVERRIDE",
                     confidence=confidence,
@@ -172,6 +176,7 @@ class SemanticCommandService:
         actor: str,
         reason: str | None = None,
         evidence: list[str] | None = None,
+        relationship_type: str | None = None,
         correlation_id: Any | None = None,
     ) -> CommitResult:
         return self._ledger.append(
@@ -186,6 +191,7 @@ class SemanticCommandService:
                         "actor": actor,
                         "reason": reason,
                         "evidence": evidence or [],
+                        "relationship_type": relationship_type,
                     },
                     authority="USER_OVERRIDE",
                     created_by=actor,
@@ -256,6 +262,7 @@ class SemanticCommandService:
         contradicting_ref: str | None = None,
         refs: list[str] | None = None,
         reason: str | None = None,
+        relationship_type: str | None = None,
         correlation_id: Any | None = None,
     ) -> CommitResult:
         return self._ledger.append(
@@ -268,6 +275,7 @@ class SemanticCommandService:
                         "contradicting_ref": contradicting_ref,
                         "refs": refs or [],
                         "reason": reason,
+                        "relationship_type": relationship_type,
                     },
                     correlation_id=correlation_id,
                 )
@@ -283,6 +291,7 @@ class SemanticCommandService:
         scope: str = "GLOBAL",
         stage: str | None = None,
         refs: list[str] | None = None,
+        relationship_type: str | None = None,
         correlation_id: Any | None = None,
     ) -> CommitResult:
         return self._ledger.append(
@@ -296,6 +305,7 @@ class SemanticCommandService:
                         "scope": scope,
                         "stage": stage,
                         "refs": refs or [],
+                        "relationship_type": relationship_type,
                     },
                     correlation_id=correlation_id,
                 )

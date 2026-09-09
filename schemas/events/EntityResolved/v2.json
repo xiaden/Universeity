@@ -89,6 +89,23 @@
         "type": "string"
       }
     },
+    "attributed_actor": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "membership_tuples": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {}
+      }
+    },
     "memberships": {
       "type": "object",
       "properties": {

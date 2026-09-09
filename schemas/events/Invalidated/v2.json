@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/events/Invalidated/v2.json",
+  "title": "Invalidated",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "subject_ref"
+  ],
+  "properties": {
+    "subject_ref": {
+      "type": "string"
+    },
+    "predicate": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "relationship_type": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]{0,63}$"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Plan U P2-S4: the normalized relationship type this invalidation targets (RELATED_TO edges). Null invalidates untyped predicates / all predicate edges when predicate is also null."
+    },
+    "cause": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "scope": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "stage": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

@@ -954,15 +954,26 @@ def test_book_fixture_full_dag_provider_promotion_via_ledger_not_projections(
     # Ledger carries the provider provenance on the appended SemanticAsserted events.
     assert prov_events and int(prov_events) > 0, "provider assertions missing from the ledger"
 
-    # --- NOT written directly to projections ---------------------------------
-    # After the full DAG only the sanctioned CURRENT_SEARCH_PROJECTION replay built
-    # current_state; the edge/search projections are NOT part of the DAG and must be
-    # empty (they need explicit replay builders). Reconciliation only appended to the
-    # ledger — it never wrote active_semantic_edge / search_document directly.
+    # --- Projection advancement is owned ONLY by the sanctioned replay stage ----
+    # Reconciliation appends only to the ledger — it never writes projection tables
+    # directly. Projection tables are written only by the sanctioned
+    # CURRENT_SEARCH_PROJECTION replay stage, which (Plan U P5-S7) now runs the
+    # registered current-tier, active-edge, and search builders in dependency order,
+    # so after the full DAG all three read projections advanced to the SAME ledger tail.
     with umd_db.connect() as c:
         edges = c.execute(sa.text("SELECT count(*) FROM active_semantic_edge")).scalar()
         sdocs = c.execute(sa.text("SELECT count(*) FROM search_document")).scalar()
         cs = c.execute(sa.text("SELECT count(*) FROM current_state")).scalar()
-    assert int(edges) == 0, "reconciliation must not write the edge projection directly"
-    assert int(sdocs) == 0, "reconciliation must not write the search projection directly"
+        cps = dict(
+            c.execute(
+                sa.text("SELECT projection_name, applied_seq FROM projection_checkpoint")
+            ).fetchall()
+        )
+    assert int(edges) > 0, "active-edge projection should be built by the sanctioned replay stage"
+    assert int(sdocs) > 0, "search projection should be built by the sanctioned replay stage"
     assert int(cs) > 0, "current_state should be built by the sanctioned replay stage"
+    # The single projection invocation ran all three builders in order to the SAME
+    # ledger tail observed at stage time (the terminal StageCompleted seq is appended
+    # AFTER the projection stage by the executor, so it is not part of that tail).
+    assert cps.get("current_tier1") == cps.get("semantic_edges") == cps.get("search")
+    assert cps.get("search", 0) > 0

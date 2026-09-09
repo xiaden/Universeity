@@ -133,7 +133,7 @@ def test_public_contract_smoke_flow(api_ctx) -> None:
         )
 
     # -- polling: ingest submitted a decomposable job ------------------------
-    rj = client.get(f"/v1/jobs/job-{sid[:12]}", headers=R)
+    rj = client.get(f"/v1/jobs/job-{sid.replace('-', '')[:12]}", headers=R)
     assert rj.status_code == 200, rj.text
     assert rj.json()["status"] == "complete"
 
@@ -916,7 +916,7 @@ def test_spec_first_production_ingestion_persists_real_output(api_ctx) -> None:
     r = client.post("/v1/sources", json={"media_kind": "txt", "content": content}, headers=W)
     assert r.status_code == 201, r.text
     sid = r.json()["source_id"]
-    job_id = f"job-{sid[:12]}"
+    job_id = f"job-{sid.replace('-', '')[:12]}"
 
     # -- poll the durable (non-fake) job to a terminal state -----------------
     status = "running"
@@ -939,13 +939,15 @@ def test_spec_first_production_ingestion_persists_real_output(api_ctx) -> None:
     assert ev.json()["total"] >= 1, "no evidence persisted through the public route"
 
     # -- semantic events + provenance refs committed to the ledger ----------
+    # POST /v1/sources returns the canonical DASHED id (Plan U P4-S1); the
+    # internal DAG/ledger carry the dashless form, so correlate on that.
     with engine.connect() as conn:
         stage_events = conn.execute(
             sa.text(
                 "SELECT count(*) FROM semantic_event "
                 "WHERE event_type='StageCompleted' AND payload->>'source_id'=:s"
             ),
-            {"s": sid},
+            {"s": sid.replace("-", "")},
         ).scalar()
     assert stage_events >= 1, "no StageCompleted semantic event persisted for the source"
     with engine.connect() as conn:
@@ -1068,7 +1070,7 @@ def test_multipart_upload_ingest_and_job_completes(api_ctx) -> None:
     assert r.status_code == 201, r.text
     sid = r.json()["source_id"]
     assert sid
-    job_id = f"job-{sid[:12]}"
+    job_id = f"job-{sid.replace('-', '')[:12]}"
     status = "running"
     for _ in range(20):
         rj = client.get(f"/v1/jobs/{job_id}", headers=R)
@@ -1113,7 +1115,7 @@ def test_route_cancel_returns_200_and_job_reflects_cancelled(api_ctx) -> None:
     r = client.post("/v1/sources", json={"media_kind": "txt", "content": "cancel me"}, headers=W)
     assert r.status_code == 201, r.text
     sid = r.json()["source_id"]
-    job_id = f"job-{sid[:12]}"
+    job_id = f"job-{sid.replace('-', '')[:12]}"
 
     rc = client.post(f"/v1/jobs/{job_id}/cancel", headers=W)
     assert rc.status_code == 200, rc.text
@@ -1134,7 +1136,7 @@ def test_route_retry_returns_200_and_job_reaches_terminal_state(api_ctx) -> None
     r = client.post("/v1/sources", json={"media_kind": "txt", "content": "retry me"}, headers=W)
     assert r.status_code == 201, r.text
     sid = r.json()["source_id"]
-    job_id = f"job-{sid[:12]}"
+    job_id = f"job-{sid.replace('-', '')[:12]}"
 
     rr = client.post(f"/v1/jobs/{job_id}/retry", headers=W)
     assert rr.status_code == 200, rr.text
@@ -1166,7 +1168,7 @@ def test_route_segment_rerun_returns_202_and_ancestors_untouched(api_ctx) -> Non
     )
     assert r.status_code == 201, r.text
     sid = r.json()["source_id"]
-    job_id = f"job-{sid[:12]}"
+    job_id = f"job-{sid.replace('-', '')[:12]}"
 
     rr = client.post(f"/v1/segments/{sid}/rerun", headers=W)
     assert rr.status_code == 202, rr.text
@@ -1733,7 +1735,7 @@ def test_phase3_book_http_public_reads_deterministic(api_ctx) -> None:
     )
     assert r.status_code == 201, r.text
     sid = r.json()["source_id"]
-    job_id = f"job-{sid[:12]}"
+    job_id = f"job-{sid.replace('-', '')[:12]}"
     status = "running"
     for _ in range(40):
         rj = client.get(f"/v1/jobs/{job_id}", headers=R)
@@ -1782,7 +1784,7 @@ def test_phase3_book_http_public_reads_deterministic(api_ctx) -> None:
     # Normalize UUID dashes: the ingest `sid` is non-dashed hex, the DB round-trip
     # provenance source_id is dashed — same id, different string form.
     assert any(
-        (h.get("provenance", {}).get("source_id") or "").replace("-", "") == sid
+        (h.get("provenance", {}).get("source_id") or "").replace("-", "") == sid.replace("-", "")
         and h.get("provenance", {}).get("locator")
         for h in ev_hits
     )
@@ -1809,7 +1811,8 @@ def test_phase3_book_http_public_reads_deterministic(api_ctx) -> None:
     assert any(
         h.get("predicate") == "text_span"  # EVIDENCE hits expose kind in ``predicate``
         and h.get("provenance", {}).get("locator")
-        and (h.get("provenance", {}).get("source_id") or "").replace("-", "") == sid
+        and (h.get("provenance", {}).get("source_id") or "").replace("-", "")
+        == sid.replace("-", "")
         for h in wt.json()["results"]
     ), "watchtower narration must surface as evidence with locator + provenance"
     # (b) no SemanticAsserted ledger event for this source promotes the claim.
@@ -1845,12 +1848,17 @@ def test_phase3_book_http_public_reads_deterministic(api_ctx) -> None:
     assert not promoted, "no SemanticAsserted event may promote the watchtower-light claim"
 
     # -- search for character/trait/relationship text: honest deterministic result.
-    #    Canonical display names ARE indexed, but canonical search docs carry
-    #    source_id=None, so the SearchService source_id filter scopes them out —
-    #    the 'Mara' total==0 here is a source_id-filter artifact, not an honest
-    #    absence of a canonical surface. 'siblings' / 'moss-green' zeros are
-    #    genuine (no predicate/trait observations produced on this path).
-    for term in ("Mara", "siblings", "moss-green"):
+    #    Plan U (P4-S1/S4): the canonical display name for 'Mara' is indexed scoped
+    #    to its source, and the search source_id filter now honors the canonical
+    #    dashed id, so a source-scoped search DOES surface the canonical surface
+    #    (this source genuinely contains the canonical). 'siblings' / 'moss-green'
+    #    zeros are genuine (no predicate/trait observations produced on this path).
+    mara = client.post(
+        "/v1/search", json={"query": "Mara", "mode": "exact", "source_id": sid}, headers=R
+    )
+    assert mara.status_code == 200, mara.text
+    assert mara.json()["total"] >= 1, "source-scoped search must surface the 'Mara' canonical"
+    for term in ("siblings", "moss-green"):
         rs = client.post(
             "/v1/search", json={"query": term, "mode": "exact", "source_id": sid}, headers=R
         )
@@ -1894,7 +1902,7 @@ def test_phase3_book_provider_aliases_and_traits_through_production_seam(
         )
         assert r.status_code == 201, r.text
         sid = r.json()["source_id"]
-        job_id = f"job-{sid[:12]}"
+        job_id = f"job-{sid.replace('-', '')[:12]}"
         status = "running"
         for _ in range(40):
             rj = client.get(f"/v1/jobs/{job_id}", headers=R)
@@ -2096,7 +2104,8 @@ def test_p5_s1_public_identity_e2e(umd_db: sa.Engine, source_store) -> None:
         assert any(
             h.get("predicate") == "text_span"
             and h.get("provenance", {}).get("locator")
-            and (h.get("provenance", {}).get("source_id") or "").replace("-", "") == sid
+            and (h.get("provenance", {}).get("source_id") or "").replace("-", "")
+            == sid.replace("-", "")
             for h in ev.json()["results"]
         ), "traits must be backed by evidence with locator + provenance"
 
@@ -2124,7 +2133,7 @@ def _provider_book(umd_db, source_store, provider) -> tuple[Any, str, Any, Any]:
         )
         assert r.status_code == 201, r.text
         sid = r.json()["source_id"]
-        job_id = f"job-{sid[:12]}"
+        job_id = f"job-{sid.replace('-', '')[:12]}"
         status = "running"
         for _ in range(40):
             rj = client.get(f"/v1/jobs/{job_id}", headers=R)
@@ -2224,22 +2233,12 @@ def test_phase3_book_provider_search_after_replay_and_freshness_gates(
     app, sid, provider, ctx = _provider_book(umd_db, source_store, provider)
 
     with TestClient(app) as client:
-        # BEFORE the search projection replay: no provider edge docs are searchable.
+        # After the full source job the sanctioned CURRENT_SEARCH_PROJECTION DAG stage
+        # (P5-S7) has ALREADY advanced the active-edge + search projections, so the
+        # provider edge docs ARE searchable (previously a separate explicit replay was
+        # required because the DAG never advanced search). No manual rebuild needed.
         mg = client.post("/v1/search", json={"query": "moss-green", "mode": "exact"}, headers=R)
         assert mg.status_code == 200, mg.text
-        assert mg.json()["total"] == 0, (
-            "provider docs must not be visible before the active-edge + search replay"
-        )
-    # The DAG/reconciliation wrote NO search docs directly (sole-writer invariant).
-    with umd_db.connect() as c:
-        assert int(c.execute(sa.text("SELECT count(*) FROM search_document")).scalar()) == 0, (
-            "reconciliation must not write search documents directly"
-        )
-
-    # Build the active-edge + search projections (the freshness gate).
-    _build_all(umd_db)
-    with TestClient(app) as client:
-        mg = client.post("/v1/search", json={"query": "moss-green", "mode": "exact"}, headers=R)
         assert mg.json()["total"] >= 1
         assert mg.json()["hits"][0]["text"] == "moss-green eyes"  # HAS_TRAIT display text
         for term, text in (("apprentice", "the apprentice"), ("resolute", "resolute")):

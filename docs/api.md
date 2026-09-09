@@ -87,10 +87,33 @@ mention rows.
 `provenance`, `generated_by`, and `capabilities` computed by the query layer on
 list, by-ref, and structured `ENTITY` reads (empty dicts for legacy
 `CANONICAL_ENTITY` fallback hits), alongside `canonical_type`, `display_label`,
-`aliases`, `state`, `confidence`, `support_refs`, and `memberships`. The identity
-`classification` is not part of this public read surface: it is carried only by the
-`EntityResolved` ESTABLISH event payload and persisted in the canonical-identity
-metadata, never surfaced on `EntityResponse`.
+`aliases`, `state`, `confidence`, `support_refs`, and `memberships`.
+
+**Active identity provenance and classification (Plan U).** The active canonical
+winner is the current state of the identity after every applied event (see
+*Current winner vs. historical audit* below). It exposes additively (through the
+`provenance` / `generated_by` / `capabilities` dicts — no schema break):
+
+- `classification` — the identity certainty class (`accepted | probable |
+  unresolved | ambiguous`) governing dependent-assertion emission: `accepted` is
+  normal; `probable` never exceeds `probable` unless human-confirmed;
+  `ambiguous`/`unresolved` never yield a confirmed canonical identity assertion.
+- `provenance` — `{predicate, support_refs, state, classification,
+  generated_by, created_by, derived_from, correspondence}` for the active
+  winner.
+- `generated_by` — the exact machine provider/config (e.g.
+  `{stage, analyzer, config_digest}`) or the human-override provenance that
+  produced the active winner.
+- `created_by`/`actor` — the authenticated human actor for an override/
+  correction, or absent for a purely machine-established identity.
+
+**Current winner vs. historical audit.** The `EntityResponse` read reflects only
+the *current winner*: the single active canonical value after every applied event,
+including authenticated human overrides/corrections (which become the new winner
+and confirm the identity). Prior winners and the full causal chain are never
+erased — they remain immutable in the append-only ledger and are explained by
+`GET /v1/audit/{subject}` (current, prior, actor, evidence, generated-by, change
+cause, history).
 
 ## Claims
 

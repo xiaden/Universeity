@@ -60,7 +60,7 @@ def _build_app(umd_db: sa.Engine, tmp_path: Path):
 def _poll_terminal(client, sid: str) -> str:
     status = "running"
     for _ in range(60):
-        rj = client.get(f"/v1/jobs/job-{sid[:12]}", headers=R)
+        rj = client.get(f"/v1/jobs/job-{sid.replace('-', '')[:12]}", headers=R)
         assert rj.status_code == 200, rj.text
         status = rj.json()["status"]
         if status in ("complete", "failed", "cancelled"):

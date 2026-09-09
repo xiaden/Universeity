@@ -62,13 +62,19 @@ _EDGE_VERSION = "edge:v1"
 
 
 def _override_fact_id(
-    event_type: str, subject_ref: str, predicate: str, object_ref: str
+    event_type: str,
+    subject_ref: str,
+    predicate: str,
+    object_ref: str,
+    relationship_type: str | None = None,
 ) -> uuid.UUID:
     """Deterministic content-addressable id for a user-authority (override/correction) edge.
 
     Derived only from the stable semantic identity + the user-authority marker so a
     rerun applying the same override maps to the SAME row (idempotency +
-    wipe-and-replay stability).
+    wipe-and-replay stability). Plan U (P2-S4): the identity includes the target
+    ``relationship_type`` so a MENTOR_OF override and a RIVAL_OF override on the same
+    ``(subject_ref, predicate, object_ref)`` map to DISTINCT rows and never collapse.
     """
     key = json.dumps(
         {
@@ -77,6 +83,7 @@ def _override_fact_id(
             "subject_ref": subject_ref,
             "predicate": predicate,
             "object_ref": object_ref,
+            "relationship_type": relationship_type,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -138,11 +145,12 @@ class ActiveSemanticEdgeProjectionBuilder:
             if driver.state.locks.get(subj):
                 return  # locked entity: no override/correction change
             prior_ref = payload.get("prior_ref") if etype == "CorrectionApplied" else None
-            self._supersede(conn, subj, pred, seq, match=prior_ref)
+            rel_type = payload.get("relationship_type")
+            self._supersede(conn, subj, pred, seq, match=prior_ref, rel_type=rel_type)
             if obj is not None:
                 self._upsert(
                     conn,
-                    fact_id=_override_fact_id(etype, subj, pred, obj),
+                    fact_id=_override_fact_id(etype, subj, pred, obj, rel_type),
                     event_type=etype,
                     predicate=pred,
                     subject_ref=subj,
@@ -155,7 +163,14 @@ class ActiveSemanticEdgeProjectionBuilder:
                 )
         elif etype == "Invalidated":
             if subj:
-                self._invalidate(conn, subj, payload.get("predicate"), payload.get("scope"), seq)
+                self._invalidate(
+                    conn,
+                    subj,
+                    payload.get("predicate"),
+                    payload.get("scope"),
+                    seq,
+                    rel_type=payload.get("relationship_type"),
+                )
         elif etype == "ContradictionRecorded":
             pred = payload.get("predicate")
             if subj and pred:
@@ -244,13 +259,23 @@ class ActiveSemanticEdgeProjectionBuilder:
         conn.execute(stmt)
 
     def _supersede(
-        self, conn: sa.Connection, subj: str, pred: str, seq: int, match: Any = None
+        self,
+        conn: sa.Connection,
+        subj: str,
+        pred: str,
+        seq: int,
+        match: Any = None,
+        rel_type: str | None = None,
     ) -> None:
         conds = [
             _edge_t.c.subject_ref == subj,
             _edge_t.c.predicate == pred,
             _edge_t.c.active.is_(sa.true()),
         ]
+        if rel_type is not None:
+            # Plan U (P2-S4): only supersede the edge carrying THIS relationship type,
+            # leaving a sibling typed edge (e.g. RIVAL_OF alongside MENTOR_OF) active.
+            conds.append(_edge_t.c.derivation["relationship_type"].astext == rel_type)
         if match:
             # Correction prior_ref may be the prior object value OR the prior fact id.
             conds.append(
@@ -261,12 +286,24 @@ class ActiveSemanticEdgeProjectionBuilder:
             )
         self._deactivate(conn, conds, seq)
 
-    def _invalidate(self, conn: sa.Connection, subj: str, pred: Any, scope: Any, seq: int) -> None:
+    def _invalidate(
+        self,
+        conn: sa.Connection,
+        subj: str,
+        pred: Any,
+        scope: Any,
+        seq: int,
+        rel_type: str | None = None,
+    ) -> None:
         conds = [_edge_t.c.subject_ref == subj, _edge_t.c.active.is_(sa.true())]
         if pred:
             conds.append(_edge_t.c.predicate == pred)
         if scope:
             conds.append(_edge_t.c.scope == scope)
+        if rel_type is not None:
+            # Plan U (P2-S4): only invalidate the edge carrying THIS relationship type,
+            # leaving a sibling typed edge active.
+            conds.append(_edge_t.c.derivation["relationship_type"].astext == rel_type)
         self._deactivate(conn, conds, seq)
 
     def _deactivate(self, conn: sa.Connection, conds: list[Any], seq: int) -> None:
@@ -279,12 +316,18 @@ class ActiveSemanticEdgeProjectionBuilder:
     def _mark_conflicting(
         self, conn: sa.Connection, subj: str, pred: str, seq: int, payload: dict[str, Any]
     ) -> None:
+        conds = [
+            _edge_t.c.subject_ref == subj,
+            _edge_t.c.predicate == pred,
+            _edge_t.c.active.is_(sa.true()),
+        ]
+        rel_type = payload.get("relationship_type")
+        if rel_type is not None:
+            # Plan U (P2-S4): only mark the edge carrying THIS relationship type
+            # conflicting, leaving a sibling typed edge untouched.
+            conds.append(_edge_t.c.derivation["relationship_type"].astext == rel_type)
         rows = conn.execute(
-            sa.select(_edge_t.c.fact_id, _edge_t.c.contradiction_refs).where(
-                _edge_t.c.subject_ref == subj,
-                _edge_t.c.predicate == pred,
-                _edge_t.c.active.is_(sa.true()),
-            )
+            sa.select(_edge_t.c.fact_id, _edge_t.c.contradiction_refs).where(*conds)
         ).fetchall()
         for r in rows:
             existing = list(r.contradiction_refs or [])

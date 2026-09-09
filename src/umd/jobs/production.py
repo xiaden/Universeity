@@ -117,6 +117,8 @@ from umd.jobs.stage_execution import (
 )
 from umd.models.registry import ProviderRegistry
 from umd.projections.current import CurrentTierOneBuilder
+from umd.projections.edges import ActiveSemanticEdgeProjectionBuilder
+from umd.projections.search import SearchProjectionBuilder
 from umd.resolution.mentions import SourceMention
 from umd.segmentation.registry import SegmentRegistry
 from umd.storage.postgres.repositories import (
@@ -898,6 +900,116 @@ class _Composer:
                 if str(mid) in by_id:
                     assigned[str(mid)] = str(r.entity_ref)
         return assigned
+
+    def _human_support(self, src: dict[str, Any], mentions: list[SourceMention]) -> dict[str, str]:
+        """Candidate narrowing: human-confirmed canonical assignments (USER_OVERRIDE).
+
+        Plan U (P1-S1/P1-S3): a mention whose committed assignment belongs to a
+        human-confirmed canonical (``USER_CONFIRMED`` state / ``USER_OVERRIDE``
+        authority) is fed to the pure ``ResolutionInputBuilder`` as ``human_support``
+        so a human-confirmed identity is reused as an ACCEPTED join — never re-derived
+        or downgraded by a machine rerun. Same-name/same-work strings are NEVER proof;
+        only the committed human-confirmed assignment narrows.
+
+        Purely a read over committed ``current_state``; writes nothing. Reruns over the
+        same state converge to the same support map.
+        """
+        from umd.storage.postgres.reducer import (
+            CANONICAL_IDENTITY_PREDICATE,
+            STATE_USER_CONFIRMED,
+            USER_OVERRIDE,
+        )
+
+        committed = self._existing_canonical_assignments(src, mentions)
+        if not committed:
+            return {}
+        _cs = db_meta.tables["current_state"]
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(_cs.c.entity_ref, _cs.c.state, _cs.c.authority).where(
+                    _cs.c.predicate == CANONICAL_IDENTITY_PREDICATE
+                )
+            ).fetchall()
+        confirmed = {
+            str(r.entity_ref)
+            for r in rows
+            if str(r.state) == STATE_USER_CONFIRMED or str(r.authority) == USER_OVERRIDE
+        }
+        return {mid: ref for mid, ref in committed.items() if ref in confirmed}
+
+    def _accepted_correspondence(
+        self, src: dict[str, Any], mentions: list[SourceMention]
+    ) -> dict[str, str]:
+        """Authoritative input hydration: accepted (positive) cross-source correspondence.
+
+        Plan U (P1-S2/P1-S3): an accepted correspondence recorded AFTER a prior
+        ENTITY_RESOLUTION (an explicit ``EQUIVALENT``/``CONTINUITY`` alignment in the
+        append-only alignment ledger) must be persisted as authoritative input for a
+        SUBSEQUENT ENTITY_RESOLUTION generation. This method reads the alignment ledger
+        and returns the ``{mention_id -> authoritative_ref}`` seeds consumed by the pure
+        ``ResolutionInputBuilder.build(correspondence=...)``.
+
+        Only ACCEPTED positive correspondence is a join: ``EQUIVALENT`` (explicit,
+        e.g. via the alignment API) and ``CONTINUITY`` (a supported shared identity).
+        The reviewable ``CORRESPONDENCE``/``candidate-separation`` records (unrelated
+        same-name that must stay separate) are explicitly NOT accepted and never seed a
+        merge. Both endpoints must be committed canonical identities (never segment /
+        evidence / synthetic refs). The authoritative target of a symmetric alignment
+        component is chosen deterministically (the lexicographic minimum committed ref),
+        so a rerun over the same ledger + committed state converges to the same ref
+        (idempotent, replayable causation). Mentions whose committed ref already IS the
+        authoritative target are seeded onto it unchanged (no-op but visible).
+
+        Purely a read over committed ``current_state`` + the alignment ledger; writes
+        nothing and never resolves in SEMANTIC_RECONCILIATION.
+        """
+        from umd.storage.postgres.reducer import CANONICAL_IDENTITY_PREDICATE
+
+        committed = self._existing_canonical_assignments(src, mentions)
+        if not committed:
+            return {}
+        accepted_types = ("EQUIVALENT", "CONTINUITY")
+        _cs = db_meta.tables["current_state"]
+        _align = db_meta.tables["alignment"]
+        with self._engine.connect() as conn:
+            identity_rows = conn.execute(
+                sa.select(_cs.c.entity_ref).where(_cs.c.predicate == CANONICAL_IDENTITY_PREDICATE)
+            ).fetchall()
+            align_rows = conn.execute(
+                sa.select(_align.c.left_ref, _align.c.right_ref, _align.c.alignment_type)
+            ).fetchall()
+        canonical_refs = {str(r.entity_ref) for r in identity_rows}
+        parent = {r: r for r in canonical_refs}
+
+        def find(a: str) -> str:
+            root = a
+            while parent[root] != root:
+                root = parent[root]
+            while parent[a] != a:
+                nxt = parent[a]
+                parent[a] = root
+                a = nxt
+            return root
+
+        connected: set[str] = set()
+        for r in align_rows:
+            if str(r.alignment_type) not in accepted_types:
+                continue
+            left, right = str(r.left_ref), str(r.right_ref)
+            if left in parent and right in parent and left != right:
+                ra, rb = find(left), find(right)
+                if ra != rb:
+                    if ra < rb:
+                        parent[rb] = ra
+                    else:
+                        parent[ra] = rb
+                connected.add(left)
+                connected.add(right)
+        out: dict[str, str] = {}
+        for mid, ref in committed.items():
+            if ref in connected:
+                out[mid] = find(ref)
+        return out
 
     def _provider_aware_analysis(self, src: dict[str, Any]) -> Any | None:
         """Deterministic + committed provider observations analysis (Plan R, no re-invoke).
@@ -1922,7 +2034,17 @@ class _Composer:
                 },
                 evidence=mentions,
                 memberships=memberships,
+                # Plan U (P1-S1): ENTITY_RESOLUTION is the SINGLE authority, so its
+                # input carries ALL three authoritative join sources — committed
+                # assignments (existing canonicals), accepted explicit correspondence/
+                # alignment (durable handoff from a prior CROSS_SOURCE_ALIGNMENT or a
+                # human-recorded EQUIVALENT alignment), and human-confirmed support.
+                # Same-name/same-work/continuity/locator/fuzzy similarity is NEVER
+                # join proof — it remains candidate narrowing only (see the pure
+                # builder + resolve_mentions Pass 1, which seed only from these).
                 committed_observations=self._existing_canonical_assignments(src, mentions),
+                correspondence=self._accepted_correspondence(src, mentions),
+                human_support=self._human_support(src, mentions),
                 generated_by={
                     "stage": "ENTITY_RESOLUTION",
                     "analyzer": "umd-entity-resolution@1",
@@ -2114,6 +2236,7 @@ class _Composer:
                 contradiction_refs=p.get("contradiction_refs") or [],
                 derived_from=p.get("derived_from") or [],
                 generated_by=p.get("generated_by") or {},
+                relationship_type=p.get("relationship_type"),
                 correlation_id=self._corr(manifest.job_id),
             )
         refs = [f"reconciled_state:{src['id']}:current", f"reconciled:{src['id']}:{len(events)}"]
@@ -2213,24 +2336,85 @@ class _Composer:
 
     def _current_search_projection(self, manifest: StageManifest) -> StageOutcome:
         src = self._require_source(manifest)
-        # Replay-only projection stage: schedules the sanctioned builder / replay
-        # driver (the ONLY writer to its projection store). It never writes
+        # Replay-only projection stage: schedules the sanctioned builders through the
+        # replay driver (the ONLY writers to their projection stores). It never writes
         # projection tables directly.
         replay = self._opt("replay")
         refs = [f"projection_checkpoint:current_tier1:{src['id']}"]
         if replay is not None:
-            builder = self._tier1_builder()
-            report = replay.run(builder, wipe=True)
-            refs = [f"projection_checkpoint:current_tier1:seq{report.applied_seq}"]
+            # Plan U (P5-S7): replay the whole ACTIVE read-side stack in the fixed
+            # dependency order the projection graph requires — scalar current-tier
+            # state first, then the active semantic-edge store (sole writer of
+            # ``active_semantic_edge``), then the search store (sole writer of
+            # ``search_document``). The search finalize reconciles edge-derived docs
+            # against the ACTIVE edge store and refuses to publish a search checkpoint
+            # after reading a lagging ``semantic_edges`` checkpoint, so edges MUST run
+            # before search. Each run is a wipe-and-replay (as the stage always did for
+            # current_tier1); ``force_resume`` additionally re-reconciles THROUGH
+            # authority (correction/override/invalidation) events so every checkpoint
+            # advances to the same ledger tail (search's true doc source is the active
+            # edge store, not the raw authority stream). Fail closed: every registered
+            # builder must be resolvable — a missing builder raises rather than being
+            # silently omitted.
+            reports = [
+                replay.run(self._tier1_builder(), wipe=True),
+                replay.run(self._semantic_edges_builder(), wipe=True),
+                replay.run(self._search_builder(), wipe=True, force_resume=True),
+            ]
+            refs = [
+                f"projection_checkpoint:{r.projection_name}:seq{r.applied_seq}" for r in reports
+            ]
         return StageOutcome(artifact_refs=refs, evidence_refs=refs)
 
     def _tier1_builder(self) -> CurrentTierOneBuilder:
         builders = self._runtime.builders
-        if isinstance(builders, dict) and "current_tier1" in builders:
+        if isinstance(builders, dict):
+            if "current_tier1" not in builders:
+                raise ConfigurationError(
+                    "runtime['builders'] is missing the 'current_tier1' builder"
+                )
             candidate = builders["current_tier1"]
             if isinstance(candidate, CurrentTierOneBuilder):
                 return candidate
+            if candidate is not None:
+                raise ConfigurationError(
+                    "runtime['builders']['current_tier1'] is not a CurrentTierOneBuilder"
+                )
+        # No builders dict supplied -> legacy degrade to the canonical default builder.
         return CurrentTierOneBuilder()
+
+    def _semantic_edges_builder(self) -> ActiveSemanticEdgeProjectionBuilder:
+        builders = self._runtime.builders
+        if isinstance(builders, dict):
+            if "semantic_edges" not in builders:
+                raise ConfigurationError(
+                    "runtime['builders'] is missing the 'semantic_edges' builder"
+                )
+            candidate = builders["semantic_edges"]
+            if isinstance(candidate, ActiveSemanticEdgeProjectionBuilder):
+                return candidate
+            if candidate is not None:
+                raise ConfigurationError(
+                    "runtime['builders']['semantic_edges'] is not an "
+                    "ActiveSemanticEdgeProjectionBuilder"
+                )
+        # No builders dict supplied -> legacy degrade to the canonical default builder.
+        return ActiveSemanticEdgeProjectionBuilder()
+
+    def _search_builder(self) -> SearchProjectionBuilder:
+        builders = self._runtime.builders
+        if isinstance(builders, dict):
+            if "search" not in builders:
+                raise ConfigurationError("runtime['builders'] is missing the 'search' builder")
+            candidate = builders["search"]
+            if isinstance(candidate, SearchProjectionBuilder):
+                return candidate
+            if candidate is not None:
+                raise ConfigurationError(
+                    "runtime['builders']['search'] is not a SearchProjectionBuilder"
+                )
+        # No builders dict supplied -> legacy degrade to the canonical default builder.
+        return SearchProjectionBuilder()
 
     # -- composition ---------------------------------------------------------
 

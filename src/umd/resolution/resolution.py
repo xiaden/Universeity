@@ -93,6 +93,9 @@ def resolved_event(
     classification: str | None = None,
     authority: str = "machine",
     created_by: str | None = None,
+    generated_by: dict[str, Any] | None = None,
+    attributed_actor: str | None = None,
+    membership_tuples: list[list[Any]] | None = None,
 ) -> SemanticEvent:
     """Build an ``EntityResolved`` event conforming to ``EntityResolved/v2.json``.
 
@@ -125,11 +128,23 @@ def resolved_event(
     }
     if intensity is not None:
         payload["confidence"] = intensity
+    # Plan U (P4-S5): a request-supplied actor is DELEGATED, non-authoritative
+    # attribution only — it is carried as a separate field, never as the
+    # authoritative ``created_by`` (which stays the authenticated principal).
+    if attributed_actor is not None:
+        payload["attributed_actor"] = attributed_actor
+    # Plan U (P4-S3): correlated source/work(/continuity) membership tuples. The
+    # legacy ``memberships`` dict keeps its exact shape; the correlated pairs ride
+    # as a separate additive payload field and are folded into
+    # ``memberships.tuples`` by the reducer so exact tuple scope stays exact.
+    if membership_tuples is not None:
+        payload["membership_tuples"] = membership_tuples
     return SemanticEvent(
         event_type="EntityResolved",
         authority=authority,
         confidence=intensity,
         created_by=created_by,
+        generated_by=generated_by or {},
         payload=payload,
     )
 
@@ -429,6 +444,9 @@ class Resolver:
             intensity=meta.get("confidence"),
             authority=authority,
             created_by=created_by,
+            generated_by=meta.get("generated_by"),
+            attributed_actor=meta.get("attributed_actor"),
+            membership_tuples=meta.get("membership_tuples"),
         )
         # Plan S (P3-S1): the idempotency key includes a deterministic fingerprint
         # of the identity metadata, so re-establishing the SAME canonical with a

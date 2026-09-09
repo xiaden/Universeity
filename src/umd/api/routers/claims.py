@@ -41,6 +41,7 @@ def create_claim(
         confidence=body.confidence,
         scope=body.scope,
         support_refs=body.support_refs,
+        relationship_type=body.relationship_type,
         authority="operator",
         actor=_p.key,
     )
@@ -69,6 +70,7 @@ def override_claim(
         actor=_p.key,
         evidence=body.refs,
         reason=body.reason or body.cause,
+        relationship_type=body.relationship_type,
     )
     return ClaimResponse(ref=ref, seq=commit.seq, consistency_token=commit.seq)
 
@@ -87,6 +89,7 @@ def invalidate_claim(
         scope=body.scope or "GLOBAL",
         stage=body.stage,
         refs=body.refs,
+        relationship_type=body.relationship_type,
     )
     return ClaimResponse(ref=ref, seq=commit.seq, consistency_token=commit.seq)
 

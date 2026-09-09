@@ -116,7 +116,9 @@ class CanonicalEntity(BaseModel):
     #: Generated-by provenance of the accepted decision (analyzer/config/stage).
     generated_by: dict[str, Any] = Field(default_factory=dict)
     #: Work/source/continuity membership context of the canonical identity.
-    memberships: dict[str, list[str]] = Field(default_factory=_empty_memberships)
+    #: Plan U (P4-S3): the correlated ``tuples`` key is additive — each entry is
+    #: ``[source_id, work_id, continuity_id]``.
+    memberships: dict[str, list[Any]] = Field(default_factory=_empty_memberships)
     #: Honest resolution classification (accepted/probable) — Plan T P1-S3/R8.
     classification: str = IdentityClassification.PROBABLE.value
 
@@ -303,7 +305,8 @@ class ResolutionInput(BaseModel):
     #: Continuity scope (a declared narrative continuity across works/sources).
     continuity_id: str | None = None
     #: Membership context carried from the source registry (source/work/continuity).
-    memberships: dict[str, list[str]] = Field(default_factory=_empty_memberships)
+    #: Plan U (P4-S3): the correlated ``tuples`` key is additive.
+    memberships: dict[str, list[Any]] = Field(default_factory=_empty_memberships)
 
 
 class ResolutionInputBuilder:
@@ -564,19 +567,54 @@ def _evidence_tokens(m: SourceMention) -> list[str]:
     return tokens
 
 
+def _membership_tuples(
+    members: list[SourceMention],
+    *,
+    work_id: str | None,
+    continuity_id: str | None,
+) -> list[list[str | None]]:
+    """The correlated ``[source_id, work_id, continuity_id]`` membership tuples.
+
+    Plan U (P4-S3): a cluster's scope is a set of CORRELATED tuples derived from its
+    members (each member carries its source and the source-level work/continuity
+    scope), never the Cartesian cross-product of the independent arrays. This is what
+    lets an exact tuple scope match A/X and B/Y while A/Y and B/X MISS — a member
+    really is in ``(source, work)`` as a unit. Deduped + sorted deterministically so
+    replay and cross-source accumulation are byte-stable. Members without a source id
+    are skipped (they contribute no correlated scope).
+    """
+    tuples: list[tuple[str, str | None, str | None]] = []
+    for m in members:
+        s = m.source_id
+        if not s:
+            continue
+        w = m.work_id or work_id
+        c = m.continuity_id or continuity_id
+        tuples.append((str(s), str(w) if w else None, str(c) if c else None))
+    seen: list[list[str | None]] = []
+    for t in sorted(tuples, key=lambda x: (x[0], x[1] or "", x[2] or "")):
+        row = [t[0], t[1], t[2]]
+        if row not in seen:
+            seen.append(row)
+    return seen
+
+
 def _cluster_memberships(
     members: list[SourceMention],
     *,
     work_id: str | None,
     continuity_id: str | None,
     scope: dict[str, list[str]],
-) -> dict[str, list[str]]:
+) -> dict[str, Any]:
     """Aggregate a cluster's work/source/continuity membership context.
 
     Carries the explicit source-level work/continuity scope (P3-S1) when a member
-    did not annotate it directly, so the canonical stays scoped.
+    did not annotate it directly, so the canonical stays scoped. Plan U (P4-S3): the
+    correlated ``tuples`` key is ADDITIVE — the legacy independent arrays are
+    preserved, and ``tuples`` records the correlated ``(source, work, continuity)``
+    memberships that power exact tuple scope matching.
     """
-    memberships = {
+    memberships: dict[str, Any] = {
         "source_ids": sorted({m.source_id for m in members if m.source_id}),
         "work_ids": sorted({m.work_id for m in members if m.work_id}),
         "continuity_ids": sorted({m.continuity_id for m in members if m.continuity_id}),
@@ -587,6 +625,11 @@ def _cluster_memberships(
         memberships["continuity_ids"] = [continuity_id]
     if not memberships["source_ids"] and scope.get("source_ids"):
         memberships["source_ids"] = list(scope["source_ids"])
+    memberships["tuples"] = _membership_tuples(
+        members,
+        work_id=work_id,
+        continuity_id=continuity_id,
+    )
     return memberships
 
 
@@ -854,6 +897,24 @@ class EntityResolutionService:
             # Canonical establishment: a first-class append-only ledger event that
             # records the accepted canonical's identity metadata (type, display
             # label, aliases, support refs, memberships, state, confidence).
+            # Plan U (P4-S3): the correlated ``tuples`` live in a SEPARATE
+            # ``membership_tuples`` key so the legacy ``memberships`` shape stays
+            # exactly ``{source_ids, work_ids, continuity_ids}``; the reducer
+            # reassembles them as additive ``memberships.tuples`` in current_state.
+            command_metadata: dict[str, Any] = {
+                "canonical_type": entity_type,
+                "display_label": label,
+                "aliases": aliases,
+                "support_refs": sorted(m.mention_id for m in members),
+                "memberships": {
+                    k: memberships.get(k) for k in ("source_ids", "work_ids", "continuity_ids")
+                },
+                "membership_tuples": list(memberships.get("tuples") or []),
+                "state": entity_state,
+                "confidence": conf,
+                "classification": classification,
+                "generated_by": dict(gb),
+            }
             commands.append(
                 ResolutionCommand(
                     kind="ESTABLISH",
@@ -862,17 +923,7 @@ class EntityResolutionService:
                     refs=sorted(m.mention_id for m in members),
                     assignments={m.mention_id: canonical_ref for m in members},
                     reason="canonical establishment",
-                    metadata={
-                        "canonical_type": entity_type,
-                        "display_label": label,
-                        "aliases": aliases,
-                        "support_refs": sorted(m.mention_id for m in members),
-                        "memberships": memberships,
-                        "state": entity_state,
-                        "confidence": conf,
-                        "classification": classification,
-                        "generated_by": dict(gb),
-                    },
+                    metadata=command_metadata,
                 )
             )
 

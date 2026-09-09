@@ -37,6 +37,7 @@ from umd.resolution.service import (
     CanonicalEntity,
     Contradiction,
     ResolutionBatch,
+    UnresolvedMention,
 )
 
 
@@ -726,3 +727,200 @@ def test_promotion_ladder_full_matrix_at_event_level() -> None:
 
     # Machine reconcile never fabricates a user-confirmed authority.
     assert all(e["state"] != "USER_CONFIRMED" for e in events)
+
+
+# ---------------------------------------------------------------------------
+# P3-S1/S2: identity certainty ceiling matrix
+# ---------------------------------------------------------------------------
+
+#: Observation categories whose emitted assertion SUBJECT is the canonical identity
+#: (so identity certainty bounds them). Scene (STARTS_AT), utterance (UTTERED_IN)
+#: and context (HAS_CONTEXT) rows are bound to a locator/utterance, not to a
+#: canonical identity, so they are NOT identity-dependent assertions.
+_IDENTITY_SUBJECT_PREDS = {
+    "MENTIONED_IN",  # mention
+    "PRESENT_IN",  # presence
+    "SPEAKS",  # speaks/utterance (speaker subject)
+    "HAS_TRAIT",  # trait
+    "CO_OCCURS",  # relationship
+    "HAS_EMOTION",  # emotion
+    "IN_STATE",  # state
+}
+
+
+def _strong_analysis() -> SemanticAnalysisResult:
+    """One strong (0.9) identity-subject observation per bounded category.
+
+    Without a ceiling every row promotes to CONFIRMED, so the matrix isolates the
+    effect of canonical identity classification on dependent assertions.
+    """
+    seg = _seg()
+    return _analysis(
+        entity_mentions=[
+            EntityMention(mention="Alice", confidence=0.9, segment=seg, generated_by=_gb())
+        ],
+        presence=[
+            Presence(
+                entity="Alice",
+                present_in="scene:1",
+                confidence=0.9,
+                segment=seg,
+                generated_by=_gb(),
+            )
+        ],
+        utterances=[
+            Utterance(
+                utterance_text="hello",
+                speaker="Alice",
+                confidence=0.9,
+                segment=seg,
+                generated_by=_gb(),
+            )
+        ],
+        traits=[
+            DescriptiveTrait(
+                entity="Alice", trait="brave", confidence=0.9, segment=seg, generated_by=_gb()
+            )
+        ],
+        relationships=[
+            RelationshipCandidate(
+                subject_ref="Alice",
+                predicate="CO_OCCURS",
+                object_ref="Bob",
+                confidence=0.9,
+                segment=seg,
+                generated_by=_gb(),
+            )
+        ],
+        emotions=[
+            EmotionObservation(
+                entity="Alice", emotion="happy", confidence=0.9, segment=seg, generated_by=_gb()
+            )
+        ],
+        states=[
+            StateObservation(
+                entity="Alice",
+                observed_state="asleep",
+                confidence=0.9,
+                segment=seg,
+                generated_by=_gb(),
+            )
+        ],
+    )
+
+
+def _identity_subject_states(events: list[dict[str, object]]) -> dict[str, str]:
+    """Emitted state per identity-subject predicate for the Alice canonical."""
+    by = _by_predicate(events)
+    out: dict[str, str] = {}
+    for pred in sorted(_IDENTITY_SUBJECT_PREDS):
+        rows = [
+            e for e in by.get(pred, []) if str(e.get("subject_ref")) == "entity:canonical:s1:aaa"
+        ]
+        if rows:
+            out[pred] = str(rows[0]["state"])
+    return out
+
+
+def _ceiling_batch(classification: str, *, state: str = "CONFIRMED") -> ResolutionBatch:
+    return ResolutionBatch(
+        source_id="s1",
+        canonical_entities=[
+            CanonicalEntity(
+                ref="entity:canonical:s1:aaa",
+                label="Alice",
+                source_id="s1",
+                confidence=0.9,
+                state=state,
+                classification=classification,
+            )
+        ],
+    )
+
+
+def test_certainty_ceiling_caps_dependent_assertions_by_classification() -> None:
+    """P3-S2: ACCEPTED follows normal promotion; PROBABLE/AMBIGUOUS/UNRESOLVED
+    cap identity-subject assertions at PROBABLE — never a CONFIRMED canonical
+    identity assertion — across mention/presence/speaks/trait/relationship/
+    emotion/state."""
+    accepted = _identity_subject_states(
+        _events(
+            ReconciliationInput(
+                source_id="s1", analysis=_strong_analysis(), resolution=_ceiling_batch("accepted")
+            )
+        )
+    )
+    assert set(accepted) == _IDENTITY_SUBJECT_PREDS
+    assert accepted == {p: "CONFIRMED" for p in _IDENTITY_SUBJECT_PREDS}, accepted
+
+    for classification in ("probable", "ambiguous", "unresolved"):
+        capped = _identity_subject_states(
+            _events(
+                ReconciliationInput(
+                    source_id="s1",
+                    analysis=_strong_analysis(),
+                    resolution=_ceiling_batch(classification),
+                )
+            )
+        )
+        assert set(capped) == _IDENTITY_SUBJECT_PREDS, (classification, capped)
+        for pred, state in capped.items():
+            assert state == "PROBABLE", (classification, pred, state)
+            assert state != "CONFIRMED", (classification, pred)
+
+
+def test_human_confirmed_probable_is_accepted_equivalent() -> None:
+    """P3-S2: a PROBABLE identity that is human-confirmed (USER_CONFIRMED) is
+    accepted-equivalent and follows normal promotion (not capped)."""
+    human = _identity_subject_states(
+        _events(
+            ReconciliationInput(
+                source_id="s1",
+                analysis=_strong_analysis(),
+                resolution=_ceiling_batch("probable", state="USER_CONFIRMED"),
+            )
+        )
+    )
+    assert human == {p: "CONFIRMED" for p in _IDENTITY_SUBJECT_PREDS}, human
+
+
+def test_unresolved_mention_surface_never_confirmed() -> None:
+    """P3-S2: an unresolved/ambiguous mention surface resolves to a deterministic
+    fallback ref (honest, no pseudo-canonical) and is capped — it can never read as
+    a confirmed canonical identity assertion."""
+    res = ResolutionBatch(
+        source_id="s1",
+        canonical_entities=[
+            CanonicalEntity(
+                ref="entity:canonical:s1:aaa",
+                label="Alice",
+                source_id="s1",
+                confidence=0.9,
+                state="CONFIRMED",
+                classification="accepted",
+            )
+        ],
+        unresolved=[UnresolvedMention(mention_id="u:1", text="Nobody", reason="ambiguous")],
+    )
+    analysis = _analysis(
+        presence=[
+            Presence(
+                entity="Nobody",
+                present_in="scene:9",
+                confidence=0.9,
+                segment=_seg(),
+                generated_by=_gb(),
+            )
+        ]
+    )
+    rows = [
+        e
+        for e in _events(ReconciliationInput(source_id="s1", analysis=analysis, resolution=res))
+        if e["predicate_code"] == "PRESENT_IN"
+    ]
+    assert rows
+    ref = str(rows[0]["subject_ref"])
+    # Honest deterministic fallback ref (never a fabricated canonical):
+    assert ref.startswith("entity:s1:")
+    # Capped: never a CONFIRMED canonical identity assertion.
+    assert rows[0]["state"] == "PROBABLE"
