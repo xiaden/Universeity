@@ -709,6 +709,37 @@ def _entities(client: httpx.Client, **params: Any) -> list[dict[str, Any]]:
     return cast("list[dict[str, Any]]", r.json()["items"])
 
 
+def _entities_all(client: httpx.Client, **params: Any) -> list[dict[str, Any]]:
+    """Page the PUBLIC cursor contract of GET /v1/entities until the list is
+    exhausted, returning the FULL grouped result set -- never just the first
+    page.
+
+    The docker-e2e workflow re-runs this boundary module TWICE against the
+    SAME persisted Postgres/OCFL volumes (pre-restart and post-restart), so the
+    DB accumulates many canonical refs over time. A single unscoped page at
+    ``limit=100`` would silently miss a valid ref that sorts beyond position
+    100 (the ABC John A/B after-restart defect); walking ``next_cursor`` until
+    it is ``None`` makes the grouped observation robust to arbitrary persisted
+    accumulation. ``limit`` stays small (100) -- page count is what changes.
+    """
+    qp: dict[str, Any] = dict(params) if params else {}
+    qp.setdefault("limit", 100)
+    out: list[dict[str, Any]] = []
+    cursor: str | None = None
+    while True:
+        page_params = dict(qp)
+        if cursor is not None:
+            page_params["cursor"] = cursor
+        r = client.get("/v1/entities", params=page_params, headers=R)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        out.extend(body["items"])
+        cursor = body.get("next_cursor")
+        if not cursor:
+            break
+    return out
+
+
 def test_boundary_identity_abc_full_dag(api_ctx: ApiCtx) -> None:
     """P3-S1/S2/S3 (R1/R3/R4/R9): the full nine-stage public A/B/C acceptance path.
 
@@ -743,7 +774,10 @@ def test_boundary_identity_abc_full_dag(api_ctx: ApiCtx) -> None:
         assert pr.status_code in (200, 503), (path, pr.status_code)
 
     sa_id, sb_id, sc_id = a["source_id"], b["source_id"], c["source_id"]
-    items = _entities(client)
+    # Page the full /v1/entities list via next_cursor so the grouped observation
+    # below can never be fooled by canonicals accumulated on persisted volumes
+    # (hosted after-restart runs re-execute this module against the same DB).
+    items = _entities_all(client)
     by_label: dict[str, list[dict[str, Any]]] = {}
     for it in items:
         by_label.setdefault(it.get("display_label") or it["label"], []).append(it)
@@ -803,7 +837,7 @@ def test_boundary_identity_abc_full_dag(api_ctx: ApiCtx) -> None:
     a_again = _ingest(client, kind="txt", name="novel_a.txt", data=_BOOK_A.encode(), work_id=None)
     assert _poll_to_terminal(client, _job_id(a_again["source_id"]))["status"] == "complete"
     assert a_again["work_id"] == a["work_id"], "byte-identical re-ingest dedupes to the same work"
-    items_again = _entities(client)
+    items_again = _entities_all(client)
     mara_again = [
         i
         for i in items_again

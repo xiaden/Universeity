@@ -597,7 +597,153 @@ def test_scoped_entity_read_survives_server_side_cardinality(umd_db: sa.Engine) 
                 break
             cursor = p["next_cursor"]
         # Pagination covered every in-scope canonical exactly once, nothing extra.
+        # Pagination covered every in-scope canonical exactly once, nothing extra.
         assert seen == set(target_refs)
+
+
+def test_unscoped_entity_pagination_pages_distinct_refs_not_paired_rows(
+    umd_db: sa.Engine,
+) -> None:
+    """Plan U (P6-S3) amendment 2: UNscoped ENTITY pagination is driven by the DISTINCT
+    canonical-ref set, never by raw paired ``current_state`` rows.
+
+    Before the fix the general ``entities()`` path fetched a bounded window of RAW
+    paired rows (``2*(offset+limit)+4`` -> for a ref that materialises as a
+    CANONICAL_IDENTITY row plus its CANONICAL_ENTITY pair, ``offset+limit+2`` distinct
+    refs), deduplicated afterward, and derived ``total`` from that truncated window
+    (``len(ordered)``) when unscoped. With enough accumulated paired rows a valid
+    canonical sorting beyond that raw window was unreachable on the requested page and
+    ``total`` under-reported the distinct canonical-ref count.
+
+    Here we seed 60 unrelated canonicals so that two source-local target canonicals sort
+    BEYOND the first page of the existing public cursor/limit contract, walk more than
+    one page through that contract, and assert:
+      * ``total`` equals the DISTINCT canonical-ref count on every page (never the raw
+        paired-row window size — the pre-fix defect this regression FAILS against);
+      * both target refs are discoverable EXACTLY ONCE across the walk with correct
+        one-source memberships and their candidate separation preserved (two DISTINCT
+        refs, never unified);
+      * cursor/page boundaries are consistent — no duplicates or gaps across the walk
+        (the union of walked refs equals the full seeded canonical set).
+    Scoped reads are re-asserted at the tail so the regression retains coverage that a
+    source-scoped read still matches only its requested scope.
+    """
+    filler_count = 60
+    target_src_a = "src:target-a"
+    target_src_b = "src:target-b"
+    filler_refs = [f"entity:canonical:aa:fill:{i:04d}" for i in range(filler_count)]
+    target_a = "entity:canonical:zz:hi:target:0"
+    target_b = "entity:canonical:zz:hi:target:1"
+    # Candidate separation is intentional: A and B are two DISTINCT canonical refs, each
+    # local to its own source, with NO correspondence/unification seeded between them.
+    all_refs = {*filler_refs, target_a, target_b}
+
+    app = create_app(engine=umd_db, source_store=None, settings=_client_settings())
+    with TestClient(app) as client:
+        for i, ref in enumerate(filler_refs):
+            r = client.post(
+                "/v1/entities",
+                json={
+                    "ref": ref,
+                    "display_label": f"Filler{i:04d}",
+                    "canonical_type": "character",
+                    "aliases": [],
+                    "memberships": {
+                        "source_ids": [f"src:filler:{i}"],
+                        "work_ids": [],
+                        "continuity_ids": [],
+                    },
+                    "state": "CONFIRMED",
+                    "authority": "operator",
+                    "actor": "plan-u-p6-s3",
+                },
+                headers=W,
+            )
+            assert r.status_code == 201, r.text
+        for ref, src in ((target_a, target_src_a), (target_b, target_src_b)):
+            r = client.post(
+                "/v1/entities",
+                json={
+                    "ref": ref,
+                    "display_label": "TargetJohn",
+                    "canonical_type": "character",
+                    "aliases": [],
+                    "memberships": {
+                        "source_ids": [src],
+                        "work_ids": [],
+                        "continuity_ids": [],
+                    },
+                    "state": "CONFIRMED",
+                    "authority": "operator",
+                    "actor": "plan-u-p6-s3",
+                },
+                headers=W,
+            )
+            assert r.status_code == 201, r.text
+
+        # (1) The first page of the UNscoped read (public limit contract) must report
+        # total == the DISTINCT canonical-ref count, and must NOT contain the two
+        # target refs (they sort beyond the first page — discoverability requires walking
+        # more than one page through the existing cursor contract).
+        first = client.get("/v1/entities", params={"limit": 20}, headers=R)
+        assert first.status_code == 200, first.text
+        fb = first.json()
+        assert fb["total"] == len(all_refs), fb["total"]
+        first_page = {item["ref"] for item in fb["items"]}
+        assert target_a not in first_page and target_b not in first_page
+
+        # (2) Walk MORE THAN ONE page via the existing cursor contract.
+        seen: list[str] = []
+        cursor: str | None = None
+        page_no = 0
+        while True:
+            params: dict[str, Any] = {"limit": 20}
+            if cursor:
+                params["cursor"] = cursor
+            page = client.get("/v1/entities", params=params, headers=R)
+            assert page.status_code == 200, page.text
+            body = page.json()
+            # Every page reports the same DISTINCT canonical-ref total, never a window.
+            assert body["total"] == len(all_refs), (page_no, body["total"])
+            items = body["items"]
+            # No duplicate ref across pages; refs are strictly ordered across the walk.
+            for item in items:
+                ref = item["ref"]
+                assert ref not in seen, f"duplicate across pages: {ref}"
+                seen.append(ref)
+            if body["next_cursor"] is None:
+                break
+            cursor = body["next_cursor"]
+            page_no += 1
+            assert page_no <= len(all_refs), "runaway cursor walk"
+        # More than one page was actually required to reach the two source-local targets.
+        assert page_no >= 2
+        # (3) The walk reached every seeded canonical exactly once — no dup, no gap.
+        assert len(seen) == len(all_refs)
+        assert set(seen) == all_refs
+
+        # (4) The two source-local targets are each discovered EXACTLY ONCE across the
+        # walk, remain DISTINCT refs (candidate separation preserved — never unified),
+        # and each exposes its correct one-source membership through the public by-ref
+        # read seam.
+        for target in (target_a, target_b):
+            assert seen.count(target) == 1, (target, seen.count(target))
+        assert target_a != target_b
+        for ref, src in ((target_a, target_src_a), (target_b, target_src_b)):
+            byref = client.get(f"/v1/entities/{ref}", headers=R)
+            assert byref.status_code == 200, byref.text
+            meta = byref.json()
+            assert set(meta["memberships"].get("source_ids") or []) == {src}
+
+        # (5) Retention: a source-scoped read matches ONLY its requested scope at this
+        # cardinality — src A sees exactly target_a, src B sees exactly target_b.
+        for src, target in ((target_src_a, target_a), (target_src_b, target_b)):
+            scoped = client.get("/v1/entities", params={"source_id": src}, headers=R)
+            assert scoped.status_code == 200, scoped.text
+            sb = scoped.json()
+            assert sb["total"] == 1, (src, sb["total"])
+            scoped_refs = {item["ref"] for item in sb["items"]}
+            assert scoped_refs == {target}
 
 
 def test_search_source_scoped_excludes_unrelated_source(umd_db: sa.Engine) -> None:

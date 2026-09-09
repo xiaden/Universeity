@@ -223,6 +223,10 @@ class QueryService:
         name = q.filters.get("name")
         fuzzy_name = q.filters.get("name_fuzzy") or q.filters.get("label_contains")
         alias = q.filters.get("alias")
+        # Plan U amendment 2: the general/ref path below finalizes page membership
+        # from the DISTINCT canonical-ref set (its page rows are already offset/limit
+        # sliced), so it sets ``page_ready`` and the shared tail must NOT re-slice.
+        page_ready = False
 
         if name is not None or fuzzy_name is not None:
             # Display-label matching applies only to canonical-identity metadata
@@ -285,8 +289,7 @@ class QueryService:
             ]
             if scope:
                 # Scope becomes part of candidate SELECTION: only identity rows whose
-                # persisted memberships intersect the scope are fetched, so the bounded
-                # raw-fetch window and the count are computed over the scoped set. The
+                # persisted memberships intersect the scope are page candidates; the
                 # CANONICAL_ENTITY-only fallback never carries identity metadata and is
                 # correctly excluded when scoped (matching the Python post-filter below).
                 conds = base + [
@@ -295,10 +298,22 @@ class QueryService:
                         self._membership_scope_pred(scope),
                     )
                 ]
-            ordered, total = self._entity_ordered(conds, q)
+            # Plan U amendment 2: form page membership FIRST from the DISTINCT
+            # canonical-ref set (the same CANONICAL_IDENTITY + legacy-identity refs this
+            # branch dedups to), then select the identity-winning row for exactly the refs
+            # on the requested page. total derives from that canonical-ref set, never from
+            # raw paired current_state rows — so a ref's raw-row cardinality can no longer
+            # push a valid ref past the bounded fetch window.
+            refs = self._entity_page_refs(conds, q)
+            winners = self._entity_winners_for_refs(conds, refs)
+            ordered = [winners[ref] for ref in refs if ref in winners]
+            # Scope post-filter (Plan T/U): drop any SQL-scope page candidate the Python
+            # correlated/legacy membership check rejects (a no-op when unscoped).
             ordered = [r for r in ordered if self._in_membership_scope(r, scope)]
-            total = len(ordered) if not scope else total
-        results = [self._entity_hit(r) for r in ordered[q.offset : q.offset + q.limit]]
+            total = self._entity_total(conds)
+            page_ready = True
+        start = 0 if page_ready else q.offset
+        results = [self._entity_hit(r) for r in ordered[start : start + q.limit]]
         return ProvenanceBearingPage(
             query=q.kind,
             results=results,
@@ -528,6 +543,62 @@ class QueryService:
                 .where(*conds)
             ).scalar()
         return int(val or 0)
+
+    def _entity_page_refs(self, conds: list[Any], q: StructuredQuery) -> list[str]:
+        """The DISTINCT canonical-ref set for exactly this page (Plan U amendment 2).
+
+        Page membership is formed from the DISTINCT canonical-ref set (the same
+        CANONICAL_IDENTITY + legacy-identity refs the caller dedups to), NOT from raw
+        paired ``current_state`` rows — so a ref's raw-row cardinality can never push a
+        valid ref off a page or out of ``total``. ``DISTINCT ... ORDER BY entity_ref
+        OFFSET q.offset LIMIT q.limit`` returns at most ``q.limit`` refs and lets the
+        RDBMS do the bounded skip (never an unbounded raw-table fetch into Python).
+        """
+        stmt = (
+            sa.select(_cs.c.entity_ref)
+            .where(*conds)
+            .order_by(_cs.c.entity_ref)
+            .distinct()
+            .offset(q.offset)
+            .limit(q.limit)
+        )
+        with self._engine.connect() as conn:
+            return [str(r[0]) for r in conn.execute(stmt).fetchall()]
+
+    def _entity_winners_for_refs(self, conds: list[Any], refs: list[str]) -> dict[str, Any]:
+        """Fetch candidate rows for exactly ``refs`` and pick each ref's identity-winning row.
+
+        Replicates the post-dedup winner semantics the caller used to apply AFTER
+        ordering: for a given ref the ``CANONICAL_IDENTITY`` row wins when present, else
+        the ``CANONICAL_ENTITY`` row for that ref is used (a ref has at most one row per
+        predicate in ``current_state``, so the winner is deterministic under the
+        ``entity_ref`` ordering). Bounded: ``refs`` is at most the page size and each ref
+        contributes at most one row per predicate.
+        """
+        if not refs:
+            return {}
+        cols = [
+            (_cs.c.entity_ref, "entity_ref"),
+            (_cs.c.predicate, "predicate"),
+            (_cs.c.object_ref, "object_ref"),
+            (_cs.c.confidence, "confidence"),
+            (_cs.c.authority, "authority"),
+            (_cs.c.seq, "seq"),
+            (_cs.c.state, "state"),
+        ]
+        stmt = (
+            sa.select(*[c.label(n) for c, n in cols])
+            .where(*conds, _cs.c.entity_ref.in_(refs))
+            .order_by(_cs.c.entity_ref)
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+        winners: dict[str, Any] = {}
+        for r in rows:
+            key = str(r.entity_ref)
+            if r.predicate == CANONICAL_IDENTITY_PREDICATE or key not in winners:
+                winners[key] = r
+        return winners
 
     def _entity_hit(self, r: Any) -> QueryResultHit:
         if r.predicate == CANONICAL_IDENTITY_PREDICATE:
