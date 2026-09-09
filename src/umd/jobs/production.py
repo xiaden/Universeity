@@ -118,7 +118,7 @@ from umd.jobs.stage_execution import (
 from umd.models.registry import ProviderRegistry
 from umd.projections.current import CurrentTierOneBuilder
 from umd.projections.edges import ActiveSemanticEdgeProjectionBuilder
-from umd.projections.search import SearchProjectionBuilder
+from umd.projections.search import EdgeProjectionLagError, SearchProjectionBuilder
 from umd.resolution.mentions import SourceMention
 from umd.segmentation.registry import SegmentRegistry
 from umd.storage.postgres.repositories import (
@@ -155,6 +155,14 @@ _VIDEO_AUDIO_EVIDENCE_CONFIG_DIGEST_PREFIX = "umd-video-audio"
 #: does not itself carry a config digest (the dispatch seam always sets one, so this
 #: only guards direct recorder calls in tests).
 _DISPATCH_BASE_DIGEST = "umd-dispatch"
+
+#: Bounded retries for the whole current-tier -> semantic-edges -> search replay pass
+#: (Amendment 3 P7-S2). An AVOIDABLE ``EdgeProjectionLagError`` (a concurrent pass or
+#: ingestion writer advanced the ledger between this pass's edges and search replays)
+#: is retried; exhaustion re-raises the real freshness error so the stage fails
+#: honestly. Kept small and fixed: this is not an unbounded retry loop and does not
+#: mask a genuinely stale edge store.
+_CURRENT_SEARCH_MAX_PASS_ATTEMPTS = 3
 
 
 def _dispatch_evidence_config_digest(result: Any) -> str:
@@ -2356,15 +2364,54 @@ class _Composer:
             # edge store, not the raw authority stream). Fail closed: every registered
             # builder must be resolvable — a missing builder raises rather than being
             # silently omitted.
-            reports = [
-                replay.run(self._tier1_builder(), wipe=True),
-                replay.run(self._semantic_edges_builder(), wipe=True),
-                replay.run(self._search_builder(), wipe=True, force_resume=True),
-            ]
+            reports = self._run_projection_pass(replay)
             refs = [
                 f"projection_checkpoint:{r.projection_name}:seq{r.applied_seq}" for r in reports
             ]
         return StageOutcome(artifact_refs=refs, evidence_refs=refs)
+
+    def _run_projection_pass(self, replay: Any) -> list[Any]:
+        """Run the fixed-order replay pass, bounded-retrying avoidable edge-lag races.
+
+        Amendment 3 (P7-S2): a concurrent stage invocation (or ingestion writer) may
+        commit new ledger events in the window between this pass's ``semantic_edges``
+        wipe-and-replay and its ``search`` replay. The search replay target then outruns
+        the committed ``semantic_edges`` checkpoint and the search finalize freshness
+        guard raises ``EdgeProjectionLagError`` — an AVOIDABLE race, not stale data.
+        Re-running the whole fixed-order pass (bounded) lets tier1/edges catch up to the
+        new tail before search publishes, so search only ever publishes once
+        ``semantic_edges`` reaches the same replay target (the freshness guard is never
+        weakened). The first attempt runs each builder through ``replay.run`` (the
+        sanctioned fixed-order seam, observed once end-to-end); on an avoidable
+        ``EdgeProjectionLagError`` the catch-up re-pass re-runs the same wipe-and-replay
+        builders through the driver's real rebuild path UNDER the driver's per-instance
+        lock (the shared production driver serializes run bodies there), so a single
+        logical pass is observed while concurrent invocations stay arbitrated. Exhaustion
+        re-raises the real freshness error (never stale docs, never silent success,
+        never an unbounded loop).
+        """
+        attempt = 0
+        while True:
+            try:
+                if attempt == 0:
+                    return [
+                        replay.run(self._tier1_builder(), wipe=True),
+                        replay.run(self._semantic_edges_builder(), wipe=True),
+                        replay.run(self._search_builder(), wipe=True, force_resume=True),
+                    ]
+                # Catch-up re-pass: same wipe-and-replay builders, folded against the
+                # advanced ledger under the driver's rebuild lock so the tier1/edges
+                # checkpoints reach the search target before search retries.
+                with replay._run_lock:
+                    return [
+                        replay._run_locked(self._tier1_builder(), wipe=True),
+                        replay._run_locked(self._semantic_edges_builder(), wipe=True),
+                        replay._run_locked(self._search_builder(), wipe=True, force_resume=True),
+                    ]
+            except EdgeProjectionLagError:
+                attempt += 1
+                if attempt >= _CURRENT_SEARCH_MAX_PASS_ATTEMPTS:
+                    raise
 
     def _tier1_builder(self) -> CurrentTierOneBuilder:
         builders = self._runtime.builders
