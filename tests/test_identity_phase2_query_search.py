@@ -597,7 +597,6 @@ def test_scoped_entity_read_survives_server_side_cardinality(umd_db: sa.Engine) 
                 break
             cursor = p["next_cursor"]
         # Pagination covered every in-scope canonical exactly once, nothing extra.
-        # Pagination covered every in-scope canonical exactly once, nothing extra.
         assert seen == set(target_refs)
 
 
