@@ -21,10 +21,7 @@ consumer product. Start with [`README.md`](README.md), [`Task.md`](Task.md), and
 | `deploy/` | Docker image, Compose topology, startup/migration entrypoint, runtime pins, sandbox policy, and deployment validation. |
 | `.github/workflows/` | Hosted validation and container publication policy. |
 | `.github/scripts/` | CI preflight, diagnostics, live-worker, engine-proof, and release-evidence scripts. |
-| `artifacts/designs/` | Design documents, decomposition material, and cross-plan contracts. |
-| `artifacts/plans/` | Pending and completed implementation plans and handoffs. |
-| `artifacts/logs/` | Historical agent and execution logs; useful context, not source authority. |
-| `artifacts/requests/`, `artifacts/reports/` | Reserved context/report artifact locations; verify current contents before relying on them. |
+| `artifacts/` | Local engineering artifacts such as designs, plans, requests, logs, and reports; intentionally not versioned. |
 
 ## Start here by task
 
@@ -160,16 +157,13 @@ workflow before changing CI validation or interpreting its results.
 ## Artifacts, design, and planning
 
 - `Task.md` records the product requirements and durable conceptual model.
-- `artifacts/designs/pending/` contains designs whose status must be read before
-  treating them as accepted; `artifacts/designs/parts/` contains decomposition
-  material and the binding cross-plan contracts at
-  `artifacts/designs/parts/universal-media-decomposer/CONTRACTS.md`.
-- `artifacts/plans/pending/` and `artifacts/plans/completed/` contain
-  implementation-plan lifecycle state. Plans are not a substitute for source
-  verification.
-- `artifacts/requests/` is the context-snapshot location when request artifacts
-  are produced; `artifacts/logs/` is historical process evidence; `artifacts/reports/`
-  is for reports. Do not treat logs or reports as normative implementation state.
+- `artifacts/` is reserved for local, ignored engineering context: request
+  snapshots, design documents and contracts, pending/completed plans, logs, and
+  reports. These files are not part of the versioned repository contract and may
+  be absent from a fresh clone.
+- When local artifacts are available, read their status and references before
+  relying on them; they are process context, not a substitute for source,
+  tests, workflows, or authoritative documentation.
 - No active `artifacts/requirements/` or `artifacts/decisions/` directories were
   found during regeneration; do not assume ASR/ADR infrastructure exists here.
 
@@ -188,7 +182,7 @@ not committed or embedded in source, documentation, or images.
 - Public contracts: [`docs/api.md`](docs/api.md), [`docs/query-search.md`](docs/query-search.md), [`docs/consistency.md`](docs/consistency.md)
 - Operations and deployment: [`docs/deployment.md`](docs/deployment.md), [`docs/runbooks.md`](docs/runbooks.md), [`docs/observability.md`](docs/observability.md)
 - Security and extension boundaries: [`docs/security.md`](docs/security.md), [`docs/plugins.md`](docs/plugins.md), [`docs/limitations.md`](docs/limitations.md), [`docs/extensions.md`](docs/extensions.md)
-- Requirements and cross-plan contracts: [`Task.md`](Task.md), [`artifacts/designs/parts/universal-media-decomposer/CONTRACTS.md`](artifacts/designs/parts/universal-media-decomposer/CONTRACTS.md)
+- Requirements: [`Task.md`](Task.md); local design/planning artifacts may exist under ignored `artifacts/`
 - No subordinate `AGENTS.md` files were present at regeneration time. Keep this
   root file repository-wide; add a subordinate contract only when a subsystem
   develops genuinely local rules that should not burden every repository task.

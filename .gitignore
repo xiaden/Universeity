@@ -30,3 +30,6 @@ htmlcov/
 .idea/
 .vscode/
 *.swp
+
+# Local engineering artifacts (process context, plans, and reports)
+/artifacts/
